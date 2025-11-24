@@ -138,7 +138,7 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
   const [mode, setMode] = useMode();
-  const { recentModels, addModel, evictModel } = useModelLRU();
+  const { recentModels, addModel, evictModel, defaultModel, setDefaultModel } = useModelLRU();
   const commandListId = useId();
   const telemetry = useTelemetry();
   const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
@@ -175,6 +175,15 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
     },
     [storageKeys.modelKey, addModel]
   );
+
+  // When entering creation mode (or when the default model changes), reset the
+  // project-scoped model to the explicit default so manual picks don't bleed
+  // into subsequent creation flows.
+  useEffect(() => {
+    if (variant === "creation" && defaultModel) {
+      updatePersistedState(storageKeys.modelKey, defaultModel);
+    }
+  }, [variant, defaultModel, storageKeys.modelKey]);
 
   // Creation-specific state (hook always called, but only used when variant === "creation")
   // This avoids conditional hook calls which violate React rules
@@ -967,6 +976,8 @@ export const ChatInput: React.FC<ChatInputProps> = (props) => {
                   recentModels={recentModels}
                   onRemoveModel={evictModel}
                   onComplete={() => inputRef.current?.focus()}
+                  defaultModel={defaultModel}
+                  onSetDefaultModel={setDefaultModel}
                 />
                 <TooltipWrapper inline>
                   <HelpIndicator>?</HelpIndicator>
