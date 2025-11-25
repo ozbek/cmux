@@ -1483,7 +1483,13 @@ export class IpcMain {
           }
 
           if (keyPath.length > 0) {
-            current[keyPath[keyPath.length - 1]] = value;
+            const lastKey = keyPath[keyPath.length - 1];
+            // Delete key if value is empty string, otherwise set it
+            if (value === "") {
+              delete current[lastKey];
+            } else {
+              current[lastKey] = value;
+            }
           }
 
           // Save updated config
@@ -1497,6 +1503,27 @@ export class IpcMain {
       }
     );
 
+    ipcMain.handle(
+      IPC_CHANNELS.PROVIDERS_SET_MODELS,
+      (_event, provider: string, models: string[]) => {
+        try {
+          const providersConfig = this.config.loadProvidersConfig() ?? {};
+
+          if (!providersConfig[provider]) {
+            providersConfig[provider] = {};
+          }
+
+          providersConfig[provider].models = models;
+          this.config.saveProvidersConfig(providersConfig);
+
+          return { success: true, data: undefined };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return { success: false, error: `Failed to set models: ${message}` };
+        }
+      }
+    );
+
     ipcMain.handle(IPC_CHANNELS.PROVIDERS_LIST, () => {
       try {
         // Return all supported providers from centralized registry
@@ -1505,6 +1532,32 @@ export class IpcMain {
       } catch (error) {
         log.error("Failed to list providers:", error);
         return [];
+      }
+    });
+
+    ipcMain.handle(IPC_CHANNELS.PROVIDERS_GET_CONFIG, () => {
+      try {
+        const config = this.config.loadProvidersConfig() ?? {};
+        // Return a sanitized version (only whether API key is set, not the value)
+        const sanitized: Record<
+          string,
+          { apiKeySet: boolean; baseUrl?: string; models?: string[] }
+        > = {};
+        for (const [provider, providerConfig] of Object.entries(config)) {
+          const baseUrl = providerConfig.baseUrl ?? providerConfig.baseURL;
+          const models = providerConfig.models;
+          sanitized[provider] = {
+            apiKeySet: !!providerConfig.apiKey,
+            baseUrl: typeof baseUrl === "string" ? baseUrl : undefined,
+            models: Array.isArray(models)
+              ? models.filter((m): m is string => typeof m === "string")
+              : undefined,
+          };
+        }
+        return sanitized;
+      } catch (error) {
+        log.error("Failed to get providers config:", error);
+        return {};
       }
     });
   }
