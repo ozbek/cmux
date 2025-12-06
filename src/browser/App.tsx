@@ -121,14 +121,6 @@ function AppInner() {
     prevWorkspaceRef.current = selectedWorkspace;
   }, [selectedWorkspace, telemetry]);
 
-  // Validate selectedWorkspace when metadata changes
-  // Clear selection if workspace was deleted
-  useEffect(() => {
-    if (selectedWorkspace && !workspaceMetadata.has(selectedWorkspace.workspaceId)) {
-      setSelectedWorkspace(null);
-    }
-  }, [selectedWorkspace, workspaceMetadata, setSelectedWorkspace]);
-
   // Track last-read timestamps for unread indicators
   const { lastReadTimestamps, onToggleUnread } = useUnreadTracking(selectedWorkspace);
 
@@ -571,15 +563,22 @@ function AppInner() {
             {selectedWorkspace ? (
               (() => {
                 const currentMetadata = workspaceMetadata.get(selectedWorkspace.workspaceId);
+                // Guard: Don't render AIView if workspace metadata not found.
+                // This can happen when selectedWorkspace (from localStorage) refers to a
+                // deleted workspace, or during a race condition on reload before the
+                // validation effect clears the stale selection.
+                if (!currentMetadata) {
+                  return null;
+                }
                 // Use metadata.name for workspace name (works for both worktree and local runtimes)
                 // Fallback to path-based derivation for legacy compatibility
                 const workspaceName =
-                  currentMetadata?.name ??
+                  currentMetadata.name ??
                   selectedWorkspace.namedWorkspacePath?.split("/").pop() ??
                   selectedWorkspace.workspaceId;
                 // Use live metadata path (updates on rename) with fallback to initial path
                 const workspacePath =
-                  currentMetadata?.namedWorkspacePath ?? selectedWorkspace.namedWorkspacePath ?? "";
+                  currentMetadata.namedWorkspacePath ?? selectedWorkspace.namedWorkspacePath ?? "";
                 return (
                   <ErrorBoundary
                     workspaceInfo={`${selectedWorkspace.projectName}/${workspaceName}`}
@@ -591,9 +590,9 @@ function AppInner() {
                       projectName={selectedWorkspace.projectName}
                       branch={workspaceName}
                       namedWorkspacePath={workspacePath}
-                      runtimeConfig={currentMetadata?.runtimeConfig}
-                      incompatibleRuntime={currentMetadata?.incompatibleRuntime}
-                      status={currentMetadata?.status}
+                      runtimeConfig={currentMetadata.runtimeConfig}
+                      incompatibleRuntime={currentMetadata.incompatibleRuntime}
+                      status={currentMetadata.status}
                     />
                   </ErrorBoundary>
                 );
