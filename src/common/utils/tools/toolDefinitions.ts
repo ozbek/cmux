@@ -52,6 +52,26 @@ export const TOOL_DEFINITIONS = {
         .describe(
           `Timeout (seconds, default: ${BASH_DEFAULT_TIMEOUT_SECS}). Start small and increase on retry; avoid large initial values to keep UX responsive`
         ),
+      run_in_background: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Run this command in the background without blocking. " +
+            "Use for processes running >5s (dev servers, builds, file watchers). " +
+            "Do NOT use for quick commands (<5s), interactive processes (no stdin support), " +
+            "or processes requiring real-time output (use foreground with larger timeout instead). " +
+            "Returns immediately with process_id (e.g., bg-a1b2c3d4), stdout_path, and stderr_path. " +
+            "Read output with bash (e.g., tail -50 <stdout_path>). " +
+            "Terminate with bash_background_terminate using the process_id. " +
+            "Process persists until terminated or workspace is removed."
+        ),
+      display_name: z
+        .string()
+        .optional()
+        .describe(
+          "Human-readable name for background processes (e.g., 'Dev Server', 'TypeCheck Watch'). " +
+            "Only used when run_in_background=true."
+        ),
     }),
   },
   file_read: {
@@ -229,6 +249,26 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  bash_background_list: {
+    description:
+      "List all background processes started with bash(run_in_background=true). " +
+      "Returns process_id, status, script, stdout_path, stderr_path for each process. " +
+      "Use to find process_id for termination or check output file paths.",
+    schema: z.object({}),
+  },
+  bash_background_terminate: {
+    description:
+      "Terminate a background process started with bash(run_in_background=true). " +
+      "Use process_id from the original bash response or from bash_background_list. " +
+      "Sends SIGTERM, waits briefly, then SIGKILL if needed. " +
+      "Output files remain available after termination.",
+    schema: z.object({
+      process_id: z
+        .string()
+        .regex(/^bg-[0-9a-f]{8}$/, "Invalid process ID format")
+        .describe("Background process ID to terminate"),
+    }),
+  },
   web_fetch: {
     description:
       `Fetch a web page and extract its main content as clean markdown. ` +
@@ -272,6 +312,8 @@ export function getAvailableTools(modelString: string): string[] {
   // Base tools available for all models
   const baseTools = [
     "bash",
+    "bash_background_list",
+    "bash_background_terminate",
     "file_read",
     "file_edit_replace_string",
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state

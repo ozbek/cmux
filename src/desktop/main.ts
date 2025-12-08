@@ -564,6 +564,30 @@ if (gotTheLock) {
     }
   });
 
+  // Track if we're in the middle of disposing to prevent re-entry
+  let isDisposing = false;
+
+  app.on("before-quit", (event) => {
+    // Skip if already disposing or no services to clean up
+    if (isDisposing || !services) {
+      return;
+    }
+
+    // Prevent quit, clean up, then quit again
+    event.preventDefault();
+    isDisposing = true;
+
+    // Race dispose against timeout to ensure app quits even if disposal hangs
+    const disposePromise = services.dispose().catch((err) => {
+      console.error("Error during ServiceContainer dispose:", err);
+    });
+    const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 5000));
+
+    void Promise.race([disposePromise, timeoutPromise]).finally(() => {
+      app.quit();
+    });
+  });
+
   app.on("window-all-closed", () => {
     if (process.platform !== "darwin") {
       app.quit();
