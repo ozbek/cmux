@@ -17,11 +17,89 @@ import {
   extractTextFromEvents,
   HAIKU_MODEL,
 } from "./helpers";
+import type { StreamCollector } from "./streamCollector";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 if (shouldRunIntegrationTests()) {
   validateApiKeys(["ANTHROPIC_API_KEY"]);
+}
+
+// Shared types for MCP content parsing
+type MediaItem = { type: "media"; data: string; mediaType: string };
+type TextItem = { type: "text"; text: string };
+
+function isMediaItem(item: unknown): item is MediaItem {
+  return (
+    typeof item === "object" &&
+    item !== null &&
+    "type" in item &&
+    (item as { type: string }).type === "media"
+  );
+}
+
+function isTextItem(item: unknown): item is TextItem {
+  return (
+    typeof item === "object" &&
+    item !== null &&
+    "type" in item &&
+    (item as { type: string }).type === "text"
+  );
+}
+
+/**
+ * Assert that a screenshot result has valid media content.
+ * Verifies: proper structure, no omitted images, no base64 in text, valid mediaType.
+ */
+function assertValidScreenshotResult(
+  result: unknown,
+  allowedMediaTypes?: RegExp
+): { mediaItems: MediaItem[]; textItems: TextItem[] } {
+  expect(typeof result).toBe("object");
+  expect(result).not.toBeNull();
+  expect(result).toHaveProperty("type", "content");
+  expect(result).toHaveProperty("value");
+
+  const value = (result as { value: unknown[] }).value;
+  expect(Array.isArray(value)).toBe(true);
+
+  const mediaItems = value.filter(isMediaItem);
+  const textItems = value.filter(isTextItem);
+
+  // No "Image omitted" text
+  const hasOmittedImageText = textItems.some((t) => t.text.includes("Image omitted"));
+  expect(hasOmittedImageText).toBe(false);
+
+  // Must have at least one media item
+  expect(mediaItems.length).toBeGreaterThan(0);
+
+  // Text parts must not contain base64 blobs (would indicate serialization as text)
+  const longBase64Pattern = /[A-Za-z0-9+/]{10000,}/;
+  for (const t of textItems) {
+    expect(t.text.startsWith("data:image")).toBe(false);
+    expect(longBase64Pattern.test(t.text)).toBe(false);
+  }
+
+  // Validate media items
+  const typePattern = allowedMediaTypes ?? /^image\//;
+  for (const media of mediaItems) {
+    expect(media.mediaType).toBeDefined();
+    expect(media.mediaType).toMatch(typePattern);
+    expect(media.data).toBeDefined();
+    expect(media.data.length).toBeGreaterThan(1000);
+  }
+
+  return { mediaItems, textItems };
+}
+
+/**
+ * Assert that the model response describes example.com content.
+ */
+function assertModelDescribesScreenshot(collector: StreamCollector): void {
+  const deltas = collector.getDeltas();
+  const responseText = extractTextFromEvents(deltas).toLowerCase();
+  expect(responseText).toContain("example domain");
+  expect(responseText.length).toBeGreaterThan(20);
 }
 
 describeIntegration("MCP project configuration", () => {
@@ -75,22 +153,32 @@ describeIntegration("MCP project configuration", () => {
 });
 
 describeIntegration("MCP server integration with model", () => {
-  test.concurrent(
-    "MCP image content is correctly transformed to AI SDK format",
-    async () => {
-      console.log("[MCP Image Test] Setting up workspace...");
-      // Setup workspace with Anthropic provider
+  // Test matrix for image format handling
+  const imageFormatCases = [
+    {
+      name: "PNG",
+      prompt: "Navigate to https://example.com and take a screenshot. Describe what you see.",
+      mediaTypePattern: /^image\//,
+    },
+    {
+      name: "JPEG",
+      prompt:
+        'Navigate to https://example.com and take a screenshot in JPEG format (use format: "jpeg"). Describe what you see.',
+      mediaTypePattern: /^image\/(jpeg|jpg|webp)$/,
+    },
+  ] as const;
+
+  test.concurrent.each(imageFormatCases)(
+    "MCP $name image content is correctly transformed to AI SDK format",
+    async ({ name, prompt, mediaTypePattern }) => {
       const { env, workspaceId, tempGitRepo, cleanup } = await setupWorkspace(
         "anthropic",
-        "mcp-chrome"
+        `mcp-chrome-${name.toLowerCase()}`
       );
       const client = resolveOrpcClient(env);
-      console.log("[MCP Image Test] Workspace created:", { workspaceId, tempGitRepo });
 
       try {
-        // Add the Chrome DevTools MCP server to the project
-        // Use --headless and --no-sandbox for CI/root environments
-        console.log("[MCP Image Test] Adding Chrome DevTools MCP server...");
+        // Add Chrome DevTools MCP server (headless + no-sandbox for CI)
         const addResult = await client.projects.mcp.add({
           projectPath: tempGitRepo,
           name: "chrome",
@@ -98,119 +186,35 @@ describeIntegration("MCP server integration with model", () => {
             "npx -y chrome-devtools-mcp@latest --headless --isolated --chromeArg='--no-sandbox'",
         });
         expect(addResult.success).toBe(true);
-        console.log("[MCP Image Test] MCP server added");
 
-        // Create stream collector to capture events
-        console.log("[MCP Image Test] Creating stream collector...");
         const collector = createStreamCollector(env.orpc, workspaceId);
         collector.start();
         await collector.waitForSubscription();
-        console.log("[MCP Image Test] Stream collector ready");
 
-        // Send a message that should trigger screenshot
-        // First navigate to a simple page, then take a screenshot
-        console.log("[MCP Image Test] Sending message...");
-        const result = await sendMessageWithModel(
-          env,
-          workspaceId,
-          "Navigate to https://example.com and take a screenshot. Describe what you see in the screenshot.",
-          HAIKU_MODEL
-        );
-        console.log("[MCP Image Test] Message sent, result:", result.success);
-
+        const result = await sendMessageWithModel(env, workspaceId, prompt, HAIKU_MODEL);
         expect(result.success).toBe(true);
 
-        // Wait for stream to complete (this may take a while with Chrome)
-        console.log("[MCP Image Test] Waiting for stream-end...");
-        await collector.waitForEvent("stream-end", 120000); // 2 minutes for Chrome operations
-        console.log("[MCP Image Test] Stream ended");
+        await collector.waitForEvent("stream-end", 120000);
         assertStreamSuccess(collector);
 
-        // Find the screenshot tool call and its result
+        // Find screenshot tool result
         const events = collector.getEvents();
         const toolCallEnds = events.filter(
           (e): e is Extract<typeof e, { type: "tool-call-end" }> => e.type === "tool-call-end"
         );
-        console.log(
-          "[MCP Image Test] Tool call ends:",
-          toolCallEnds.map((e) => ({ toolName: e.toolName, resultType: typeof e.result }))
-        );
-
-        // Find the screenshot tool result (namespaced as chrome_take_screenshot)
         const screenshotResult = toolCallEnds.find((e) => e.toolName === "chrome_take_screenshot");
         expect(screenshotResult).toBeDefined();
 
-        // Verify the result has correct AI SDK format with mediaType
-        const result_output = screenshotResult!.result as
-          | { type: string; value: unknown[] }
-          | unknown;
-        // Log media items to verify mediaType presence
-        if (
-          typeof result_output === "object" &&
-          result_output !== null &&
-          "value" in result_output
-        ) {
-          const value = (result_output as { value: unknown[] }).value;
-          const mediaPreview = value
-            .filter(
-              (v): v is object =>
-                typeof v === "object" &&
-                v !== null &&
-                "type" in v &&
-                (v as { type: string }).type === "media"
-            )
-            .map((m) => ({
-              type: (m as { type: string }).type,
-              mediaType: (m as { mediaType?: string }).mediaType,
-              dataLen: ((m as { data?: string }).data || "").length,
-            }));
-          console.log("[MCP Image Test] Media items:", JSON.stringify(mediaPreview));
-        }
-
-        // If it's properly transformed, it should have { type: "content", value: [...] }
-        if (
-          typeof result_output === "object" &&
-          result_output !== null &&
-          "type" in result_output
-        ) {
-          const typedResult = result_output as { type: string; value: unknown[] };
-          expect(typedResult.type).toBe("content");
-          expect(Array.isArray(typedResult.value)).toBe(true);
-
-          // Check for media content with mediaType
-          const mediaItems = typedResult.value.filter(
-            (item): item is { type: "media"; data: string; mediaType: string } =>
-              typeof item === "object" &&
-              item !== null &&
-              "type" in item &&
-              (item as { type: string }).type === "media"
-          );
-
-          expect(mediaItems.length).toBeGreaterThan(0);
-          // Verify mediaType is present and is a valid image type
-          for (const media of mediaItems) {
-            expect(media.mediaType).toBeDefined();
-            expect(media.mediaType).toMatch(/^image\//);
-            expect(media.data).toBeDefined();
-            expect(media.data.length).toBeGreaterThan(100); // Should have actual image data
-          }
-        }
-
-        // Verify model's response mentions seeing something (proves it understood the image)
-        const deltas = collector.getDeltas();
-        const responseText = extractTextFromEvents(deltas).toLowerCase();
-        console.log("[MCP Image Test] Response text preview:", responseText.slice(0, 200));
-        // Model should describe something it sees - domain name, content, or visual elements
-        expect(responseText).toMatch(/example|domain|website|page|text|heading|title/i);
+        // Validate result structure and media content
+        assertValidScreenshotResult(screenshotResult!.result, mediaTypePattern);
+        assertModelDescribesScreenshot(collector);
 
         collector.stop();
       } finally {
-        console.log("[MCP Image Test] Cleaning up...");
         await cleanup();
-        console.log("[MCP Image Test] Done");
       }
     },
-    180000 // 3 minutes - Chrome operations can be slow
+    180000
   );
 
   test.concurrent(
