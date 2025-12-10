@@ -13,9 +13,9 @@ import type {
 } from "@/common/orpc/types";
 import { createAuthMiddleware } from "./authMiddleware";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
-import { getPlanFilePath } from "@/common/utils/planStorage";
+
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import { readFileString } from "@/node/utils/runtime/helpers";
+import { readPlanFile } from "@/node/utils/runtime/helpers";
 import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
 
 export const router = (authToken?: string) => {
@@ -592,9 +592,7 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.getPlanContent.input)
         .output(schemas.workspace.getPlanContent.output)
         .handler(async ({ context, input }) => {
-          const planPath = getPlanFilePath(input.workspaceId);
-
-          // Get workspace metadata to determine runtime
+          // Get workspace metadata to determine runtime and paths
           const metadata = await context.workspaceService.getInfo(input.workspaceId);
           if (!metadata) {
             return { success: false as const, error: `Workspace not found: ${input.workspaceId}` };
@@ -605,12 +603,17 @@ export const router = (authToken?: string) => {
             projectPath: metadata.projectPath,
           });
 
-          try {
-            const content = await readFileString(runtime, planPath);
-            return { success: true as const, data: { content, path: planPath } };
-          } catch {
-            return { success: false as const, error: `Plan file not found at ${planPath}` };
+          const result = await readPlanFile(
+            runtime,
+            metadata.name,
+            metadata.projectName,
+            input.workspaceId
+          );
+
+          if (!result.exists) {
+            return { success: false as const, error: `Plan file not found at ${result.path}` };
           }
+          return { success: true as const, data: { content: result.content, path: result.path } };
         }),
       backgroundBashes: {
         subscribe: t

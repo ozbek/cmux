@@ -40,6 +40,8 @@ import { createBashTool } from "@/node/services/tools/bash";
 import type { BashToolResult } from "@/common/types/tools";
 import { secretsToRecord } from "@/common/types/secrets";
 
+import { movePlanFile } from "@/node/utils/runtime/helpers";
+
 /** Maximum number of retry attempts when workspace name collides */
 const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
 
@@ -559,6 +561,9 @@ export class WorkspaceService extends EventEmitter {
         }
         return config;
       });
+
+      // Rename plan file if it exists (uses workspace name, not ID)
+      await movePlanFile(runtime, oldName, newName, oldMetadata.projectName);
 
       const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
       const updatedMetadata = allMetadataUpdated.find((m) => m.id === workspaceId);

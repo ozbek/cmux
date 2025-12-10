@@ -79,10 +79,12 @@ describeIntegration("Plan Commands Integration", () => {
       if (!createResult.success) throw new Error("Failed to create workspace");
 
       const workspaceId = createResult.metadata.id;
+      const workspaceName = createResult.metadata.name;
+      const projectName = createResult.metadata.projectName;
 
       try {
         // Create a plan file
-        const planPath = getPlanFilePath(workspaceId);
+        const planPath = getPlanFilePath(workspaceName, projectName);
         const expandedPlanPath = expandTilde(planPath);
         const planDir = path.dirname(expandedPlanPath);
         await fs.mkdir(planDir, { recursive: true });
@@ -116,10 +118,12 @@ describeIntegration("Plan Commands Integration", () => {
       if (!createResult.success) throw new Error("Failed to create workspace");
 
       const workspaceId = createResult.metadata.id;
+      const workspaceName = createResult.metadata.name;
+      const projectName = createResult.metadata.projectName;
 
       try {
         // Create an empty plan file
-        const planPath = getPlanFilePath(workspaceId);
+        const planPath = getPlanFilePath(workspaceName, projectName);
         const expandedPlanPath = expandTilde(planPath);
         const planDir = path.dirname(expandedPlanPath);
         await fs.mkdir(planDir, { recursive: true });
@@ -153,10 +157,12 @@ describeIntegration("Plan Commands Integration", () => {
       if (!createResult.success) throw new Error("Failed to create workspace");
 
       const workspaceId = createResult.metadata.id;
+      const workspaceName = createResult.metadata.name;
+      const projectName = createResult.metadata.projectName;
 
       try {
         // Create a plan file
-        const planPath = getPlanFilePath(workspaceId);
+        const planPath = getPlanFilePath(workspaceName, projectName);
         const planDir = path.dirname(planPath);
         await fs.mkdir(planDir, { recursive: true });
         await fs.writeFile(planPath, "# Test Plan");

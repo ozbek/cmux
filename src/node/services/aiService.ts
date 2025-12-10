@@ -57,7 +57,7 @@ import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
 import type { UIMode } from "@/common/types/mode";
-import { readFileString } from "@/node/utils/runtime/helpers";
+import { readPlanFile } from "@/node/utils/runtime/helpers";
 
 // Export a standalone version of getToolsForModel for use in backend
 
@@ -992,17 +992,18 @@ export class AIService extends EventEmitter {
       // Construct plan mode instruction if in plan mode
       // This is done backend-side because we have access to the plan file path
       let effectiveAdditionalInstructions = additionalSystemInstructions;
+      const planFilePath = getPlanFilePath(metadata.name, metadata.projectName);
+
+      // Read plan file (handles legacy migration transparently)
+      const planResult = await readPlanFile(
+        runtime,
+        metadata.name,
+        metadata.projectName,
+        workspaceId
+      );
+
       if (mode === "plan") {
-        const planFilePath = getPlanFilePath(workspaceId);
-        // Check if plan file exists using runtime (supports both local and SSH)
-        let planExists = false;
-        try {
-          await runtime.stat(planFilePath);
-          planExists = true;
-        } catch {
-          // File doesn't exist
-        }
-        const planModeInstruction = getPlanModeInstruction(planFilePath, planExists);
+        const planModeInstruction = getPlanModeInstruction(planFilePath, planResult.exists);
         effectiveAdditionalInstructions = additionalSystemInstructions
           ? `${planModeInstruction}\n\n${additionalSystemInstructions}`
           : planModeInstruction;
@@ -1015,16 +1016,8 @@ export class AIService extends EventEmitter {
         const lastAssistantMessage = [...filteredMessages]
           .reverse()
           .find((m) => m.role === "assistant");
-        if (lastAssistantMessage?.metadata?.mode === "plan") {
-          const planFilePath = getPlanFilePath(workspaceId);
-          try {
-            const content = await readFileString(runtime, planFilePath);
-            if (content.trim()) {
-              planContentForTransition = content;
-            }
-          } catch {
-            // No plan file exists, proceed without plan content
-          }
+        if (lastAssistantMessage?.metadata?.mode === "plan" && planResult.content.trim()) {
+          planContentForTransition = planResult.content;
         }
       }
 
@@ -1141,7 +1134,7 @@ export class AIService extends EventEmitter {
           backgroundProcessManager: this.backgroundProcessManager,
           // Plan mode configuration for path enforcement
           mode: mode as UIMode | undefined,
-          planFilePath: mode === "plan" ? getPlanFilePath(workspaceId) : undefined,
+          planFilePath: mode === "plan" ? planFilePath : undefined,
           workspaceId,
           // External edit detection callback
           recordFileState,
