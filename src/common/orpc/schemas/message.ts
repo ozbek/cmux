@@ -27,14 +27,39 @@ const MuxToolPartBase = z.object({
   timestamp: z.number().optional(),
 });
 
+/**
+ * Schema for nested tool calls within code_execution.
+ *
+ * RUNTIME VS PERSISTED STATE:
+ * The `nestedCalls` field is RUNTIME-ONLY state - it is NOT persisted to chat.jsonl.
+ * - During live streaming: parentToolCallId on events → aggregator stores in part.nestedCalls
+ * - In chat.jsonl: Only result.toolCalls (inside PTCExecutionResult output) is persisted
+ * - On history replay: Aggregator reconstructs nestedCalls from result.toolCalls
+ *
+ * This means the schema describes runtime state that differs from persisted state.
+ * The reconstruction logic lives in StreamingMessageAggregator.getDisplayedMessages().
+ *
+ * Not exported - only used internally for typing nestedCalls arrays.
+ */
+const NestedToolCallSchema = z.object({
+  toolCallId: z.string(),
+  toolName: z.string(),
+  input: z.unknown(),
+  output: z.unknown().optional(),
+  state: z.enum(["input-available", "output-available"]),
+  timestamp: z.number().optional(),
+});
+
 // Discriminated tool part schemas - output required only when state is "output-available"
 export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
   state: z.literal("input-available"),
+  nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 
 export const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
+  nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 
 export const DynamicToolPartSchema = z.discriminatedUnion("state", [
@@ -82,8 +107,8 @@ export const MuxMessageSchema = z.object({
       systemMessageTokens: z.number().optional(),
       muxMetadata: z.any().optional(),
       cmuxMetadata: z.any().optional(), // Legacy field for backward compatibility
-      compacted: z.boolean().optional(), // Marks compaction summary messages
-      idleCompacted: z.boolean().optional(), // Marks auto-compaction due to inactivity
+      // Compaction source: "user" (manual), "idle" (auto), or legacy boolean (true)
+      compacted: z.union([z.literal("user"), z.literal("idle"), z.boolean()]).optional(),
       toolPolicy: z.any().optional(),
       mode: z.string().optional(),
       partial: z.boolean().optional(),
