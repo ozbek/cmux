@@ -11,7 +11,6 @@ import {
   DetailSection,
   DetailLabel,
   DetailContent,
-  LoadingDots,
   ToolIcon,
   ErrorBox,
   ExitCodeBadge,
@@ -23,9 +22,12 @@ import {
   type ToolStatus,
 } from "./shared/toolUtils";
 import { cn } from "@/common/lib/utils";
+import { useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../ui/tooltip";
 
 interface BashToolCallProps {
+  workspaceId?: string;
+  toolCallId?: string;
   args: BashToolArgs;
   result?: BashToolResult;
   status?: ToolStatus;
@@ -36,7 +38,16 @@ interface BashToolCallProps {
   onSendToBackground?: () => void;
 }
 
+const EMPTY_LIVE_OUTPUT = {
+  stdout: "",
+  stderr: "",
+  combined: "",
+  truncated: false,
+};
+
 export const BashToolCall: React.FC<BashToolCallProps> = ({
+  workspaceId,
+  toolCallId,
   args,
   result,
   status = "pending",
@@ -46,6 +57,27 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 }) => {
   const { expanded, toggleExpanded } = useToolExpansion();
   const [elapsedTime, setElapsedTime] = useState(0);
+
+  const liveOutput = useBashToolLiveOutput(workspaceId, toolCallId);
+
+  const outputRef = useRef<HTMLPreElement>(null);
+  const outputPinnedRef = useRef(true);
+
+  const updatePinned = (el: HTMLPreElement) => {
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    outputPinnedRef.current = distanceToBottom < 40;
+  };
+
+  const liveOutputView = liveOutput ?? EMPTY_LIVE_OUTPUT;
+  const combinedLiveOutput = liveOutputView.combined;
+
+  useEffect(() => {
+    const el = outputRef.current;
+    if (!el) return;
+    if (outputPinnedRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [combinedLiveOutput]);
   const startTimeRef = useRef<number>(startedAt ?? Date.now());
 
   // Track elapsed time for pending/executing status
@@ -73,6 +105,11 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   // but for a foreground→background migration we want to show "backgrounded"
   const effectiveStatus: ToolStatus =
     status === "completed" && result && "backgroundProcessId" in result ? "backgrounded" : status;
+
+  const resultHasOutput = typeof (result as { output?: unknown } | undefined)?.output === "string";
+
+  const showLiveOutput =
+    !isBackground && (status === "executing" || (Boolean(liveOutput) && !resultHasOutput));
 
   return (
     <ToolContainer expanded={expanded}>
@@ -142,6 +179,30 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             <DetailContent className="px-2 py-1.5">{args.script}</DetailContent>
           </DetailSection>
 
+          {showLiveOutput && (
+            <>
+              {liveOutputView.truncated && (
+                <div className="text-muted px-2 text-[10px] italic">
+                  Live output truncated (showing last ~1MB)
+                </div>
+              )}
+
+              <DetailSection>
+                <DetailLabel>Output</DetailLabel>
+                <DetailContent
+                  ref={outputRef}
+                  onScroll={(e) => updatePinned(e.currentTarget)}
+                  className={cn(
+                    "px-2 py-1.5",
+                    combinedLiveOutput.length === 0 && "text-muted italic"
+                  )}
+                >
+                  {combinedLiveOutput.length > 0 ? combinedLiveOutput : "No output yet"}
+                </DetailContent>
+              </DetailSection>
+            </>
+          )}
+
           {result && (
             <>
               {result.success === false && result.error && (
@@ -170,15 +231,6 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
                 )
               )}
             </>
-          )}
-
-          {status === "executing" && !result && (
-            <DetailSection>
-              <DetailContent className="px-2 py-1.5">
-                Waiting for result
-                <LoadingDots />
-              </DetailContent>
-            </DetailSection>
           )}
         </ToolDetails>
       )}
