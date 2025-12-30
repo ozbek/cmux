@@ -52,6 +52,7 @@ import {
 } from "@/browser/utils/chatCommands";
 import { shouldTriggerAutoCompaction } from "@/browser/utils/compaction/shouldTriggerAutoCompaction";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { findAtMentionAtCursor } from "@/common/utils/atMentions";
 import {
   getSlashCommandSuggestions,
   type SlashSuggestion,
@@ -154,6 +155,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
   const { variant } = props;
   const [thinkingLevel] = useThinkingLevel();
+  const atMentionProjectPath = variant === "creation" ? props.projectPath : null;
   const workspaceId = variant === "workspace" ? props.workspaceId : null;
 
   // Extract workspace-specific props with defaults
@@ -184,7 +186,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const [input, setInput] = usePersistedState(storageKeys.inputKey, "", { listener: true });
   const [isSending, setIsSending] = useState(false);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
+  const [showAtMentionSuggestions, setShowAtMentionSuggestions] = useState(false);
+  const [atMentionSuggestions, setAtMentionSuggestions] = useState<SlashSuggestion[]>([]);
+  const atMentionDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const atMentionRequestIdRef = useRef(0);
+  const lastAtMentionScopeIdRef = useRef<string | null>(null);
+  const lastAtMentionQueryRef = useRef<string | null>(null);
+  const lastAtMentionInputRef = useRef<string>(input);
   const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
+
   const [commandSuggestions, setCommandSuggestions] = useState<SlashSuggestion[]>([]);
   const [providerNames, setProviderNames] = useState<string[]>([]);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -253,6 +263,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
+  const [atMentionCursorNonce, setAtMentionCursorNonce] = useState(0);
+  const lastAtMentionCursorRef = useRef<number | null>(null);
+  const handleAtMentionCursorActivity = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) {
+      return;
+    }
+
+    const nextCursor = el.selectionStart ?? input.length;
+    if (lastAtMentionCursorRef.current === nextCursor) {
+      return;
+    }
+
+    lastAtMentionCursorRef.current = nextCursor;
+    setAtMentionCursorNonce((n) => n + 1);
+  }, [input.length]);
 
   // Draft state combines text input and image attachments
   // Reviews are managed separately via props (persisted in pendingReviews state)
@@ -294,6 +320,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       listener: true,
     }
   );
+  const atMentionListId = useId();
   const commandListId = useId();
   const telemetry = useTelemetry();
   const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
@@ -650,6 +677,125 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only run when editingMessage changes
   }, [editingMessage]);
 
+  // Watch input/cursor for @file mentions
+  useEffect(() => {
+    if (atMentionDebounceRef.current) {
+      clearTimeout(atMentionDebounceRef.current);
+      atMentionDebounceRef.current = null;
+    }
+
+    const inputChanged = lastAtMentionInputRef.current !== input;
+    lastAtMentionInputRef.current = input;
+
+    const atMentionScopeId = variant === "workspace" ? workspaceId : atMentionProjectPath;
+
+    if (!api || !atMentionScopeId) {
+      // Invalidate any in-flight completion request.
+      atMentionRequestIdRef.current++;
+      lastAtMentionScopeIdRef.current = null;
+      lastAtMentionQueryRef.current = null;
+      setAtMentionSuggestions([]);
+      setShowAtMentionSuggestions(false);
+      return;
+    }
+
+    // Prefer slash command suggestions when the input is a command.
+    if (input.trimStart().startsWith("/")) {
+      // Invalidate any in-flight completion request.
+      atMentionRequestIdRef.current++;
+      lastAtMentionScopeIdRef.current = null;
+      lastAtMentionQueryRef.current = null;
+      setAtMentionSuggestions([]);
+      setShowAtMentionSuggestions(false);
+      return;
+    }
+
+    const cursor = inputRef.current?.selectionStart ?? input.length;
+    const match = findAtMentionAtCursor(input, cursor);
+
+    if (!match) {
+      // Invalidate any in-flight completion request.
+      atMentionRequestIdRef.current++;
+      lastAtMentionScopeIdRef.current = null;
+      lastAtMentionQueryRef.current = null;
+      setAtMentionSuggestions([]);
+      setShowAtMentionSuggestions(false);
+      return;
+    }
+
+    // If the user is moving the caret and we aren't already showing suggestions, don't re-open.
+    if (!inputChanged && !showAtMentionSuggestions) {
+      return;
+    }
+
+    // Avoid refetching on caret movement within the same token/query.
+    if (
+      !inputChanged &&
+      lastAtMentionScopeIdRef.current === atMentionScopeId &&
+      lastAtMentionQueryRef.current === match.query
+    ) {
+      return;
+    }
+
+    lastAtMentionScopeIdRef.current = atMentionScopeId;
+    lastAtMentionQueryRef.current = match.query;
+
+    const requestId = ++atMentionRequestIdRef.current;
+    const runRequest = () => {
+      void (async () => {
+        try {
+          const result =
+            variant === "workspace"
+              ? await api.workspace.getFileCompletions({
+                  workspaceId: atMentionScopeId,
+                  query: match.query,
+                  limit: 20,
+                })
+              : await api.projects.getFileCompletions({
+                  projectPath: atMentionScopeId,
+                  query: match.query,
+                  limit: 20,
+                });
+
+          if (atMentionRequestIdRef.current !== requestId) {
+            return;
+          }
+
+          const nextSuggestions = result.paths
+            // File @mentions are whitespace-delimited (extractAtMentions uses /@(\S+)/), so
+            // suggestions containing spaces would be inserted incorrectly (e.g. "@foo bar.ts").
+            .filter((p) => !/\s/.test(p))
+            .map((p) => ({
+              id: `file:${p}`,
+              display: p,
+              description: "File",
+              replacement: `@${p}`,
+            }));
+
+          setAtMentionSuggestions(nextSuggestions);
+          setShowAtMentionSuggestions(nextSuggestions.length > 0);
+        } catch {
+          if (atMentionRequestIdRef.current === requestId) {
+            setAtMentionSuggestions([]);
+            setShowAtMentionSuggestions(false);
+          }
+        }
+      })();
+    };
+
+    // Our backend autocomplete is cheap (indexed) and cached, so update suggestions on every
+    // character rather than waiting for a debounce window.
+    runRequest();
+  }, [
+    api,
+    input,
+    showAtMentionSuggestions,
+    variant,
+    workspaceId,
+    atMentionProjectPath,
+    atMentionCursorNonce,
+  ]);
+
   // Watch input for slash commands
   useEffect(() => {
     const suggestions = getSlashCommandSuggestions(input, { providerNames, variant });
@@ -929,7 +1075,37 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [editingMessage, pushToast, setImageAttachments]
   );
 
-  // Handle command selection
+  // Handle suggestion selection
+
+  const handleAtMentionSelect = useCallback(
+    (suggestion: SlashSuggestion) => {
+      const cursor = inputRef.current?.selectionStart ?? input.length;
+      const match = findAtMentionAtCursor(input, cursor);
+      if (!match) {
+        return;
+      }
+
+      const next =
+        input.slice(0, match.startIndex) + suggestion.replacement + input.slice(match.endIndex);
+
+      setInput(next);
+      setAtMentionSuggestions([]);
+      setShowAtMentionSuggestions(false);
+
+      requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!el || el.disabled) {
+          return;
+        }
+
+        el.focus();
+        const newCursor = match.startIndex + suggestion.replacement.length;
+        el.selectionStart = newCursor;
+        el.selectionEnd = newCursor;
+      });
+    },
+    [input, setInput]
+  );
   const handleCommandSelect = useCallback(
     (suggestion: SlashSuggestion) => {
       setInput(suggestion.replacement);
@@ -1546,11 +1722,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // Note: ESC handled by VimTextArea (for mode transitions) and CommandSuggestions (for dismissal)
 
-    // Don't handle keys if command suggestions are visible
+    // Don't handle keys if suggestions are visible
     if (
-      showCommandSuggestions &&
-      commandSuggestions.length > 0 &&
-      COMMAND_SUGGESTION_KEYS.includes(e.key)
+      COMMAND_SUGGESTION_KEYS.includes(e.key) &&
+      ((showCommandSuggestions && commandSuggestions.length > 0) ||
+        (showAtMentionSuggestions && atMentionSuggestions.length > 0))
     ) {
       return; // Let CommandSuggestions handle it
     }
@@ -1711,7 +1887,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             />
           )}
 
-          {/* Command suggestions - available in both variants */}
+          {/* File path suggestions (@src/foo.ts) */}
+          <CommandSuggestions
+            suggestions={atMentionSuggestions}
+            onSelectSuggestion={handleAtMentionSelect}
+            onDismiss={() => setShowAtMentionSuggestions(false)}
+            isVisible={showAtMentionSuggestions}
+            ariaLabel="File path suggestions"
+            listId={atMentionListId}
+            anchorRef={variant === "creation" ? inputRef : undefined}
+          />
+
+          {/* Slash command suggestions - available in both variants */}
           {/* In creation mode, use portal (anchorRef) to escape overflow:hidden containers */}
           <CommandSuggestions
             suggestions={commandSuggestions}
@@ -1742,10 +1929,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   onChange={setInput}
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
+                  onKeyUp={handleAtMentionCursorActivity}
+                  onMouseUp={handleAtMentionCursorActivity}
+                  onSelect={handleAtMentionCursorActivity}
                   onDragOver={handleDragOver}
                   onDrop={handleDrop}
                   onEscapeInNormalMode={handleEscapeInNormalMode}
-                  suppressKeys={showCommandSuggestions ? COMMAND_SUGGESTION_KEYS : undefined}
+                  suppressKeys={
+                    showCommandSuggestions || showAtMentionSuggestions
+                      ? COMMAND_SUGGESTION_KEYS
+                      : undefined
+                  }
                   placeholder={placeholder}
                   disabled={!editingMessage && (disabled || isSendInFlight)}
                   aria-label={editingMessage ? "Edit your last message" : "Message Claude"}
@@ -1753,9 +1947,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   aria-controls={
                     showCommandSuggestions && commandSuggestions.length > 0
                       ? commandListId
-                      : undefined
+                      : showAtMentionSuggestions && atMentionSuggestions.length > 0
+                        ? atMentionListId
+                        : undefined
                   }
-                  aria-expanded={showCommandSuggestions && commandSuggestions.length > 0}
+                  aria-expanded={
+                    (showCommandSuggestions && commandSuggestions.length > 0) ||
+                    (showAtMentionSuggestions && atMentionSuggestions.length > 0)
+                  }
                   className={variant === "creation" ? "min-h-24" : undefined}
                 />
                 {/* Token count - positioned to left of mic */}
