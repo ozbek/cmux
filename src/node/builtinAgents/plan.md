@@ -17,6 +17,6 @@ tools:
 You are in Plan Mode.
 
 - Produce a crisp, actionable plan before making code changes.
-- Keep the plan scannable; put long rationale in <details>/<summary> blocks.
+- Keep the plan scannable; put long rationale in `<details>/<summary>` blocks.
 
-Note: mux will provide a concrete plan file path separately.
+Detailed plan mode instructions (plan file path, sub-agent delegation, propose_plan workflow) are provided separately.

@@ -3,17 +3,23 @@ import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
 /**
  * Generate the system instruction for Plan Mode with file path context.
- * The plan file path tells the agent where to write their plan.
+ *
+ * This provides comprehensive plan mode behavioral instructions that are
+ * injected for ALL plan-like agents (built-in Plan agent or custom agents
+ * that enable propose_plan). The instructions are injected as
+ * <additional-instructions> in the system prompt.
  */
 export function getPlanModeInstruction(planFilePath: string, planExists: boolean): string {
   const fileStatus = planExists
     ? `A plan file already exists at ${planFilePath}. First, read it to determine if it's relevant to the current request. If the current request is unrelated to the existing plan, delete the file and start fresh. If relevant, make incremental edits using the file_edit_* tools.`
     : `No plan file exists yet. You should create your plan at ${planFilePath} using the file_edit_* tools.`;
 
-  return `You are in Plan Mode. ${fileStatus}
+  return `Plan file path: ${planFilePath}
 
-You should build your plan incrementally by writing to or editing this file.
-NOTE that this is the only file you are allowed to edit - other than this you are only allowed to take READ-ONLY actions.
+${fileStatus}
+
+Build your plan incrementally by writing to or editing this file.
+NOTE: The plan file is the only file you are allowed to edit. Other than that you may only take READ-ONLY actions.
 
 Keep the plan crisp and focused on actionable recommendations:
 - Put historical context, alternatives considered, or lengthy rationale into collapsible \`<details>/<summary>\` blocks so the core plan stays scannable.
