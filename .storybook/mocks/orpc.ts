@@ -277,6 +277,20 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       track: async () => undefined,
       status: async () => ({ enabled: true, explicit: false }),
     },
+    signing: {
+      capabilities: async () => ({
+        publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey",
+        githubUser: "mockuser",
+        email: "mockuser@example.com",
+        error: null,
+      }),
+      sign: async () => ({
+        signature: "mockSignature==",
+        publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey",
+        githubUser: "mockuser",
+      }),
+      clearIdentityCache: async () => ({ success: true }),
+    },
     server: {
       getLaunchProject: async () => null,
       getSshHost: async () => null,

@@ -1771,6 +1771,27 @@ export const router = (authToken?: string) => {
           };
         }),
     },
+    signing: {
+      capabilities: t
+        .input(schemas.signing.capabilities.input)
+        .output(schemas.signing.capabilities.output)
+        .handler(async ({ context }) => {
+          return context.signingService.getCapabilities();
+        }),
+      getSignCredentials: t
+        .input(schemas.signing.getSignCredentials.input)
+        .output(schemas.signing.getSignCredentials.output)
+        .handler(async ({ context }) => {
+          return context.signingService.getSignCredentials();
+        }),
+      clearIdentityCache: t
+        .input(schemas.signing.clearIdentityCache.input)
+        .output(schemas.signing.clearIdentityCache.output)
+        .handler(({ context }) => {
+          context.signingService.clearIdentityCache();
+          return { success: true };
+        }),
+    },
   });
 };
 
