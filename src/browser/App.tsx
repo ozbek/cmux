@@ -140,6 +140,11 @@ function AppInner() {
   // Track last-read timestamps for unread indicators
   const { lastReadTimestamps, onToggleUnread } = useUnreadTracking(selectedWorkspace);
 
+  const workspaceMetadataRef = useRef(workspaceMetadata);
+  useEffect(() => {
+    workspaceMetadataRef.current = workspaceMetadata;
+  }, [workspaceMetadata]);
+
   // Auto-resume interrupted streams on app startup and when failures occur
   useResumeManager();
 
@@ -600,6 +605,28 @@ function AppInner() {
         handleForkSwitch as EventListener
       );
   }, [projects, setSelectedWorkspace, setWorkspaceMetadata]);
+
+  // Set up navigation callback for notification clicks
+  useEffect(() => {
+    const navigateToWorkspace = (workspaceId: string) => {
+      const metadata = workspaceMetadataRef.current.get(workspaceId);
+      if (metadata) {
+        setSelectedWorkspace(toWorkspaceSelection(metadata));
+      }
+    };
+
+    // Single source of truth: WorkspaceStore owns the navigation callback.
+    // Browser notifications and Electron notification clicks both route through this.
+    workspaceStore.setNavigateToWorkspace(navigateToWorkspace);
+
+    const unsubscribe = window.api?.onNotificationClicked?.((data) => {
+      workspaceStore.navigateToWorkspace(data.workspaceId);
+    });
+
+    return () => {
+      unsubscribe?.();
+    };
+  }, [setSelectedWorkspace, workspaceStore]);
 
   const handleProviderConfig = useCallback(
     async (provider: string, keyPath: string[], value: string) => {
