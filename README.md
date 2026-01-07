@@ -10,27 +10,9 @@
 
 </div>
 
-> 🎟️ **Have a voucher code?** Redeem it at [gateway.mux.coder.com](https://gateway.mux.coder.com)
-
 ![mux product screenshot](docs/img/product-hero.webp)
 
-A desktop application for parallel agentic development.
-
-<details>
-<summary>Why parallelize?</summary>
-
-Here are some specific use cases we enable:
-
-- **Contextual continuity between relevant changes**:
-  - e.g. create a workspace for `code-review`, `refactor`, and `new-feature`
-- **GPT-5-Pro**: use the slow but powerful GPT-5-Pro for complex issues
-  - Run in the background for hours on end
-  - The stream will automatically resume after restarts or intermittent connection issues. If the model completes early we will show an indicator.
-- **A/B testing**: run multiple workspaces in parallel on the same problem but different approaches,
-  abandon the bad ones.
-- **Tangent exploration**: launch tangents in `mux` away from main work
-
-</details>
+A desktop & browser application for parallel agentic development.
 
 ## Features
 
@@ -51,10 +33,6 @@ like [opportunistic compaction](https://mux.coder.com/workspaces/compaction) and
 **[Read the full documentation →](https://mux.coder.com)**
 
 ## Install
-
-> [!WARNING]  
-> mux is in Beta. You may encounter bugs and performance issues.
-> It's still possible to be highly productive. We are using it almost exclusively for our own development.
 
 Download pre-built binaries from [the releases page](https://github.com/coder/mux/releases) for
 macOS and Linux.
