@@ -71,6 +71,7 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = ({ workspaceId, classNa
   const lastMessage = workspaceState
     ? workspaceState.messages[workspaceState.messages.length - 1]
     : undefined;
+
   const isContextExceeded =
     lastMessage?.type === "stream-error" && lastMessage.errorType === "context_exceeded";
 

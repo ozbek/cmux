@@ -1693,8 +1693,7 @@ export class WorkspaceStore {
     if (isStreamError(data)) {
       applyWorkspaceChatEventToAggregator(aggregator, data);
 
-      // Increment retry attempt counter when stream fails
-      // This handles auth errors that happen AFTER stream-start
+      // Increment retry attempt counter when stream fails.
       updatePersistedState(
         getRetryStateKey(workspaceId),
         (prev) => {
