@@ -1,9 +1,12 @@
-import React, { useState, useCallback } from "react";
-import { Plus, Loader2 } from "lucide-react";
+import React, { useState, useCallback, useRef, useEffect } from "react";
+import { Plus, Loader2, Check, ChevronDown } from "lucide-react";
 import { SUPPORTED_PROVIDERS, PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
-import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
+import {
+  LAST_CUSTOM_MODEL_PROVIDER_KEY,
+  PREFERRED_COMPACTION_MODEL_KEY,
+} from "@/common/constants/storage";
+import { useModelsFromSettings, getSuggestedModels } from "@/browser/hooks/useModelsFromSettings";
 import { useGateway } from "@/browser/hooks/useGatewayModels";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { ModelRow } from "./ModelRow";
@@ -16,7 +19,160 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/ui/select";
+import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/ui/popover";
 import { Button } from "@/browser/components/ui/button";
+import { getModelName } from "@/common/utils/ai/models";
+import { cn } from "@/common/lib/utils";
+
+/** Searchable model dropdown with keyboard navigation */
+function SearchableModelSelect(props: {
+  value: string;
+  onChange: (value: string) => void;
+  models: string[];
+  placeholder?: string;
+  emptyOption?: { value: string; label: string };
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [highlightedIndex, setHighlightedIndex] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const displayValue =
+    props.emptyOption && !props.value
+      ? props.emptyOption.label
+      : (getModelName(props.value) ?? props.placeholder ?? "Select model");
+
+  // Filter models based on search
+  const searchLower = search.toLowerCase();
+  const filteredModels = props.models.filter(
+    (m) =>
+      m.toLowerCase().includes(searchLower) ||
+      (getModelName(m)?.toLowerCase().includes(searchLower) ?? false)
+  );
+
+  // Build list of all selectable items (empty option + filtered models)
+  const items: Array<{ value: string; label: string; isMuted?: boolean }> = [];
+  if (props.emptyOption) {
+    items.push({
+      value: props.emptyOption.value,
+      label: props.emptyOption.label,
+      isMuted: true,
+    });
+  }
+  for (const model of filteredModels) {
+    items.push({ value: model, label: getModelName(model) ?? model });
+  }
+
+  // Reset highlight when search changes or popover opens
+  useEffect(() => {
+    setHighlightedIndex(0);
+  }, [search]);
+
+  useEffect(() => {
+    if (isOpen) {
+      setSearch("");
+      setHighlightedIndex(0);
+      // Focus input after popover renders
+      const timer = setTimeout(() => inputRef.current?.focus(), 10);
+      return () => clearTimeout(timer);
+    }
+  }, [isOpen]);
+
+  // Scroll highlighted item into view
+  useEffect(() => {
+    if (!listRef.current) return;
+    const highlighted = listRef.current.querySelector("[data-highlighted=true]");
+    if (highlighted) {
+      highlighted.scrollIntoView({ block: "nearest" });
+    }
+  }, [highlightedIndex]);
+
+  const handleSelect = (value: string) => {
+    props.onChange(value);
+    setIsOpen(false);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        setHighlightedIndex((i) => Math.min(i + 1, items.length - 1));
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setHighlightedIndex((i) => Math.max(i - 1, 0));
+        break;
+      case "Enter":
+        e.preventDefault();
+        if (items[highlightedIndex]) {
+          handleSelect(items[highlightedIndex].value);
+        }
+        break;
+      case "Escape":
+        e.preventDefault();
+        setIsOpen(false);
+        break;
+    }
+  };
+
+  return (
+    <Popover open={isOpen} onOpenChange={setIsOpen} modal>
+      <PopoverTrigger asChild>
+        <button className="bg-background-secondary border-border-medium focus:border-accent flex h-8 w-full items-center justify-between rounded border px-2 text-xs">
+          <span className={cn("truncate", !props.value && props.emptyOption && "text-muted")}>
+            {displayValue}
+          </span>
+          <ChevronDown className="text-muted h-3 w-3 shrink-0" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="max-h-[350px] w-[320px] p-0">
+        {/* Search input */}
+        <div className="border-border border-b px-2 py-1.5">
+          <input
+            ref={inputRef}
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Search models..."
+            className="text-foreground placeholder:text-muted w-full bg-transparent text-xs outline-none"
+          />
+        </div>
+
+        {/* Scrollable list */}
+        <div ref={listRef} className="max-h-[280px] overflow-y-auto p-1">
+          {items.length === 0 ? (
+            <div className="text-muted py-2 text-center text-[10px]">No matching models</div>
+          ) : (
+            items.map((item, index) => (
+              <button
+                key={item.value || "__empty__"}
+                data-highlighted={index === highlightedIndex}
+                onClick={() => handleSelect(item.value)}
+                onMouseEnter={() => setHighlightedIndex(index)}
+                className={cn(
+                  "flex w-full items-center gap-1.5 rounded-sm px-2 py-1 text-xs",
+                  index === highlightedIndex ? "bg-hover" : "hover:bg-hover"
+                )}
+              >
+                <Check
+                  className={cn(
+                    "h-3 w-3 shrink-0",
+                    props.value === item.value || (!props.value && !item.value)
+                      ? "opacity-100"
+                      : "opacity-0"
+                  )}
+                />
+                <span className={cn("truncate", item.isMuted && "text-muted")}>{item.label}</span>
+              </button>
+            ))
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 // Providers to exclude from the custom models UI (handled specially or internal)
 const HIDDEN_PROVIDERS = new Set(["mux-gateway"]);
@@ -58,6 +214,16 @@ export function ModelsSection() {
   const { defaultModel, setDefaultModel, hiddenModels, hideModel, unhideModel } =
     useModelsFromSettings();
   const gateway = useGateway();
+
+  // Compaction model preference
+  const [compactionModel, setCompactionModel] = usePersistedState<string>(
+    PREFERRED_COMPACTION_MODEL_KEY,
+    "",
+    { listener: true }
+  );
+
+  // All models (including hidden) for the settings dropdowns
+  const allModels = getSuggestedModels(config);
 
   // Check if a model already exists (for duplicate prevention)
   const modelExists = useCallback(
@@ -190,19 +356,56 @@ export function ModelsSection() {
 
   return (
     <div className="space-y-4">
-      <p className="text-muted text-xs">
-        Manage your models. Click the star to set a default model for new workspaces.
-      </p>
+      {/* Model Defaults - styled to match table aesthetic */}
+      <div className="border-border-medium overflow-hidden rounded-md border">
+        {/* Header row - matches table header */}
+        <div className="border-border-medium bg-background-secondary/50 border-b px-2 py-1.5 md:px-3">
+          <span className="text-muted text-xs font-medium">Model Defaults</span>
+        </div>
+        {/* Content rows - match table row styling */}
+        <div className="divide-border-medium divide-y">
+          {/* Default Model row */}
+          <div className="flex items-center gap-4 px-2 py-2 md:px-3">
+            <div className="w-28 shrink-0 md:w-32">
+              <div className="text-muted text-xs">Default Model</div>
+              <div className="text-muted-light text-[10px]">New workspaces</div>
+            </div>
+            <div className="min-w-0 flex-1">
+              <SearchableModelSelect
+                value={defaultModel}
+                onChange={setDefaultModel}
+                models={allModels}
+                placeholder="Select model"
+              />
+            </div>
+          </div>
+          {/* Compaction Model row */}
+          <div className="flex items-center gap-4 px-2 py-2 md:px-3">
+            <div className="w-28 shrink-0 md:w-32">
+              <div className="text-muted text-xs">Compaction Model</div>
+              <div className="text-muted-light text-[10px]">History summary</div>
+            </div>
+            <div className="min-w-0 flex-1">
+              <SearchableModelSelect
+                value={compactionModel}
+                onChange={setCompactionModel}
+                models={allModels}
+                emptyOption={{ value: "", label: "Use workspace model" }}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
 
-      {/* Custom Models - shown first */}
+      {/* Custom Models */}
       <div className="space-y-3">
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Custom Models</div>
 
-        {/* Add new model form */}
-        <div className="border-border-medium bg-background-secondary rounded-md border p-2">
-          <div className="flex flex-wrap items-center gap-1.5">
+        {/* Add new model form - styled to match table */}
+        <div className="border-border-medium overflow-hidden rounded-md border">
+          <div className="border-border-medium bg-background-secondary/50 flex flex-wrap items-center gap-1.5 border-b px-2 py-1.5 md:px-3">
             <Select value={lastProvider} onValueChange={setLastProvider}>
-              <SelectTrigger className="bg-modal-bg border-border-medium focus:border-accent h-7 w-auto shrink-0 rounded border px-2 text-xs">
+              <SelectTrigger className="bg-background border-border-medium focus:border-accent h-7 w-auto shrink-0 rounded border px-2 text-xs">
                 <SelectValue placeholder="Provider" />
               </SelectTrigger>
               <SelectContent>
@@ -218,7 +421,7 @@ export function ModelsSection() {
               value={newModelId}
               onChange={(e) => setNewModelId(e.target.value)}
               placeholder="model-id"
-              className="bg-modal-bg border-border-medium focus:border-accent min-w-0 flex-1 rounded border px-2 py-1 font-mono text-xs focus:outline-none"
+              className="bg-background border-border-medium focus:border-accent min-w-0 flex-1 rounded border px-2 py-1 font-mono text-xs focus:outline-none"
               onKeyDown={(e) => {
                 if (e.key === "Enter") void handleAddModel();
               }}
@@ -234,7 +437,9 @@ export function ModelsSection() {
               Add
             </Button>
           </div>
-          {error && !editing && <div className="text-error mt-1.5 text-xs">{error}</div>}
+          {error && !editing && (
+            <div className="text-error px-2 py-1.5 text-xs md:px-3">{error}</div>
+          )}
         </div>
 
         {/* Table of custom models */}
