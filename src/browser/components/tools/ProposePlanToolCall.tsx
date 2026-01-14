@@ -15,6 +15,7 @@ import {
 } from "./shared/ToolPrimitives";
 import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
+import { Button } from "../ui/button";
 import { IconActionButton, type ButtonConfig } from "../Messages/MessageWindow";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useStartHere } from "@/browser/hooks/useStartHere";
@@ -298,12 +299,14 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const statusDisplay = getStatusDisplay(status);
 
   // Build action buttons array (similar to AssistantMessage)
+  const copyButton: ButtonConfig = {
+    label: copied ? "Copied" : "Copy",
+    onClick: () => void copyToClipboard(planContent),
+    icon: copied ? <ClipboardCheck /> : <Clipboard />,
+  };
+
   const actionButtons: ButtonConfig[] = [
-    {
-      label: copied ? "Copied" : "Copy",
-      onClick: () => void copyToClipboard(planContent),
-      icon: copied ? <ClipboardCheck /> : <Clipboard />,
-    },
+    copyButton,
     {
       label: "Share",
       component: (
@@ -382,9 +385,23 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       {errorMessage ? (
         <div className="text-error rounded-sm p-2 font-mono text-xs">{errorMessage}</div>
       ) : showRaw ? (
-        <pre className="text-text bg-code-bg m-0 rounded-sm p-2 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
-          {planContent}
-        </pre>
+        <div className="relative">
+          <pre className="text-text bg-code-bg m-0 rounded-sm p-2 pb-8 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
+            {planContent}
+          </pre>
+          <div className="absolute right-2 bottom-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-[11px] [&_svg]:size-3.5"
+              onClick={() => void copyToClipboard(planContent)}
+            >
+              {copied ? <ClipboardCheck /> : <Clipboard />}
+              {copied ? "Copied" : "Copy to clipboard"}
+            </Button>
+          </div>
+        </div>
       ) : (
         <div className="plan-content">
           <MarkdownRenderer content={planContent} />

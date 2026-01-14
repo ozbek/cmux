@@ -6,6 +6,7 @@ import { copyToClipboard } from "@/browser/utils/clipboard";
 import { Clipboard, ClipboardCheck, FileText, ListStart } from "lucide-react";
 import { ShareMessagePopover } from "@/browser/components/ShareMessagePopover";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { Button } from "../ui/button";
 import React, { useState } from "react";
 import { CompactingMessageContent } from "./CompactingMessageContent";
 import { CompactionBackground } from "./CompactionBackground";
@@ -61,15 +62,13 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
 
   // Keep only Copy button visible (most common action)
   // Kebab menu saves horizontal space by collapsing less-used actions into a single ⋮ button
-  const buttons: ButtonConfig[] = isStreaming
-    ? []
-    : [
-        {
-          label: copied ? "Copied" : "Copy",
-          onClick: () => void copyToClipboard(content),
-          icon: copied ? <ClipboardCheck /> : <Clipboard />,
-        },
-      ];
+  const copyButton: ButtonConfig = {
+    label: copied ? "Copied" : "Copy",
+    onClick: () => void copyToClipboard(content),
+    icon: copied ? <ClipboardCheck /> : <Clipboard />,
+  };
+
+  const buttons: ButtonConfig[] = isStreaming ? [] : [copyButton];
 
   if (!isStreaming) {
     buttons.push({
@@ -120,9 +119,23 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     // Completed text renders as static content
     return content ? (
       showRaw ? (
-        <pre className="text-text bg-code-bg m-0 rounded-sm p-2 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
-          {content}
-        </pre>
+        <div className="relative">
+          <pre className="text-text bg-code-bg m-0 rounded-sm p-2 pb-8 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
+            {content}
+          </pre>
+          <div className="absolute right-2 bottom-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-[11px] [&_svg]:size-3.5"
+              onClick={() => void copyToClipboard(content)}
+            >
+              {copied ? <ClipboardCheck /> : <Clipboard />}
+              {copied ? "Copied" : "Copy to clipboard"}
+            </Button>
+          </div>
+        </div>
       ) : (
         <MarkdownRenderer content={content} />
       )
