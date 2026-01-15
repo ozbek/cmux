@@ -22,6 +22,7 @@ import type { BranchListResult } from "@/common/orpc/types";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
 import * as os from "os";
+import ignore from "ignore";
 
 /**
  * List directory contents for the DirectoryPickerModal.
@@ -59,6 +60,92 @@ async function listDirectory(requestedPath: string): Promise<FileTreeNode> {
 }
 
 const FILE_COMPLETIONS_CACHE_TTL_MS = 10_000;
+
+/**
+ * Load and parse .gitignore file from workspace root.
+ * Returns an ignore instance that can check if paths are ignored.
+ */
+async function loadGitignore(
+  workspacePath: string
+): Promise<{ ignores: (path: string) => boolean } | null> {
+  try {
+    const gitignorePath = path.join(workspacePath, ".gitignore");
+    const content = await fsPromises.readFile(gitignorePath, "utf-8");
+    return ignore().add(content);
+  } catch {
+    // No .gitignore or can't read it
+    return null;
+  }
+}
+
+/**
+ * List workspace directory contents (files AND directories).
+ * Unlike listDirectory (directories only), this returns both.
+ * Sorted: directories first, then files, both alphabetically. .git is filtered out.
+ * Marks files/directories as ignored if they match .gitignore patterns.
+ */
+async function listWorkspaceDirectory(
+  workspacePath: string,
+  relativePath?: string
+): Promise<Result<FileTreeNode[]>> {
+  try {
+    // Validate relativePath doesn't escape workspace
+    if (relativePath) {
+      // Reject absolute paths
+      if (path.isAbsolute(relativePath)) {
+        return Err("Absolute paths are not allowed");
+      }
+      // Normalize and verify it stays within workspace
+      const resolved = path.resolve(workspacePath, relativePath);
+      const normalizedWorkspace = path.resolve(workspacePath);
+      if (
+        !resolved.startsWith(normalizedWorkspace + path.sep) &&
+        resolved !== normalizedWorkspace
+      ) {
+        return Err("Path traversal not allowed");
+      }
+    }
+
+    const targetPath = relativePath ? path.join(workspacePath, relativePath) : workspacePath;
+    const normalizedPath = path.resolve(targetPath);
+
+    const [entries, ig] = await Promise.all([
+      fsPromises.readdir(normalizedPath, { withFileTypes: true }),
+      loadGitignore(workspacePath),
+    ]);
+
+    const nodes: FileTreeNode[] = entries
+      .filter((entry) => entry.name !== ".git")
+      .map((entry) => {
+        const entryPath = relativePath ? path.join(relativePath, entry.name) : entry.name;
+        // For directories, append / to match gitignore directory patterns
+        // Use POSIX separators for gitignore matching (Windows uses backslashes)
+        const posixPath = entryPath.split(path.sep).join("/");
+        const pathToCheck = entry.isDirectory() ? `${posixPath}/` : posixPath;
+        const ignored = ig ? ig.ignores(pathToCheck) : false;
+
+        return {
+          name: entry.name,
+          path: entryPath,
+          isDirectory: entry.isDirectory(),
+          children: [],
+          ignored: ignored || undefined, // Only include if true
+        };
+      })
+      // Sort: directories first, then files, both alphabetically
+      .sort((a, b) => {
+        if (a.isDirectory !== b.isDirectory) {
+          return a.isDirectory ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name);
+      });
+
+    return Ok(nodes);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return Err(`Failed to list directory: ${message}`);
+  }
+}
 
 interface FileCompletionsCacheEntry {
   index: FileCompletionsIndex;
@@ -318,6 +405,10 @@ export class ProjectService {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  async listWorkspaceDirectory(workspacePath: string, relativePath?: string) {
+    return listWorkspaceDirectory(workspacePath, relativePath);
   }
 
   async createDirectory(

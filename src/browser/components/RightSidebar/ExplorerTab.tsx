@@ -1,0 +1,331 @@
+/**
+ * ExplorerTab - VS Code-style file explorer tree view.
+ *
+ * Features:
+ * - Lazy-load directories on expand
+ * - Auto-refresh on file-modifying tool completion (debounced)
+ * - Toolbar with Refresh and Collapse All buttons
+ */
+
+import React from "react";
+import { useAPI } from "@/browser/contexts/API";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import {
+  ChevronDown,
+  ChevronRight,
+  ChevronsDownUp,
+  FolderClosed,
+  FolderOpen,
+  RefreshCw,
+} from "lucide-react";
+import { FileIcon } from "../FileIcon";
+import { cn } from "@/common/lib/utils";
+import type { FileTreeNode } from "@/common/utils/git/numstatParser";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
+
+interface ExplorerTabProps {
+  workspaceId: string;
+  workspacePath: string;
+}
+
+interface ExplorerState {
+  entries: Map<string, FileTreeNode[]>; // relativePath -> children
+  expanded: Set<string>;
+  loading: Set<string>;
+  error: string | null;
+}
+
+const DEBOUNCE_MS = 2000;
+const INDENT_PX = 12;
+
+export const ExplorerTab: React.FC<ExplorerTabProps> = (props) => {
+  const { api } = useAPI();
+
+  const [state, setState] = React.useState<ExplorerState>({
+    entries: new Map(),
+    expanded: new Set(),
+    loading: new Set(), // starts empty, set when fetch begins
+    error: null,
+  });
+
+  // Track if we've done initial load
+  const initialLoadRef = React.useRef(false);
+
+  // Fetch a directory's contents and return the entries (for recursive expand)
+  const fetchDirectory = React.useCallback(
+    async (relativePath: string, suppressErrors = false): Promise<FileTreeNode[] | null> => {
+      if (!api) return null;
+
+      const key = relativePath; // empty string = root directory
+
+      setState((prev) => ({
+        ...prev,
+        loading: new Set(prev.loading).add(key),
+        error: null,
+      }));
+
+      try {
+        const result = await api.general.listWorkspaceDirectory({
+          workspaceId: props.workspaceId,
+          relativePath: relativePath || undefined,
+        });
+
+        if (!result.success) {
+          setState((prev) => {
+            // On failure, remove from expanded set (dir may have been deleted)
+            const newExpanded = new Set(prev.expanded);
+            newExpanded.delete(key);
+            // Remove stale entries
+            const newEntries = new Map(prev.entries);
+            newEntries.delete(key);
+            return {
+              ...prev,
+              entries: newEntries,
+              expanded: newExpanded,
+              loading: new Set([...prev.loading].filter((k) => k !== key)),
+              // Only set error for root or if not suppressing
+              error: suppressErrors ? prev.error : result.error,
+            };
+          });
+          return null;
+        }
+
+        setState((prev) => {
+          const newEntries = new Map(prev.entries);
+          newEntries.set(key, result.data);
+          return {
+            ...prev,
+            entries: newEntries,
+            loading: new Set([...prev.loading].filter((k) => k !== key)),
+          };
+        });
+
+        return result.data;
+      } catch (err) {
+        setState((prev) => {
+          // On error, remove from expanded set
+          const newExpanded = new Set(prev.expanded);
+          newExpanded.delete(key);
+          const newEntries = new Map(prev.entries);
+          newEntries.delete(key);
+          return {
+            ...prev,
+            entries: newEntries,
+            expanded: newExpanded,
+            loading: new Set([...prev.loading].filter((k) => k !== key)),
+            error: suppressErrors ? prev.error : err instanceof Error ? err.message : String(err),
+          };
+        });
+        return null;
+      }
+    },
+    [api, props.workspaceId]
+  );
+
+  // Initial load - retry when api becomes available
+  React.useEffect(() => {
+    if (!api) return;
+    if (!initialLoadRef.current) {
+      initialLoadRef.current = true;
+      void fetchDirectory("");
+    }
+  }, [api, fetchDirectory]);
+
+  // Subscribe to file-modifying tool events and debounce refresh
+  React.useEffect(() => {
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const unsubscribe = workspaceStore.subscribeFileModifyingTool(() => {
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => {
+        // Refresh root and all expanded directories
+        // Suppress errors for non-root paths (dir may have been deleted)
+        void fetchDirectory("");
+        for (const p of state.expanded) {
+          void fetchDirectory(p, true);
+        }
+      }, DEBOUNCE_MS);
+    }, props.workspaceId);
+
+    return () => {
+      unsubscribe();
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, [props.workspaceId, state.expanded, fetchDirectory]);
+
+  // Toggle expand/collapse
+  const toggleExpand = (node: FileTreeNode) => {
+    if (!node.isDirectory) return;
+
+    const key = node.path;
+
+    setState((prev) => {
+      const newExpanded = new Set(prev.expanded);
+
+      if (newExpanded.has(key)) {
+        newExpanded.delete(key);
+        return { ...prev, expanded: newExpanded };
+      }
+
+      newExpanded.add(key);
+
+      // Always fetch when expanding to ensure fresh data
+      void fetchDirectory(key);
+
+      return { ...prev, expanded: newExpanded };
+    });
+  };
+
+  // Refresh all expanded paths
+  const handleRefresh = () => {
+    const pathsToRefresh = ["", ...state.expanded];
+    void Promise.all(pathsToRefresh.map((p) => fetchDirectory(p)));
+  };
+
+  // Collapse all
+  const handleCollapseAll = () => {
+    setState((prev) => ({
+      ...prev,
+      expanded: new Set(),
+    }));
+  };
+
+  const hasExpandedDirs = state.expanded.size > 0;
+
+  // Render a tree node recursively
+  const renderNode = (node: FileTreeNode, depth: number): React.ReactNode => {
+    const key = node.path;
+    const isExpanded = state.expanded.has(key);
+    const isLoading = state.loading.has(key);
+    const children = state.entries.get(key) ?? [];
+    const isIgnored = node.ignored === true;
+
+    return (
+      <div key={key}>
+        <button
+          type="button"
+          className={cn(
+            "flex w-full cursor-pointer items-center gap-1 px-2 py-0.5 text-left text-sm hover:bg-accent/50",
+            "focus:bg-accent/50 focus:outline-none",
+            isIgnored && "opacity-50"
+          )}
+          style={{ paddingLeft: `${8 + depth * INDENT_PX}px` }}
+          onClick={() => (node.isDirectory ? toggleExpand(node) : undefined)}
+        >
+          {node.isDirectory ? (
+            <>
+              {isLoading ? (
+                <RefreshCw className="text-muted h-3 w-3 shrink-0 animate-spin" />
+              ) : isExpanded ? (
+                <ChevronDown className="text-muted h-3 w-3 shrink-0" />
+              ) : (
+                <ChevronRight className="text-muted h-3 w-3 shrink-0" />
+              )}
+              {isExpanded ? (
+                <FolderOpen className="h-4 w-4 shrink-0 text-[var(--color-folder-icon)]" />
+              ) : (
+                <FolderClosed className="h-4 w-4 shrink-0 text-[var(--color-folder-icon)]" />
+              )}
+            </>
+          ) : (
+            <>
+              <span className="w-3 shrink-0" />
+              <FileIcon fileName={node.name} style={{ fontSize: 18 }} className="h-4 w-4" />
+            </>
+          )}
+          <span className="truncate">{node.name}</span>
+        </button>
+
+        {node.isDirectory && isExpanded && (
+          <div>{children.map((child) => renderNode(child, depth + 1))}</div>
+        )}
+      </div>
+    );
+  };
+
+  const rootEntries = state.entries.get("") ?? [];
+  const isRootLoading = state.loading.has("");
+
+  // Shorten workspace path for display (replace home dir with ~)
+  const shortenPath = (fullPath: string): string => {
+    // Match home directory patterns across platforms:
+    // Linux: /home/username/...
+    // macOS: /Users/username/...
+    // Windows: C:\Users\username\... (may come as forward slashes too)
+    const homePatterns = [
+      /^\/home\/[^/]+/, // Linux
+      /^\/Users\/[^/]+/, // macOS
+      /^[A-Za-z]:[\\/]Users[\\/][^\\/]+/, // Windows
+    ];
+
+    for (const pattern of homePatterns) {
+      const match = fullPath.match(pattern);
+      if (match) {
+        return "~" + fullPath.slice(match[0].length);
+      }
+    }
+    return fullPath;
+  };
+
+  const displayPath = shortenPath(props.workspacePath);
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* Toolbar */}
+      <div className="border-border-light flex items-center gap-1 border-b px-2 py-1">
+        <FolderOpen className="h-4 w-4 shrink-0 text-[var(--color-folder-icon)]" />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="min-w-0 flex-1 truncate text-xs font-medium">{displayPath}</span>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">{props.workspacePath}</TooltipContent>
+        </Tooltip>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="text-muted hover:bg-accent/50 hover:text-foreground rounded p-1"
+                onClick={handleRefresh}
+                disabled={isRootLoading}
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", isRootLoading && "animate-spin")} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Refresh</TooltipContent>
+          </Tooltip>
+          {hasExpandedDirs && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className="text-muted hover:bg-accent/50 hover:text-foreground rounded p-1"
+                  onClick={handleCollapseAll}
+                  aria-label="Collapse All"
+                >
+                  <ChevronsDownUp className="h-3.5 w-3.5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Collapse All</TooltipContent>
+            </Tooltip>
+          )}
+        </div>
+      </div>
+
+      {/* Tree */}
+      <div className="flex-1 overflow-y-auto py-1">
+        {state.error && <div className="text-destructive px-3 py-2 text-sm">{state.error}</div>}
+        {isRootLoading && rootEntries.length === 0 ? (
+          <div className="flex items-center justify-center py-4">
+            <RefreshCw className="text-muted h-5 w-5 animate-spin" />
+          </div>
+        ) : (
+          rootEntries.map((node) => renderNode(node, 0))
+        )}
+        {!isRootLoading && rootEntries.length === 0 && !state.error && (
+          <div className="text-muted px-3 py-2 text-sm">No files found</div>
+        )}
+      </div>
+    </div>
+  );
+};
