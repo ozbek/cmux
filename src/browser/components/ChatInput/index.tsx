@@ -1169,7 +1169,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // When editing an existing message, we only allow changing the text.
       // Don't preventDefault here so any clipboard text can still paste normally.
       if (editingMessage) {
-        pushToast({ type: "error", message: "Images cannot be changed while editing a message." });
+        pushToast({ type: "error", message: "Images cannot be added while editing a message." });
         return;
       }
 
@@ -1256,7 +1256,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       if (imageFiles.length === 0) return;
 
       if (editingMessage) {
-        pushToast({ type: "error", message: "Images cannot be changed while editing a message." });
+        pushToast({ type: "error", message: "Images cannot be added while editing a message." });
         return;
       }
 
@@ -1750,6 +1750,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       try {
         // Prepare image parts if any
         const imageParts = imageAttachmentsToImageParts(imageAttachments, { validate: true });
+        const sendImageParts = editingMessage
+          ? imageParts
+          : imageParts.length > 0
+            ? imageParts
+            : undefined;
 
         // Prepare reviews data (used for both compaction continueMessage and normal send)
         const reviewsData =
@@ -1816,7 +1821,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             ...sendMessageOptions,
             ...compactionOptions,
             editMessageId: editingMessage?.id,
-            imageParts: imageParts.length > 0 ? imageParts : undefined,
+            imageParts: sendImageParts,
             muxMetadata,
           },
         });
@@ -2204,10 +2209,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           </div>
 
           {/* Image attachments */}
-          <ImageAttachments
-            images={imageAttachments}
-            onRemove={editingMessage ? undefined : handleRemoveImage}
-          />
+          <ImageAttachments images={imageAttachments} onRemove={handleRemoveImage} />
 
           <div className="flex flex-col gap-0.5" data-component="ChatModeToggles">
             {/* Editing indicator - workspace only */}
