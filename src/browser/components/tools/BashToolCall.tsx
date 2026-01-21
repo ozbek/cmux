@@ -204,8 +204,8 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           sendToBackground(toolCallId);
         }
       : undefined;
-
   const truncatedInfo = result && "truncated" in result ? result.truncated : undefined;
+  const note = result && "note" in result ? result.note : undefined;
 
   const handleToggle = () => {
     userToggledRef.current = true;
@@ -331,6 +331,15 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
           {result && (
             <>
+              {note && (
+                <DetailSection>
+                  <DetailLabel>Notice</DetailLabel>
+                  <div className="text-muted text-[11px] break-words whitespace-pre-wrap">
+                    {note}
+                  </div>
+                </DetailSection>
+              )}
+
               {result.success === false && result.error && (
                 <DetailSection>
                   <DetailLabel>Error</DetailLabel>

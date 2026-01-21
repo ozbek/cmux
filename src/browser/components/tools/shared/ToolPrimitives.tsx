@@ -230,13 +230,12 @@ export const ToolIcon: React.FC<ToolIconProps> = ({ toolName, emoji, className }
 /**
  * Error display box with danger styling
  */
-export const ErrorBox: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({
-  className,
-  ...props
-}) => (
+type ErrorBoxProps = React.HTMLAttributes<HTMLDivElement>;
+
+export const ErrorBox: React.FC<ErrorBoxProps> = ({ className, ...props }) => (
   <div
     className={cn(
-      "text-danger bg-danger-overlay border-danger rounded border-l-2 px-2 py-1.5 text-[11px]",
+      "rounded border-l-2 px-2 py-1.5 text-[11px] text-danger bg-danger-overlay border-danger",
       className
     )}
     {...props}

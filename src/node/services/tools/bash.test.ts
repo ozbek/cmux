@@ -9,6 +9,14 @@ import { TestTempDir, createTestToolConfig, getTestDeps } from "./testHelpers";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import type { ToolCallOptions } from "ai";
+
+// Type guard to narrow foreground success result (has note, no backgroundProcessId)
+function isForegroundSuccess(
+  result: BashToolResult
+): result is BashToolResult & { success: true; note?: string } {
+  return result.success && !("backgroundProcessId" in result);
+}
+
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 
 // Mock ToolCallOptions for testing
@@ -115,7 +123,7 @@ describe("bash tool", () => {
     }
   });
 
-  it("should fail when hard cap (300 lines) is exceeded", async () => {
+  it("should report overflow when hard cap (300 lines) is exceeded", async () => {
     using testEnv = createTestBashTool();
     const tool = testEnv.tool;
     const args: BashToolArgs = {
@@ -127,11 +135,13 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Line count exceeded");
-      expect(result.error).toContain("300 lines");
-      expect(result.exitCode).toBe(-1);
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
+      expect(result.output).toBe("");
+      expect(result.note).toContain("[OUTPUT OVERFLOW");
+      expect(result.note).toContain("Line count exceeded");
+      expect(result.note).toContain("300 lines");
+      expect(result.exitCode).toBe(0);
     }
   });
 
@@ -147,21 +157,23 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("[OUTPUT OVERFLOW");
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
+      expect(result.output).toBe("");
+      expect(result.note).toContain("[OUTPUT OVERFLOW");
       // Should contain specific overflow reason (one of the three types)
-      expect(result.error).toMatch(
+      expect(result.note).toMatch(
         /Line count exceeded|Total output exceeded|exceeded per-line limit/
       );
-      expect(result.error).toContain("Full output");
-      expect(result.error).toContain("lines) saved to");
-      expect(result.error).toContain("bash-");
-      expect(result.error).toContain(".txt");
-      expect(result.error).toContain("File will be automatically cleaned up when stream ends");
+      expect(result.note).toContain("Full output");
+      expect(result.note).toContain("lines) saved to");
+      expect(result.note).toContain("bash-");
+      expect(result.note).toContain(".txt");
+      expect(result.note).toContain("File will be automatically cleaned up when stream ends");
+      expect(result.exitCode).toBe(0);
 
-      // Extract file path from error message (handles both "lines saved to" and "lines) saved to")
-      const match = /saved to (\/.+?\.txt)/.exec(result.error);
+      // Extract file path from output message (handles both "lines saved to" and "lines) saved to")
+      const match = /saved to (\/.+?\.txt)/.exec(result.note ?? "");
       expect(match).toBeDefined();
       if (match) {
         const overflowPath = match[1];
@@ -186,13 +198,13 @@ describe("bash tool", () => {
     }
   });
 
-  it("should fail early when hard cap is reached", async () => {
+  it("should report overflow quickly when hard cap is reached", async () => {
     using testEnv = createTestBashTool();
     const tool = testEnv.tool;
     const startTime = performance.now();
 
     const args: BashToolArgs = {
-      // This will generate 500 lines quickly - should fail at 300
+      // This will generate 500 lines quickly - should report overflow at 300
       run_in_background: false,
       script: "for i in {1..500}; do echo line$i; done",
       timeout_secs: 5,
@@ -202,13 +214,15 @@ describe("bash tool", () => {
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
     const duration = performance.now() - startTime;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
       // Should complete quickly since we stop at 300 lines
       expect(duration).toBeLessThan(4000);
-      expect(result.error).toContain("Line count exceeded");
-      expect(result.error).toContain("300 lines");
-      expect(result.exitCode).toBe(-1);
+      expect(result.output).toBe("");
+      expect(result.note).toContain("[OUTPUT OVERFLOW");
+      expect(result.note).toContain("Line count exceeded");
+      expect(result.note).toContain("300 lines");
+      expect(result.exitCode).toBe(0);
     }
   });
 
@@ -350,12 +364,14 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
       // Should use tmpfile behavior
-      expect(result.error).toContain("[OUTPUT OVERFLOW");
-      expect(result.error).toContain("saved to");
-      expect(result.error).not.toContain("[OUTPUT TRUNCATED");
+      expect(result.output).toBe("");
+      expect(result.note).toContain("[OUTPUT OVERFLOW");
+      expect(result.note).toContain("saved to");
+      expect(result.note).not.toContain("[OUTPUT TRUNCATED");
+      expect(result.exitCode).toBe(0);
 
       // Verify temp file was created in runtimeTempDir
       expect(fs.existsSync(tempDir.path)).toBe(true);
@@ -388,14 +404,16 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
       // Should hit display limit and save to temp file
-      expect(result.error).toContain("[OUTPUT OVERFLOW");
-      expect(result.error).toContain("saved to");
+      expect(result.output).toBe("");
+      expect(result.note).toContain("[OUTPUT OVERFLOW");
+      expect(result.note).toContain("saved to");
+      expect(result.exitCode).toBe(0);
 
       // Extract and verify temp file
-      const match = /saved to (\/.*?\.txt)/.exec(result.error);
+      const match = /saved to (\/.*?\.txt)/.exec(result.note ?? "");
       expect(match).toBeDefined();
       if (match) {
         const overflowPath = match[1];
@@ -443,13 +461,15 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
       // Should hit file limit
-      expect(result.error).toContain("file preservation limit");
+      expect(result.output).toBe("");
+      expect(result.note).toContain("file preservation limit");
+      expect(result.exitCode).toBe(0);
 
       // Extract and verify temp file
-      const match = /saved to (\/.*?\.txt)/.exec(result.error);
+      const match = /saved to (\/.*?\.txt)/.exec(result.note ?? "");
       expect(match).toBeDefined();
       if (match) {
         const overflowPath = match[1];
@@ -489,13 +509,14 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
       // Should hit display limit
-      expect(result.error).toContain("display limit");
+      expect(result.note).toContain("display limit");
+      expect(result.exitCode).toBe(0);
 
       // Extract and verify temp file contains the completion marker
-      const match = /saved to (\/.*?\.txt)/.exec(result.error);
+      const match = /saved to (\/.*?\.txt)/.exec(result.note ?? "");
       expect(match).toBeDefined();
       if (match) {
         const overflowPath = match[1];
@@ -532,13 +553,15 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
       // Should hit per-line limit (file truncation, not display)
-      expect(result.error).toContain("per-line limit");
+      expect(result.output).toBe("");
+      expect(result.note).toContain("per-line limit");
+      expect(result.exitCode).toBe(0);
 
       // Extract and verify temp file does NOT contain the second echo
-      const match = /saved to (\/.*?\.txt)/.exec(result.error);
+      const match = /saved to (\/.*?\.txt)/.exec(result.note ?? "");
       expect(match).toBeDefined();
       if (match) {
         const overflowPath = match[1];
@@ -609,10 +632,13 @@ describe("bash tool", () => {
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
     // Should trigger display truncation at exactly 300 lines
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("300 lines");
-      expect(result.error).toContain("display limit");
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
+      expect(result.output).toBe("");
+      expect(result.note).toContain("[OUTPUT OVERFLOW");
+      expect(result.note).toContain("300 lines");
+      expect(result.note).toContain("display limit");
+      expect(result.exitCode).toBe(0);
     }
 
     tempDir[Symbol.dispose]();
@@ -908,7 +934,7 @@ describe("bash tool", () => {
     }
   });
 
-  it("should fail when line exceeds max line bytes", async () => {
+  it("should report overflow when line exceeds max line bytes", async () => {
     using testEnv = createTestBashTool();
     const tool = testEnv.tool;
     const longLine = "x".repeat(2000);
@@ -921,14 +947,15 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toMatch(/exceeded per-line limit|OUTPUT OVERFLOW/);
-      expect(result.exitCode).toBe(-1);
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
+      expect(result.output).toBe("");
+      expect(result.note).toMatch(/exceeded per-line limit|OUTPUT OVERFLOW/);
+      expect(result.exitCode).toBe(0);
     }
   });
 
-  it("should fail when total bytes limit exceeded", async () => {
+  it("should report overflow when total bytes limit exceeded", async () => {
     using testEnv = createTestBashTool();
     const tool = testEnv.tool;
     const lineContent = "x".repeat(100);
@@ -942,14 +969,15 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toMatch(/Total output exceeded limit|OUTPUT OVERFLOW/);
-      expect(result.exitCode).toBe(-1);
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
+      expect(result.output).toBe("");
+      expect(result.note).toMatch(/Total output exceeded limit|OUTPUT OVERFLOW/);
+      expect(result.exitCode).toBe(0);
     }
   });
 
-  it("should fail early when byte limit is reached", async () => {
+  it("should report overflow when byte limit is reached", async () => {
     using testEnv = createTestBashTool();
     const tool = testEnv.tool;
     const args: BashToolArgs = {
@@ -961,10 +989,11 @@ describe("bash tool", () => {
 
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toMatch(/Total output exceeded limit|OUTPUT OVERFLOW/);
-      expect(result.exitCode).toBe(-1);
+    expect(result.success).toBe(true);
+    if (isForegroundSuccess(result)) {
+      expect(result.output).toBe("");
+      expect(result.note).toMatch(/Total output exceeded limit|OUTPUT OVERFLOW/);
+      expect(result.exitCode).toBe(0);
     }
   });
 

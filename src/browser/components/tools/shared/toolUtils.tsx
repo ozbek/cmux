@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { AlertTriangle, Check, CircleDot, X } from "lucide-react";
-import { LoadingDots } from "./ToolPrimitives";
 import type { ToolErrorResult } from "@/common/types/tools";
+import { LoadingDots } from "./ToolPrimitives";
 
 /**
  * Shared utilities and hooks for tool components

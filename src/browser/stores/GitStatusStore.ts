@@ -342,6 +342,10 @@ export class GitStatusStore {
         return [metadata.id, null];
       }
 
+      if (result.data.note?.includes("OUTPUT OVERFLOW")) {
+        return [metadata.id, null];
+      }
+
       // Parse the output using centralized function
       const parsed = parseGitStatusScriptOutput(result.data.output);
 
