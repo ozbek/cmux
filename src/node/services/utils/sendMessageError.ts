@@ -1,5 +1,7 @@
 import assert from "@/common/utils/assert";
+import type { ErrorEvent } from "@/common/types/stream";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { StreamErrorMessage } from "@/common/orpc/types";
 import { createAssistantMessageId } from "./messageIds";
 
 /**
@@ -66,11 +68,46 @@ export const formatSendMessageError = (
 };
 
 /**
+ * Stream-error payload helpers.
+ */
+export interface StreamErrorPayload {
+  messageId: string;
+  error: string;
+  errorType?: StreamErrorType;
+}
+
+export const createErrorEvent = (workspaceId: string, payload: StreamErrorPayload): ErrorEvent => ({
+  type: "error",
+  workspaceId,
+  messageId: payload.messageId,
+  error: payload.error,
+  errorType: payload.errorType,
+});
+
+const API_KEY_ERROR_HINTS = ["api key", "api_key", "anthropic_api_key"];
+
+export const coerceStreamErrorTypeForMessage = (
+  errorType: StreamErrorType,
+  errorMessage: string
+): StreamErrorType => {
+  const loweredMessage = errorMessage.toLowerCase();
+  if (API_KEY_ERROR_HINTS.some((hint) => loweredMessage.includes(hint))) {
+    return "authentication";
+  }
+
+  return errorType;
+};
+export const createStreamErrorMessage = (payload: StreamErrorPayload): StreamErrorMessage => ({
+  type: "stream-error",
+  messageId: payload.messageId,
+  error: payload.error,
+  errorType: payload.errorType ?? "unknown",
+});
+
+/**
  * Build a stream-error payload for pre-stream failures so the UI can surface them immediately.
  */
-export const buildStreamErrorEventData = (
-  error: SendMessageError
-): { messageId: string; error: string; errorType: StreamErrorType } => {
+export const buildStreamErrorEventData = (error: SendMessageError): StreamErrorPayload => {
   const { message, errorType } = formatSendMessageError(error);
   const messageId = createAssistantMessageId();
   return { messageId, error: message, errorType };

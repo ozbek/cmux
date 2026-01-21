@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildStreamErrorEventData,
+  coerceStreamErrorTypeForMessage,
+  createErrorEvent,
+  createStreamErrorMessage,
   createUnknownSendMessageError,
   formatSendMessageError,
 } from "./sendMessageError";
@@ -17,6 +20,51 @@ describe("buildStreamErrorEventData", () => {
     expect(result.messageId).toMatch(/^assistant-/);
   });
 });
+describe("createStreamErrorMessage", () => {
+  test("defaults errorType to unknown", () => {
+    const result = createStreamErrorMessage({
+      messageId: "assistant-test",
+      error: "something went wrong",
+    });
+
+    expect(result.type).toBe("stream-error");
+    expect(result.errorType).toBe("unknown");
+    expect(result.messageId).toBe("assistant-test");
+  });
+});
+
+describe("createErrorEvent", () => {
+  test("builds an error event payload", () => {
+    const result = createErrorEvent("workspace-1", {
+      messageId: "assistant-123",
+      error: "something broke",
+      errorType: "unknown",
+    });
+
+    expect(result).toEqual({
+      type: "error",
+      workspaceId: "workspace-1",
+      messageId: "assistant-123",
+      error: "something broke",
+      errorType: "unknown",
+    });
+  });
+});
+
+describe("coerceStreamErrorTypeForMessage", () => {
+  test("forces authentication when API key hints are present", () => {
+    const result = coerceStreamErrorTypeForMessage("unknown", "Missing API key");
+
+    expect(result).toBe("authentication");
+  });
+
+  test("keeps the original errorType otherwise", () => {
+    const result = coerceStreamErrorTypeForMessage("network", "Connection reset");
+
+    expect(result).toBe("network");
+  });
+});
+
 describe("formatSendMessageError", () => {
   test("formats api_key_not_found with authentication errorType", () => {
     const result = formatSendMessageError({
