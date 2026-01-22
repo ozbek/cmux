@@ -10,6 +10,7 @@ import {
   BASH_TRUNCATE_MAX_TOTAL_BYTES,
   BASH_TRUNCATE_MAX_FILE_BYTES,
 } from "@/common/constants/toolLimits";
+import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 
 import type { BashOutputEvent } from "@/common/types/stream";
@@ -355,7 +356,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: { ...config.muxEnv, ...config.secrets },
+        env: { ...config.muxEnv, ...config.secrets, ...NON_INTERACTIVE_ENV_VARS },
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
       });
@@ -614,6 +615,12 @@ ${scriptWithEnv}`;
       // Attach a no-op rejection handler to prevent Node's unhandled rejection warning.
       void foregroundCompletion.catch(() => undefined);
 
+      // If the user clicks "Background" right as the process is exiting, we can end up
+      // racing the background request against stream draining. In that case, prefer the
+      // normal completion path so we don't drop any last-millisecond output (especially
+      // on Windows, where stream/exit events can arrive slightly out of order).
+      const BACKGROUND_EXIT_GRACE_MS = 100;
+
       let exitCode: number;
       try {
         const result = await Promise.race([
@@ -627,7 +634,16 @@ ${scriptWithEnv}`;
         // If the process already exited, drain the foreground streams for reliable output
         // instead of backgrounding based on timing.
         if (shouldBackground) {
-          if (exitCodeResolved) {
+          const didExit =
+            exitCodeResolved ||
+            (await Promise.race([
+              execStream.exitCode.then(() => true).catch(() => true),
+              new Promise<boolean>((resolve) =>
+                setTimeout(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
+              ),
+            ]));
+
+          if (didExit) {
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
@@ -666,7 +682,7 @@ ${scriptWithEnv}`;
                 stdout: stdoutForMigration,
                 stderr: stderrForMigration,
                 stdin: execStream.stdin,
-                exitCode: exitCodePromise,
+                exitCode: execStream.exitCode,
                 duration: execStream.duration,
               };
 
