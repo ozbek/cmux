@@ -1,8 +1,128 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import { init, Terminal, FitAddon } from "ghostty-web";
 import { useAPI } from "@/browser/contexts/API";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  DEFAULT_TERMINAL_FONT_CONFIG,
+  TERMINAL_FONT_CONFIG_KEY,
+  type TerminalFontConfig,
+} from "@/common/constants/storage";
 import { useTerminalRouter } from "@/browser/terminal/TerminalRouterContext";
+import {
+  appendTerminalIconFallback,
+  formatCssFontFamilyList,
+  isFontFamilyAvailableInBrowser,
+  isGenericFontFamily,
+  splitFontFamilyList,
+  stripOuterQuotes,
+  TERMINAL_ICON_FALLBACK_FAMILY,
+} from "@/browser/terminal/terminalFontFamily";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
+
+function normalizeTerminalFontConfig(value: unknown): TerminalFontConfig {
+  if (!value || typeof value !== "object") {
+    return DEFAULT_TERMINAL_FONT_CONFIG;
+  }
+
+  const record = value as { fontFamily?: unknown; fontSize?: unknown };
+
+  const fontFamily =
+    typeof record.fontFamily === "string" && record.fontFamily.trim()
+      ? record.fontFamily
+      : DEFAULT_TERMINAL_FONT_CONFIG.fontFamily;
+
+  const fontSizeNumber = Number(record.fontSize);
+  const fontSize =
+    Number.isFinite(fontSizeNumber) && fontSizeNumber > 0
+      ? fontSizeNumber
+      : DEFAULT_TERMINAL_FONT_CONFIG.fontSize;
+
+  return { fontFamily, fontSize };
+}
+
+function canLoadFontFamily(primary: string, fontSize: number): boolean {
+  const family = stripOuterQuotes(primary).trim();
+  if (!family) {
+    return false;
+  }
+
+  if (isGenericFontFamily(family)) {
+    return true;
+  }
+
+  return isFontFamilyAvailableInBrowser(family, fontSize);
+}
+
+function resolveTerminalFontFamily(fontFamily: string, fontSize: number): string {
+  const formatted = formatCssFontFamilyList(fontFamily);
+  const parts = splitFontFamilyList(fontFamily).map(stripOuterQuotes).filter(Boolean);
+  const primary = parts.at(0);
+  if (!primary) {
+    return appendTerminalIconFallback(formatted);
+  }
+
+  const primaryOk = canLoadFontFamily(primary, fontSize);
+  if (primaryOk) {
+    return appendTerminalIconFallback(formatted);
+  }
+
+  // Common mismatch: "Nerd Font" vs "Nerd Font Mono". Try the Mono variant even if the user
+  // didn't list it explicitly.
+  if (primary.endsWith("Nerd Font") && !primary.endsWith("Nerd Font Mono")) {
+    const monoCandidate = `${primary} Mono`;
+    const monoOk = canLoadFontFamily(monoCandidate, fontSize);
+    if (monoOk) {
+      const remaining = parts.slice(1).join(", ");
+      const withMono = remaining ? `${monoCandidate}, ${remaining}` : monoCandidate;
+      return appendTerminalIconFallback(withMono);
+    }
+  }
+
+  // If the primary isn't available, try to promote the first available fallback font.
+  for (const candidate of parts.slice(1)) {
+    if (isGenericFontFamily(candidate)) {
+      continue;
+    }
+
+    const candidateOk = canLoadFontFamily(candidate, fontSize);
+    if (candidateOk) {
+      const remaining = parts.filter((part) => part !== candidate).join(", ");
+      const reordered = remaining ? `${candidate}, ${remaining}` : candidate;
+      return appendTerminalIconFallback(reordered);
+    }
+  }
+
+  return appendTerminalIconFallback(formatted);
+}
+
+const TERMINAL_FONT_LOAD_TEST_STRING = "abcdefghijklmnopqrstuvwxyz0123456789";
+const TERMINAL_ICON_LOAD_TEST_STRING = String.fromCodePoint(0xf024b);
+
+async function preloadTerminalWebfonts(
+  resolvedFontFamily: string,
+  fontSize: number
+): Promise<void> {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const fontFaceSet = document.fonts;
+  if (!fontFaceSet || typeof fontFaceSet.load !== "function") {
+    return;
+  }
+
+  try {
+    await Promise.all([
+      fontFaceSet.load(`${fontSize}px ${resolvedFontFamily}`, TERMINAL_FONT_LOAD_TEST_STRING),
+      fontFaceSet.load(
+        `${fontSize}px ${formatCssFontFamilyList(TERMINAL_ICON_FALLBACK_FAMILY)}`,
+        TERMINAL_ICON_LOAD_TEST_STRING
+      ),
+    ]);
+  } catch (err) {
+    console.warn("[TerminalView] Failed to preload webfonts:", err);
+  }
+}
 
 interface TerminalViewProps {
   workspaceId: string;
@@ -47,6 +167,12 @@ export function TerminalView({
   // Track whether we've received the initial screen state from backend
   const [isLoading, setIsLoading] = useState(true);
 
+  const [rawTerminalFontConfig] = usePersistedState<TerminalFontConfig>(
+    TERMINAL_FONT_CONFIG_KEY,
+    DEFAULT_TERMINAL_FONT_CONFIG,
+    { listener: true }
+  );
+  const terminalFontConfig = normalizeTerminalFontConfig(rawTerminalFontConfig);
   const { api } = useAPI();
   const router = useTerminalRouter();
 
@@ -267,11 +393,22 @@ export function TerminalView({
         // Resolve CSS variables for xterm.js (canvas rendering doesn't support CSS vars)
         const styles = getComputedStyle(document.documentElement);
         const terminalBg = styles.getPropertyValue("--color-terminal-bg").trim() || "#1e1e1e";
+
+        const resolvedFontFamily = resolveTerminalFontFamily(
+          terminalFontConfig.fontFamily,
+          terminalFontConfig.fontSize
+        );
+
+        await preloadTerminalWebfonts(resolvedFontFamily, terminalFontConfig.fontSize);
+
+        if (cancelled) {
+          return;
+        }
         const terminalFg = styles.getPropertyValue("--color-terminal-fg").trim() || "#d4d4d4";
 
         terminal = new Terminal({
-          fontSize: 13,
-          fontFamily: "JetBrains Mono, Menlo, Monaco, monospace",
+          fontSize: terminalFontConfig.fontSize,
+          fontFamily: resolvedFontFamily,
           // Start with no blinking - we enable it on focus
           cursorBlink: false,
           theme: {
@@ -410,7 +547,90 @@ export function TerminalView({
       containerEl.replaceChildren();
       initInProgressRef.current = false;
     };
-  }, [visible, workspaceId, router, sessionId]);
+  }, [
+    visible,
+    workspaceId,
+    router,
+    sessionId,
+    terminalFontConfig.fontFamily,
+    terminalFontConfig.fontSize,
+  ]);
+
+  // Apply persisted terminal font options and keep PTY size in sync.
+
+  useEffect(() => {
+    if (!terminalReady) {
+      return;
+    }
+
+    const term = termRef.current;
+    const fitAddon = fitAddonRef.current;
+    if (!term || !fitAddon) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const applyFont = async () => {
+      const resolvedFontFamily = resolveTerminalFontFamily(
+        terminalFontConfig.fontFamily,
+        terminalFontConfig.fontSize
+      );
+
+      await preloadTerminalWebfonts(resolvedFontFamily, terminalFontConfig.fontSize);
+
+      if (cancelled || term !== termRef.current) {
+        return;
+      }
+
+      term.options.fontFamily = resolvedFontFamily;
+      term.options.fontSize = terminalFontConfig.fontSize;
+
+      // Avoid resizing the PTY when hidden (container may be 0x0).
+      if (!visible) {
+        return;
+      }
+
+      // ghostty-web measures character sizes asynchronously after font changes.
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+      );
+
+      if (cancelled || term !== termRef.current) {
+        return;
+      }
+
+      const proposed = fitAddon.proposeDimensions();
+      if (!proposed) {
+        return;
+      }
+
+      try {
+        await router.resize(sessionId, proposed.cols, proposed.rows);
+
+        if (cancelled || term !== termRef.current) {
+          return;
+        }
+
+        term.resize(proposed.cols, proposed.rows);
+      } catch (err) {
+        console.error("[TerminalView] Error resizing after terminal font change:", err);
+      }
+    };
+
+    void applyFont();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    router,
+    sessionId,
+    terminalReady,
+    terminalFontConfig.fontFamily,
+    terminalFontConfig.fontSize,
+    visible,
+  ]);
 
   // Track focus/blur on the terminal container to control cursor blinking
   useEffect(() => {

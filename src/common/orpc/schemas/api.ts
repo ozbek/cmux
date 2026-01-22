@@ -885,6 +885,7 @@ export const ApiServerStatusSchema = z.object({
   /** Whether the API server should serve the mux web UI at /. */
   configuredServeWebUi: z.boolean(),
 });
+
 export const server = {
   getLaunchProject: {
     input: z.void(),
