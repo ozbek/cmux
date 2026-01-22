@@ -1,4 +1,5 @@
 import React from "react";
+import { cn } from "@/common/lib/utils";
 import type { LucideIcon } from "lucide-react";
 import {
   AlertTriangle,
@@ -44,6 +45,7 @@ const EMOJI_TO_ICON: Record<string, LucideIcon> = {
   "❌": X,
   "🚀": Rocket,
   "⏳": Hourglass,
+  "⌛": Hourglass,
   "🔗": Link,
   "🔄": RefreshCw,
   "🧪": Beaker,
@@ -76,15 +78,32 @@ const EMOJI_TO_ICON: Record<string, LucideIcon> = {
   "💡": Lightbulb,
 };
 
+const SPINNING_EMOJI = new Set([
+  // In tool output and agent status, these represent "refreshing".
+  "🔄",
+]);
+
 export function getIconForEmoji(emoji: string): LucideIcon | undefined {
   const normalized = normalizeEmoji(emoji);
   return EMOJI_TO_ICON[normalized];
 }
 
-export function EmojiIcon(props: { emoji: string | null | undefined; className?: string }) {
+export function EmojiIcon(props: {
+  emoji: string | null | undefined;
+  className?: string;
+  /**
+   * When provided, forces whether the icon should spin.
+   *
+   * When omitted, we spin only for emojis that semantically represent
+   * "working"/"refreshing".
+   */
+  spin?: boolean;
+}) {
   if (!props.emoji) return null;
 
-  const Icon = getIconForEmoji(props.emoji) ?? Sparkles;
+  const normalizedEmoji = normalizeEmoji(props.emoji);
+  const Icon = EMOJI_TO_ICON[normalizedEmoji] ?? Sparkles;
+  const shouldSpin = props.spin ?? SPINNING_EMOJI.has(normalizedEmoji);
 
-  return <Icon aria-hidden="true" className={props.className} />;
+  return <Icon aria-hidden="true" className={cn(props.className, shouldSpin && "animate-spin")} />;
 }
