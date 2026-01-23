@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect } from "react";
 import { RUNTIME_MODE, type RuntimeMode, type ParsedRuntime } from "@/common/types/runtime";
-import type { RuntimeAvailabilityMap } from "./useCreationWorkspace";
+import { type RuntimeAvailabilityState } from "./useCreationWorkspace";
+import {
+  resolveDevcontainerSelection,
+  DEFAULT_DEVCONTAINER_CONFIG_PATH,
+} from "@/browser/utils/devcontainerSelection";
 import { Select } from "../Select";
 import {
   Select as RadixSelect,
@@ -15,8 +19,8 @@ import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { cn } from "@/common/lib/utils";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../ui/tooltip";
-import { SSHIcon, WorktreeIcon, LocalIcon, DockerIcon } from "../icons/RuntimeIcons";
 import { DocsLink } from "../DocsLink";
+import { RUNTIME_UI, type RuntimeIconProps } from "@/browser/utils/runtimeUi";
 import type { WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
 import type { SectionConfig } from "@/common/types/project";
 import { resolveSectionColor } from "@/common/constants/ui";
@@ -41,8 +45,8 @@ interface CreationControlsProps {
   projectName: string;
   /** Workspace name/title generation state and actions */
   nameState: WorkspaceNameState;
-  /** Runtime availability for each mode (null while loading) */
-  runtimeAvailability: RuntimeAvailabilityMap | null;
+  /** Runtime availability state for each mode */
+  runtimeAvailabilityState: RuntimeAvailabilityState;
   /** Available sections for this project */
   sections?: SectionConfig[];
   /** Currently selected section ID */
@@ -62,64 +66,38 @@ interface RuntimeButtonGroupProps {
   defaultMode: RuntimeMode;
   onSetDefault: (mode: RuntimeMode) => void;
   disabled?: boolean;
-  runtimeAvailability?: RuntimeAvailabilityMap | null;
+  runtimeAvailabilityState?: RuntimeAvailabilityState;
 }
+
+const RUNTIME_ORDER: RuntimeMode[] = [
+  RUNTIME_MODE.LOCAL,
+  RUNTIME_MODE.WORKTREE,
+  RUNTIME_MODE.SSH,
+  RUNTIME_MODE.DOCKER,
+  RUNTIME_MODE.DEVCONTAINER,
+];
 
 const RUNTIME_OPTIONS: Array<{
   value: RuntimeMode;
   label: string;
   description: string;
   docsPath: string;
-  Icon: React.FC<{ size?: number; className?: string }>;
+  Icon: React.ComponentType<RuntimeIconProps>;
   // Active state colors using CSS variables for theme support
   activeClass: string;
   idleClass: string;
-}> = [
-  {
-    value: RUNTIME_MODE.LOCAL,
-    label: "Local",
-    description: "Work directly in project directory",
-    docsPath: "/runtime/local",
-    Icon: LocalIcon,
-    activeClass:
-      "bg-[var(--color-runtime-local)]/30 text-foreground border-[var(--color-runtime-local)]/60",
-    idleClass:
-      "bg-transparent text-muted border-transparent hover:border-[var(--color-runtime-local)]/40",
-  },
-  {
-    value: RUNTIME_MODE.WORKTREE,
-    label: "Worktree",
-    description: "Isolated git worktree",
-    docsPath: "/runtime/worktree",
-    Icon: WorktreeIcon,
-    activeClass:
-      "bg-[var(--color-runtime-worktree)]/20 text-[var(--color-runtime-worktree-text)] border-[var(--color-runtime-worktree)]/60",
-    idleClass:
-      "bg-transparent text-muted border-transparent hover:border-[var(--color-runtime-worktree)]/40",
-  },
-  {
-    value: RUNTIME_MODE.SSH,
-    label: "SSH",
-    description: "Clone on SSH host",
-    docsPath: "/runtime/ssh",
-    Icon: SSHIcon,
-    activeClass:
-      "bg-[var(--color-runtime-ssh)]/20 text-[var(--color-runtime-ssh-text)] border-[var(--color-runtime-ssh)]/60",
-    idleClass:
-      "bg-transparent text-muted border-transparent hover:border-[var(--color-runtime-ssh)]/40",
-  },
-  {
-    value: RUNTIME_MODE.DOCKER,
-    label: "Docker",
-    description: "Run in Docker container",
-    docsPath: "/runtime/docker",
-    Icon: DockerIcon,
-    activeClass:
-      "bg-[var(--color-runtime-docker)]/20 text-[var(--color-runtime-docker-text)] border-[var(--color-runtime-docker)]/60",
-    idleClass:
-      "bg-transparent text-muted border-transparent hover:border-[var(--color-runtime-docker)]/40",
-  },
-];
+}> = RUNTIME_ORDER.map((mode) => {
+  const ui = RUNTIME_UI[mode];
+  return {
+    value: mode,
+    label: ui.label,
+    description: ui.description,
+    docsPath: ui.docsPath,
+    Icon: ui.Icon,
+    activeClass: ui.button.activeClass,
+    idleClass: ui.button.idleClass,
+  };
+});
 
 /** Aesthetic section picker with color accent */
 interface SectionPickerProps {
@@ -183,12 +161,27 @@ function SectionPicker(props: SectionPickerProps) {
 }
 
 function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
+  const availabilityMap =
+    props.runtimeAvailabilityState?.status === "loaded"
+      ? props.runtimeAvailabilityState.data
+      : null;
+  const hideDevcontainer =
+    availabilityMap?.devcontainer?.available === false &&
+    availabilityMap.devcontainer.reason === "No devcontainer.json found";
+
+  const runtimeOptions = hideDevcontainer
+    ? RUNTIME_OPTIONS.filter((option) => option.value !== RUNTIME_MODE.DEVCONTAINER)
+    : RUNTIME_OPTIONS;
+
   return (
     <div className="flex gap-1" role="group" aria-label="Runtime type">
-      {RUNTIME_OPTIONS.map((option) => {
+      {runtimeOptions.map((option) => {
         const isActive = props.value === option.value;
         const isDefault = props.defaultMode === option.value;
-        const availability = props.runtimeAvailability?.[option.value];
+        const availability = availabilityMap?.[option.value];
+        // Disable only if availability is explicitly known and unavailable.
+        // When availability is undefined (loading or fetch failed), allow selection
+        // as fallback - the config picker will validate before creation.
         const isModeDisabled = availability !== undefined && !availability.available;
         const disabledReason =
           availability && !availability.available ? availability.reason : undefined;
@@ -250,28 +243,46 @@ function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
 export function CreationControls(props: CreationControlsProps) {
   const { projects } = useProjectContext();
   const { beginWorkspaceCreation } = useWorkspaceContext();
-  const { nameState, runtimeAvailability } = props;
+  const { nameState, runtimeAvailabilityState } = props;
 
   // Extract mode from discriminated union for convenience
   const runtimeMode = props.selectedRuntime.mode;
+  const { selectedRuntime, onSelectedRuntimeChange } = props;
 
   // Local runtime doesn't need a trunk branch selector (uses project dir as-is)
+  const availabilityMap =
+    runtimeAvailabilityState.status === "loaded" ? runtimeAvailabilityState.data : null;
   const showTrunkBranchSelector = props.branches.length > 0 && runtimeMode !== RUNTIME_MODE.LOCAL;
 
-  const { selectedRuntime, onSelectedRuntimeChange } = props;
+  // Centralized devcontainer selection logic
+  const devcontainerSelection = resolveDevcontainerSelection({
+    selectedRuntime,
+    availabilityState: runtimeAvailabilityState,
+  });
+
+  const isDevcontainerMissing =
+    availabilityMap?.devcontainer?.available === false &&
+    availabilityMap.devcontainer.reason === "No devcontainer.json found";
 
   // Check if git is required (worktree unavailable due to git or no branches)
   const isNonGitRepo =
-    (runtimeAvailability?.worktree?.available === false &&
-      runtimeAvailability.worktree.reason === "Requires git repository") ||
+    (availabilityMap?.worktree?.available === false &&
+      availabilityMap.worktree.reason === "Requires git repository") ||
     (props.branchesLoaded && props.branches.length === 0);
 
-  // Force local runtime for non-git directories
+  // Keep selected runtime aligned with availability constraints
   useEffect(() => {
-    if (isNonGitRepo && selectedRuntime.mode !== RUNTIME_MODE.LOCAL) {
-      onSelectedRuntimeChange({ mode: "local" });
+    if (isNonGitRepo) {
+      if (selectedRuntime.mode !== RUNTIME_MODE.LOCAL) {
+        onSelectedRuntimeChange({ mode: "local" });
+      }
+      return;
     }
-  }, [isNonGitRepo, selectedRuntime.mode, onSelectedRuntimeChange]);
+
+    if (isDevcontainerMissing && selectedRuntime.mode === RUNTIME_MODE.DEVCONTAINER) {
+      onSelectedRuntimeChange({ mode: "worktree" });
+    }
+  }, [isDevcontainerMissing, isNonGitRepo, selectedRuntime.mode, onSelectedRuntimeChange]);
 
   const handleNameChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -433,6 +444,25 @@ export function CreationControls(props: CreationControlsProps) {
                     image: selectedRuntime.mode === "docker" ? selectedRuntime.image : "",
                   });
                   break;
+                case RUNTIME_MODE.DEVCONTAINER: {
+                  // Use resolver to get initial config path (prefers first available config)
+                  const initialSelection = resolveDevcontainerSelection({
+                    selectedRuntime: { mode: "devcontainer", configPath: "" },
+                    availabilityState: runtimeAvailabilityState,
+                  });
+                  onSelectedRuntimeChange({
+                    mode: "devcontainer",
+                    configPath:
+                      selectedRuntime.mode === "devcontainer"
+                        ? selectedRuntime.configPath
+                        : initialSelection.configPath,
+                    shareCredentials:
+                      selectedRuntime.mode === "devcontainer"
+                        ? selectedRuntime.shareCredentials
+                        : false,
+                  });
+                  break;
+                }
                 case RUNTIME_MODE.LOCAL:
                   onSelectedRuntimeChange({ mode: "local" });
                   break;
@@ -445,7 +475,7 @@ export function CreationControls(props: CreationControlsProps) {
             defaultMode={props.defaultRuntimeMode}
             onSetDefault={props.onSetDefaultRuntime}
             disabled={props.disabled}
-            runtimeAvailability={runtimeAvailability}
+            runtimeAvailabilityState={runtimeAvailabilityState}
           />
 
           {/* Branch selector - shown for worktree/SSH */}
@@ -487,7 +517,8 @@ export function CreationControls(props: CreationControlsProps) {
             </div>
           )}
 
-          {/* Docker Image Input */}
+          {/* Runtime-specific config inputs */}
+
           {selectedRuntime.mode === "docker" && (
             <div className="flex items-center gap-2">
               <label htmlFor="docker-image" className="text-muted-foreground text-xs">
@@ -516,7 +547,81 @@ export function CreationControls(props: CreationControlsProps) {
           )}
         </div>
 
-        {/* Docker Credential Sharing - separate row for consistency with Coder controls */}
+        {/* Dev container controls - config dropdown/input + credential sharing */}
+        {selectedRuntime.mode === "devcontainer" && devcontainerSelection.uiMode !== "hidden" && (
+          <div className="border-border-medium flex w-fit flex-col gap-1.5 rounded-md border p-2">
+            <div className="flex flex-col gap-1">
+              <label className="text-muted-foreground text-xs">Config</label>
+              {devcontainerSelection.uiMode === "dropdown" ? (
+                <RadixSelect
+                  value={devcontainerSelection.configPath}
+                  onValueChange={(value) =>
+                    onSelectedRuntimeChange({
+                      mode: "devcontainer",
+                      configPath: value,
+                      shareCredentials: selectedRuntime.shareCredentials,
+                    })
+                  }
+                  disabled={props.disabled}
+                >
+                  <SelectTrigger
+                    className="h-6 w-[280px] text-xs"
+                    aria-label="Dev container config"
+                  >
+                    <SelectValue placeholder="Select config" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {devcontainerSelection.configs.map((config) => (
+                      <SelectItem key={config.path} value={config.path}>
+                        {config.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </RadixSelect>
+              ) : (
+                <input
+                  type="text"
+                  value={devcontainerSelection.configPath}
+                  onChange={(e) =>
+                    onSelectedRuntimeChange({
+                      mode: "devcontainer",
+                      configPath: e.target.value,
+                      shareCredentials: selectedRuntime.shareCredentials,
+                    })
+                  }
+                  placeholder={DEFAULT_DEVCONTAINER_CONFIG_PATH}
+                  disabled={props.disabled}
+                  className={cn(
+                    "bg-bg-dark text-foreground border-border-medium focus:border-accent h-7 w-[280px] rounded-md border px-2 text-xs focus:outline-none disabled:opacity-50"
+                  )}
+                  aria-label="Dev container config path"
+                />
+              )}
+            </div>
+            {devcontainerSelection.helperText && (
+              <p className="text-muted-foreground text-xs">{devcontainerSelection.helperText}</p>
+            )}
+            <label className="flex items-center gap-1.5 text-xs">
+              <input
+                type="checkbox"
+                checked={selectedRuntime.shareCredentials ?? false}
+                onChange={(e) =>
+                  onSelectedRuntimeChange({
+                    mode: "devcontainer",
+                    configPath: devcontainerSelection.configPath,
+                    shareCredentials: e.target.checked,
+                  })
+                }
+                disabled={props.disabled}
+                className="accent-accent"
+              />
+              <span className="text-muted">Share credentials (SSH, Git)</span>
+              <DocsLink path="/runtime/docker#credential-sharing" />
+            </label>
+          </div>
+        )}
+
+        {/* Credential sharing - separate row for consistency with Coder controls */}
         {selectedRuntime.mode === "docker" && (
           <label className="flex items-center gap-1.5 text-xs">
             <input
