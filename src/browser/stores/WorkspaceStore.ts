@@ -342,14 +342,14 @@ export class WorkspaceStore {
   // Global callback when a response completes (for "notify on response" feature)
   // isFinal is true when no more active streams remain (assistant done with all work)
   // finalText is the text content after any tool calls (for notification body)
-  // isCompaction is true when this was a compaction stream (for special notification text)
+  // compaction is provided when this was a compaction stream (includes continue metadata)
   private responseCompleteCallback:
     | ((
         workspaceId: string,
         messageId: string,
         isFinal: boolean,
         finalText: string,
-        isCompaction: boolean
+        compaction?: { hasContinueMessage: boolean }
       ) => void)
     | null = null;
 
@@ -650,7 +650,7 @@ export class WorkspaceStore {
    * Set the callback for when a response completes (used for "notify on response" feature).
    * isFinal is true when no more active streams remain (assistant done with all work).
    * finalText is the text content after any tool calls (for notification body).
-   * isCompaction is true when this was a compaction stream (for special notification text).
+   * compaction is provided when this was a compaction stream (includes continue metadata).
    */
   setOnResponseComplete(
     callback: (
@@ -658,7 +658,7 @@ export class WorkspaceStore {
       messageId: string,
       isFinal: boolean,
       finalText: string,
-      isCompaction: boolean
+      compaction?: { hasContinueMessage: boolean }
     ) => void
   ): void {
     this.responseCompleteCallback = callback;
