@@ -1,8 +1,9 @@
 import { useRename } from "@/browser/contexts/WorkspaceRenameContext";
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import React, { useState, useEffect } from "react";
@@ -15,6 +16,7 @@ import { WorkspaceStatusIndicator } from "./WorkspaceStatusIndicator";
 import { Shimmer } from "./ai-elements/shimmer";
 import { ArchiveIcon } from "./icons/ArchiveIcon";
 import { WORKSPACE_DRAG_TYPE, type WorkspaceDragItem } from "./WorkspaceSectionDropZone";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 
 export interface WorkspaceSelection {
   projectPath: string;
@@ -32,13 +34,9 @@ export interface WorkspaceListItemProps {
   depth?: number;
   /** Section ID this workspace belongs to (for drag-drop targeting) */
   sectionId?: string;
-  /** @deprecated No longer used since status dot was removed, kept for API compatibility */
-  lastReadTimestamp?: number;
   // Event handlers
   onSelectWorkspace: (selection: WorkspaceSelection) => void;
-  onArchiveWorkspace: (workspaceId: string, button?: HTMLElement) => Promise<void>;
-  /** @deprecated No longer used since status dot was removed, kept for API compatibility */
-  onToggleUnread?: (workspaceId: string) => void;
+  onArchiveWorkspace: (workspaceId: string, button: HTMLElement) => Promise<void>;
 }
 
 const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
@@ -49,15 +47,17 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
   isArchiving,
   depth,
   sectionId,
-  lastReadTimestamp: _lastReadTimestamp,
   onSelectWorkspace,
   onArchiveWorkspace,
-  onToggleUnread: _onToggleUnread,
 }) => {
   // Destructure metadata for convenience
   const { id: workspaceId, namedWorkspacePath, status } = metadata;
   const isCreating = status === "creating";
   const isDisabled = isCreating || isArchiving;
+
+  const [lastReadTimestamp] = usePersistedState<number>(getWorkspaceLastReadKey(workspaceId), 0, {
+    listener: true,
+  });
   const gitStatus = useGitStatus(workspaceId);
 
   // Get title edit context (renamed from rename context since we now edit titles, not names)
@@ -110,10 +110,30 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
     }
   };
 
-  const { canInterrupt, awaitingUserQuestion, isStarting } = useWorkspaceSidebarState(workspaceId);
+  const { canInterrupt, awaitingUserQuestion, isStarting, recencyTimestamp } =
+    useWorkspaceSidebarState(workspaceId);
+
+  const isUnread = recencyTimestamp !== null && recencyTimestamp > lastReadTimestamp;
+  const showUnreadBar = !isCreating && !isEditing && isUnread && !(isSelected && !isDisabled);
+  const barColorClass =
+    isSelected && !isDisabled
+      ? "bg-blue-400"
+      : showUnreadBar
+        ? "bg-muted-foreground"
+        : "bg-transparent";
+  const unreadBar = (
+    <span
+      className={cn(
+        "absolute left-0 top-0 bottom-0 w-[3px] transition-colors duration-150",
+        barColorClass,
+        showUnreadBar ? "pointer-events-auto" : "pointer-events-none"
+      )}
+      aria-hidden={!showUnreadBar}
+    />
+  );
   const isWorking = (canInterrupt || isStarting) && !awaitingUserQuestion;
   const safeDepth = typeof depth === "number" && Number.isFinite(depth) ? Math.max(0, depth) : 0;
-  const paddingLeft = 9 + Math.min(32, safeDepth) * 12;
+  const paddingLeft = 12 + Math.min(32, safeDepth) * 12;
 
   // Drag handle for moving workspace between sections
   const [{ isDragging }, drag, dragPreview] = useDrag(
@@ -146,12 +166,12 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
       <div
         ref={drag}
         className={cn(
-          "py-1.5 pr-2 border-l-[3px] border-transparent transition-all duration-150 text-[13px] relative flex gap-2",
+          "py-1.5 pr-2 transition-all duration-150 text-[13px] relative flex gap-2",
           isDragging && "opacity-50",
           isDisabled
             ? "cursor-default opacity-70"
             : "cursor-pointer hover:bg-hover [&:hover_button]:opacity-100",
-          isSelected && !isDisabled && "bg-hover border-l-blue-400",
+          isSelected && !isDisabled && "bg-hover",
           isArchiving && "pointer-events-none"
         )}
         style={{ paddingLeft }}
@@ -192,26 +212,37 @@ const WorkspaceListItemInner: React.FC<WorkspaceListItemProps> = ({
         data-section-id={sectionId ?? ""}
         data-git-status={gitStatus ? JSON.stringify(gitStatus) : undefined}
       >
+        {/* Workspace indicator bar (selected/unread) */}
+        {showUnreadBar ? (
+          <Tooltip>
+            <TooltipTrigger asChild>{unreadBar}</TooltipTrigger>
+            <TooltipContent align="start">Unread messages</TooltipContent>
+          </Tooltip>
+        ) : (
+          unreadBar
+        )}
         {/* Archive button - vertically centered against entire item */}
         {!isCreating && !isEditing && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                className="text-muted hover:text-foreground inline-flex shrink-0 cursor-pointer items-center self-center border-none bg-transparent p-0 opacity-0 transition-colors duration-200"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void onArchiveWorkspace(workspaceId, e.currentTarget);
-                }}
-                aria-label={`Archive workspace ${displayTitle}`}
-                data-workspace-id={workspaceId}
-              >
-                <ArchiveIcon className="h-3 w-3" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent align="start">
-              Archive workspace ({formatKeybind(KEYBINDS.ARCHIVE_WORKSPACE)} when selected)
-            </TooltipContent>
-          </Tooltip>
+          <div className="relative inline-flex h-4 w-4 shrink-0 items-center self-center">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  className="text-muted hover:text-foreground inline-flex h-4 w-4 cursor-pointer items-center justify-center border-none bg-transparent p-0 opacity-0 transition-colors duration-200"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void onArchiveWorkspace(workspaceId, e.currentTarget);
+                  }}
+                  aria-label={`Archive workspace ${displayTitle}`}
+                  data-workspace-id={workspaceId}
+                >
+                  <ArchiveIcon className="h-3 w-3" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent align="start">
+                Archive workspace ({formatKeybind(KEYBINDS.ARCHIVE_WORKSPACE)})
+              </TooltipContent>
+            </Tooltip>
+          </div>
         )}
         <div className="flex min-w-0 flex-1 flex-col gap-1">
           <div className="grid min-w-0 grid-cols-[auto_1fr_auto] items-center gap-1.5">
