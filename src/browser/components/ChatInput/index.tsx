@@ -7,6 +7,7 @@ import {
 import type { Toast } from "../ChatInputToast";
 import { ConnectionStatusToast } from "../ConnectionStatusToast";
 import { ChatInputToast } from "../ChatInputToast";
+import type { SendMessageError } from "@/common/types/errors";
 import { createCommandToast, createErrorToast } from "../ChatInputToasts";
 import { ConfirmationModal } from "../ConfirmationModal";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
@@ -35,6 +36,7 @@ import {
   VIM_ENABLED_KEY,
   getProjectScopeId,
   getPendingScopeId,
+  getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
 } from "@/common/constants/storage";
 import {
@@ -206,6 +208,21 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     },
     [setToast]
   );
+  // Subscribe to pending send errors from creation flow. Uses listener: true so
+  // late failures (e.g., slow devcontainer startup) still surface a toast.
+  const pendingErrorKey =
+    variant === "workspace" && workspaceId ? getPendingWorkspaceSendErrorKey(workspaceId) : null;
+  const [pendingError, setPendingError] = usePersistedState<SendMessageError | null>(
+    pendingErrorKey ?? "__unused__",
+    null,
+    { listener: true }
+  );
+  useEffect(() => {
+    if (!pendingErrorKey || !pendingError) return;
+    setToast(createErrorToast(pendingError));
+    setPendingError(null);
+  }, [pendingErrorKey, pendingError, setPendingError]);
+
   const handleToastDismiss = useCallback(() => {
     setToast(null);
   }, []);
@@ -266,6 +283,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
   // Attached reviews come from parent via props (persisted in pendingReviews state)
   const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
+  // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
   const [atMentionCursorNonce, setAtMentionCursorNonce] = useState(0);
@@ -1428,12 +1452,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
       // Creation variant: simple message send + workspace creation
       const creationFileParts = chatAttachmentsToFileParts(attachments);
-      const ok = await creationState.handleSend(
+      const creationResult = await creationState.handleSend(
         creationMessageTextForSend,
         creationFileParts.length > 0 ? creationFileParts : undefined,
         creationOptionsOverride
       );
-      if (ok) {
+      if (creationResult.success && isMountedRef.current) {
         setInput("");
         setAttachments([]);
         // Height is managed by VimTextArea's useLayoutEffect - clear inline style

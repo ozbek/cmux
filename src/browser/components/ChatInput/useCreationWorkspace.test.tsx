@@ -6,10 +6,10 @@ import {
   getInputAttachmentsKey,
   getModelKey,
   getPendingScopeId,
+  getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
-import type { SendMessageError as _SendMessageError } from "@/common/types/errors";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { RuntimeMode, ParsedRuntime } from "@/common/types/runtime";
 import type {
@@ -19,7 +19,7 @@ import type {
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import { useCreationWorkspace } from "./useCreationWorkspace";
+import { useCreationWorkspace, type CreationSendResult } from "./useCreationWorkspace";
 
 const readPersistedStateCalls: Array<[string, unknown]> = [];
 let persistedPreferences: Record<string, unknown> = {};
@@ -467,9 +467,12 @@ describe("useCreationWorkspace", () => {
     // Wait for name generation to trigger (happens on debounce)
     await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
 
+    let handleSendResult: CreationSendResult | undefined;
     await act(async () => {
-      await getHook().handleSend("launch workspace");
+      handleSendResult = await getHook().handleSend("launch workspace");
     });
+
+    expect(handleSendResult).toEqual({ success: true });
 
     // workspace.create should be called with the generated name
     expect(workspaceApi.create.mock.calls.length).toBe(1);
@@ -505,6 +508,133 @@ describe("useCreationWorkspace", () => {
     // Thinking is workspace-scoped, but this test doesn't set a project-scoped thinking preference.
     expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
     expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+  });
+
+  test("handleSend returns failure when sendMessage fails and keeps draft", async () => {
+    const listBranchesMock = mock(
+      (): Promise<BranchListResult> =>
+        Promise.resolve({
+          branches: ["main"],
+          recommendedTrunk: "main",
+        })
+    );
+    const sendError = { type: "api_key_not_found", provider: "openai" } as const;
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false,
+          error: sendError,
+        } as WorkspaceSendMessageResult)
+    );
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.resolve({
+          success: true,
+          metadata: TEST_METADATA,
+        } as WorkspaceCreateResult)
+    );
+    const nameGenerationMock = mock(
+      (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+        Promise.resolve({
+          success: true,
+          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+        } as NameGenerationResult)
+    );
+    setupWindow({
+      listBranches: listBranchesMock,
+      sendMessage: sendMessageMock,
+      create: createMock,
+      nameGeneration: nameGenerationMock,
+    });
+
+    draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
+    const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "test message",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    let handleSendResult: CreationSendResult | undefined;
+    await act(async () => {
+      handleSendResult = await getHook().handleSend("test message");
+    });
+
+    expect(handleSendResult).toEqual({ success: false, error: sendError });
+    expect(onWorkspaceCreated.mock.calls.length).toBe(1);
+
+    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
+    const pendingInputKey = getInputKey(pendingScopeId);
+    const pendingImagesKey = getInputAttachmentsKey(pendingScopeId);
+    const pendingErrorKey = getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID);
+    expect(updatePersistedStateCalls.some(([key]) => key === pendingInputKey)).toBe(false);
+    expect(updatePersistedStateCalls.some(([key]) => key === pendingImagesKey)).toBe(false);
+    expect(updatePersistedStateCalls).toContainEqual([pendingErrorKey, sendError]);
+  });
+  test("onWorkspaceCreated is called before sendMessage resolves (no blocking)", async () => {
+    // This test ensures we don't regress #1146 - the fix that makes workspace creation
+    // navigate immediately without waiting for sendMessage to complete.
+    // Regression occurred in #1896 when sendMessage became awaited again.
+    const listBranchesMock = mock(
+      (): Promise<BranchListResult> =>
+        Promise.resolve({
+          branches: ["main"],
+          recommendedTrunk: "main",
+        })
+    );
+    let resolveSend!: (result: WorkspaceSendMessageResult) => void;
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        new Promise((resolve) => {
+          resolveSend = resolve;
+        })
+    );
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.resolve({
+          success: true,
+          metadata: TEST_METADATA,
+        } as WorkspaceCreateResult)
+    );
+    const nameGenerationMock = mock(
+      (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+        Promise.resolve({
+          success: true,
+          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+        } as NameGenerationResult)
+    );
+    setupWindow({
+      listBranches: listBranchesMock,
+      sendMessage: sendMessageMock,
+      create: createMock,
+      nameGeneration: nameGenerationMock,
+    });
+
+    draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
+    const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "test message",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    let handleSendPromise!: Promise<CreationSendResult>;
+    act(() => {
+      handleSendPromise = getHook().handleSend("test message");
+    });
+
+    await waitFor(() => expect(onWorkspaceCreated.mock.calls.length).toBe(1));
+    expect(onWorkspaceCreated.mock.calls[0][0]).toEqual(TEST_METADATA);
+
+    resolveSend({ success: true, data: {} });
+    const handleSendResult = await handleSendPromise;
+    expect(handleSendResult).toEqual({ success: true });
   });
 
   test("handleSend surfaces backend errors and resets state", async () => {
