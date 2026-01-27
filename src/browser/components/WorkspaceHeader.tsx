@@ -32,6 +32,9 @@ import {
 } from "@/browser/hooks/useDesktopTitlebar";
 import { DebugLlmRequestModal } from "./DebugLlmRequestModal";
 import { WorkspaceLinks } from "./WorkspaceLinks";
+import { SkillIndicator } from "./SkillIndicator";
+import { useAPI } from "@/browser/contexts/API";
+import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 
 interface WorkspaceHeaderProps {
   workspaceId: string;
@@ -57,16 +60,19 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
   onToggleLeftSidebarCollapsed,
   onOpenTerminal,
 }) => {
+  const { api } = useAPI();
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const isMuxChat = workspaceId === MUX_CHAT_WORKSPACE_ID;
   const gitStatus = useGitStatus(workspaceId);
-  const { canInterrupt, isStarting, awaitingUserQuestion } = useWorkspaceSidebarState(workspaceId);
+  const { canInterrupt, isStarting, awaitingUserQuestion, loadedSkills } =
+    useWorkspaceSidebarState(workspaceId);
   const isWorking = (canInterrupt || isStarting) && !awaitingUserQuestion;
   const { startSequence: startTutorial } = useTutorial();
   const [editorError, setEditorError] = useState<string | null>(null);
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
+  const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
 
   const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
     // This state is toggled from RightSidebar, so we need cross-component updates.
@@ -137,6 +143,36 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [setNotifyOnResponse]);
 
+  // Fetch available skills for this project
+  useEffect(() => {
+    if (!api) {
+      setAvailableSkills([]);
+      return;
+    }
+
+    let isMounted = true;
+
+    const loadSkills = async () => {
+      try {
+        const skills = await api.agentSkills.list({ projectPath });
+        if (isMounted && Array.isArray(skills)) {
+          setAvailableSkills(skills);
+        }
+      } catch (error) {
+        console.error("Failed to load available skills:", error);
+        if (isMounted) {
+          setAvailableSkills([]);
+        }
+      }
+    };
+
+    void loadSkills();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [api, projectPath]);
+
   // On Windows/Linux, the native window controls overlay the top-right of the app.
   // When the right sidebar is collapsed (20px), this header stretches underneath
   // those controls and the MCP/editor/terminal buttons become unclickable.
@@ -173,7 +209,7 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
             aria-label="Open sidebar menu"
             className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 shrink-0"
           >
-            <Menu className="h-4 w-4" />
+            <Menu className="h-3.5 w-3.5" />
           </Button>
         )}
         {!isMuxChat && (
@@ -218,9 +254,9 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
                   aria-pressed={notifyOnResponse}
                 >
                   {notifyOnResponse ? (
-                    <Bell className="h-4 w-4" />
+                    <Bell className="h-3.5 w-3.5" />
                   ) : (
-                    <BellOff className="h-4 w-4" />
+                    <BellOff className="h-3.5 w-3.5" />
                   )}
                 </button>
               </PopoverTrigger>
@@ -304,6 +340,7 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
             </div>
           </PopoverContent>
         </Popover>
+        <SkillIndicator loadedSkills={loadedSkills} availableSkills={availableSkills} />
         {editorError && <span className="text-danger-soft text-xs">{editorError}</span>}
         <Tooltip>
           <TooltipTrigger asChild>
@@ -314,7 +351,7 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
               className="text-muted hover:text-foreground h-6 w-6 shrink-0"
               data-testid="workspace-mcp-button"
             >
-              <Server className="h-4 w-4" />
+              <Server className="h-3.5 w-3.5" />
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom" align="center">
@@ -329,7 +366,7 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
               onClick={() => void handleOpenInEditor()}
               className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
             >
-              <Pencil className="h-4 w-4" />
+              <Pencil className="h-3.5 w-3.5" />
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom" align="center">

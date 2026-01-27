@@ -8,6 +8,7 @@ import type {
   AgentDefinitionDescriptor,
   AgentDefinitionPackage,
 } from "@/common/types/agentDefinition";
+import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/node/config";
 import {
@@ -175,6 +176,8 @@ export interface MockORPCClientOptions {
   coderPresets?: Map<string, CoderPreset[]>;
   /** Existing Coder workspaces */
   coderWorkspaces?: CoderWorkspace[];
+  /** Available agent skills (descriptors) */
+  agentSkills?: AgentSkillDescriptor[];
 }
 
 interface MockBackgroundProcess {
@@ -248,6 +251,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderPresets = new Map<string, CoderPreset[]>(),
     coderWorkspaces = [],
     layoutPresets: initialLayoutPresets,
+    agentSkills = [],
   } = options;
 
   // Feature flags
@@ -494,7 +498,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     agentSkills: {
-      list: () => Promise.resolve([]),
+      list: () => Promise.resolve(agentSkills),
       get: () =>
         Promise.resolve({
           scope: "built-in" as const,
