@@ -47,6 +47,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import { getToolsForModel } from "@/common/utils/tools/tools";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { getMuxEnv, getRuntimeType } from "@/node/runtime/initHook";
+import { MUX_CHAT_AGENT_ID, MUX_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -1318,9 +1319,11 @@ export class AIService extends EventEmitter {
       // - Child workspaces (tasks) use their persisted agentId/agentType.
       // - Main workspaces use the requested agentId (frontend), falling back to exec.
       const requestedAgentIdRaw =
-        (metadata.parentWorkspaceId ? (metadata.agentId ?? metadata.agentType) : undefined) ??
-        (typeof agentId === "string" ? agentId : undefined) ??
-        "exec";
+        workspaceId === MUX_CHAT_WORKSPACE_ID
+          ? MUX_CHAT_AGENT_ID
+          : ((metadata.parentWorkspaceId ? (metadata.agentId ?? metadata.agentType) : undefined) ??
+            (typeof agentId === "string" ? agentId : undefined) ??
+            "exec");
       const requestedAgentIdNormalized = requestedAgentIdRaw.trim().toLowerCase();
       const parsedAgentId = AgentIdSchema.safeParse(requestedAgentIdNormalized);
       const effectiveAgentId = parsedAgentId.success ? parsedAgentId.data : ("exec" as const);
@@ -1373,9 +1376,32 @@ export class AIService extends EventEmitter {
         isSubagent: isSubagentWorkspace,
         disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
       });
+
+      // The Chat with Mux system workspace must remain sandboxed regardless of caller-supplied
+      // toolPolicy (defense-in-depth).
+      const systemWorkspaceToolPolicy: ToolPolicy | undefined =
+        workspaceId === MUX_CHAT_WORKSPACE_ID
+          ? [
+              { regex_match: ".*", action: "disable" },
+
+              // Allow docs lookup via built-in skills (e.g. mux-docs), while keeping
+              // filesystem/binary execution locked down.
+              { regex_match: "agent_skill_read", action: "enable" },
+              { regex_match: "agent_skill_read_file", action: "enable" },
+
+              { regex_match: "mux_global_agents_read", action: "enable" },
+              { regex_match: "mux_global_agents_write", action: "enable" },
+              { regex_match: "ask_user_question", action: "enable" },
+              { regex_match: "todo_read", action: "enable" },
+              { regex_match: "todo_write", action: "enable" },
+              { regex_match: "status_set", action: "enable" },
+              { regex_match: "notify", action: "enable" },
+            ]
+          : undefined;
+
       const effectiveToolPolicy: ToolPolicy | undefined =
-        toolPolicy || agentToolPolicy.length > 0
-          ? [...agentToolPolicy, ...(toolPolicy ?? [])]
+        toolPolicy || agentToolPolicy.length > 0 || systemWorkspaceToolPolicy
+          ? [...agentToolPolicy, ...(toolPolicy ?? []), ...(systemWorkspaceToolPolicy ?? [])]
           : undefined;
 
       // Compute tool names for agent transition sentinel.
@@ -1413,9 +1439,10 @@ export class AIService extends EventEmitter {
 
       // Fetch MCP server config for system prompt (before building message)
       // Pass overrides to filter out disabled servers
-      const mcpServers = this.mcpServerManager
-        ? await this.mcpServerManager.listServers(metadata.projectPath, mcpOverrides)
-        : undefined;
+      const mcpServers =
+        this.mcpServerManager && workspaceId !== MUX_CHAT_WORKSPACE_ID
+          ? await this.mcpServerManager.listServers(metadata.projectPath, mcpOverrides)
+          : undefined;
 
       // Construct plan mode instruction if in plan mode
       // This is done backend-side because we have access to the plan file path
@@ -1627,8 +1654,11 @@ export class AIService extends EventEmitter {
       const tokenizer = await getTokenizerForModel(modelString);
       const systemMessageTokens = await tokenizer.countTokens(systemMessage);
 
-      // Load project secrets
-      const projectSecrets = this.config.getProjectSecrets(metadata.projectPath);
+      // Load project secrets (system workspace never gets secrets injected)
+      const projectSecrets =
+        workspaceId === MUX_CHAT_WORKSPACE_ID
+          ? []
+          : this.config.getProjectSecrets(metadata.projectPath);
 
       // Generate stream token and create temp directory for tools
       const streamToken = this.streamManager.generateStreamToken();
@@ -1637,7 +1667,7 @@ export class AIService extends EventEmitter {
       let mcpStats: MCPWorkspaceStats | undefined;
       let mcpSetupDurationMs = 0;
 
-      if (this.mcpServerManager) {
+      if (this.mcpServerManager && workspaceId !== MUX_CHAT_WORKSPACE_ID) {
         const start = Date.now();
         try {
           const result = await this.mcpServerManager.getToolsForWorkspace({

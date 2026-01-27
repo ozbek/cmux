@@ -33,6 +33,20 @@ function createSessionUsage(cost: number): MockSessionUsage {
   };
 }
 
+async function openFirstProjectCreationView(storyRoot: HTMLElement): Promise<void> {
+  // App now boots into the built-in mux-chat workspace.
+  // Navigate to the first project's creation page so creation/banner UI is visible.
+  const projectRow = await waitFor(
+    () => {
+      const el = storyRoot.querySelector("[data-project-path][aria-controls]");
+      if (!el) throw new Error("Project row not found");
+      return el;
+    },
+    { timeout: 10_000 }
+  );
+
+  await userEvent.click(projectRow);
+}
 export default {
   ...appMeta,
   title: "App/Welcome",
@@ -134,6 +148,7 @@ export const NonGitRepository: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for the banner to appear and scroll into view
@@ -173,6 +188,7 @@ export const NonGitRepositorySuccess: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for the banner to appear
@@ -225,6 +241,7 @@ export const NonGitRepositoryInProgress: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for the banner to appear
@@ -280,6 +297,7 @@ export const NonGitRepositoryError: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for the banner to appear
@@ -329,6 +347,7 @@ export const DockerUnavailable: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for workspace type buttons to appear
@@ -462,6 +481,7 @@ export const NoProvidersConfigured: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for the configure prompt to appear
@@ -489,6 +509,7 @@ export const SingleProviderConfigured: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for the provider bar to appear (it contains "Providers" settings link)
@@ -526,6 +547,7 @@ export const MultipleProvidersConfigured: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
     // Wait for the provider bar to appear
