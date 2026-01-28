@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type {
   RuntimeConfig,
@@ -27,9 +27,11 @@ import {
 } from "@/common/constants/storage";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useRouter } from "@/browser/contexts/RouterContext";
 import type { Toast } from "@/browser/components/ChatInputToast";
 import { useAPI } from "@/browser/contexts/API";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { WorkspaceCreatedOptions } from "@/browser/components/ChatInput/types";
 import {
   useWorkspaceName,
   type WorkspaceNameState,
@@ -45,7 +47,10 @@ export type CreationSendResult = { success: true } | { success: false; error?: S
 
 interface UseCreationWorkspaceOptions {
   projectPath: string;
-  onWorkspaceCreated: (metadata: FrontendWorkspaceMetadata) => void;
+  onWorkspaceCreated: (
+    metadata: FrontendWorkspaceMetadata,
+    options?: WorkspaceCreatedOptions
+  ) => void;
   /** Current message input for name generation */
   message: string;
   /** Section ID to assign the new workspace to */
@@ -187,6 +192,19 @@ export function useCreationWorkspace({
   const workspaceContext = useOptionalWorkspaceContext();
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
   const deleteWorkspaceDraft = workspaceContext?.deleteWorkspaceDraft;
+  const { currentWorkspaceId, currentProjectId, pendingDraftId } = useRouter();
+  const isMountedRef = useRef(true);
+  const latestRouteRef = useRef({ currentWorkspaceId, currentProjectId, pendingDraftId });
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
+  latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
   const { api } = useAPI();
   const [branches, setBranches] = useState<string[]>([]);
   const [branchesLoaded, setBranchesLoaded] = useState(false);
@@ -456,18 +474,31 @@ export function useCreationWorkspace({
         // Sync preferences before switching (keeps workspace settings consistent).
         syncCreationPreferences(projectPath, metadata.id);
 
-        // Switch to the workspace IMMEDIATELY after creation to exit splash faster.
-        // The user sees the workspace UI while sendMessage kicks off the stream.
-        onWorkspaceCreated(metadata);
+        // Switch to the workspace immediately after creation unless the user navigated away
+        // from the draft that initiated the creation (avoid yanking focus to the new workspace).
+        const shouldAutoNavigate =
+          !isDraftScope ||
+          (() => {
+            if (!isMountedRef.current) return false;
+            const latestRoute = latestRouteRef.current;
+            if (latestRoute.currentWorkspaceId) return false;
+            return latestRoute.pendingDraftId === draftId;
+          })();
+
+        onWorkspaceCreated(metadata, { autoNavigate: shouldAutoNavigate });
 
         if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
           promoteWorkspaceDraft(projectPath, draftId, metadata);
         }
 
+        // Persistently clear the draft as soon as the workspace exists so a refresh
+        // during the initial send can't resurrect the draft entry in the sidebar.
+        clearPendingDraft();
+
         setIsSending(false);
 
-        // Wait for the initial send result so we can surface errors and clean up draft state.
+        // Wait for the initial send result so we can surface errors.
         const additionalSystemInstructions = [
           sendMessageOptions.additionalSystemInstructions,
           optionsOverride?.additionalSystemInstructions,
@@ -493,11 +524,9 @@ export function useCreationWorkspace({
             // Persist the failure so the workspace view can surface a toast after navigation.
             updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), sendResult.error);
           }
-          clearPendingDraft();
           return { success: false, error: sendResult.error };
         }
 
-        clearPendingDraft();
         return { success: true };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
