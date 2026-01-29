@@ -3,13 +3,46 @@ import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import { useGateway, formatAsGatewayModel } from "./useGatewayModels";
+import { getKnownModel } from "@/common/constants/knownModels";
+
+/** Small/fast models preferred for name generation */
+const PREFERRED_MODELS = [getKnownModel("HAIKU").id, getKnownModel("GPT_MINI").id];
+
+/**
+ * Build ordered candidate list respecting gateway prefs.
+ * Takes primitive/stable values to avoid re-computation on every render.
+ */
+function buildCandidates(
+  isGatewayActive: boolean,
+  modelUsesGateway: (modelId: string) => boolean,
+  userModel: string | undefined
+): string[] {
+  const candidates: string[] = [];
+
+  // 1. Preferred models with gateway prefs applied
+  for (const modelId of PREFERRED_MODELS) {
+    const transformed =
+      isGatewayActive && modelUsesGateway(modelId) ? formatAsGatewayModel(modelId) : modelId;
+    if (!candidates.includes(transformed)) {
+      candidates.push(transformed);
+    }
+  }
+
+  // 2. User's selected model (already gateway-transformed by caller)
+  if (userModel && !candidates.includes(userModel)) {
+    candidates.push(userModel);
+  }
+
+  return candidates;
+}
 
 export interface UseWorkspaceNameOptions {
   /** The user's message to generate a name for */
   message: string;
   /** Debounce delay in milliseconds (default: 500) */
   debounceMs?: number;
-  /** User's selected model to try after preferred models (for Ollama/Bedrock/custom providers) */
+  /** User's selected model to try after preferred models */
   userModel?: string;
   /**
    * Optional storage scope for persisting draft name-generation state.
@@ -106,6 +139,13 @@ export function getDisplayTitleFromPersistedState(state: unknown): string {
 export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspaceNameReturn {
   const { message, debounceMs = 500, userModel, scopeId } = options;
   const { api } = useAPI();
+  const { isActive: isGatewayActive, modelUsesGateway } = useGateway();
+  // Memoize candidates with stable dependencies (isGatewayActive is primitive,
+  // modelUsesGateway is a useCallback that only changes when enabledModels changes)
+  const candidates = useMemo(
+    () => buildCandidates(isGatewayActive, modelUsesGateway, userModel),
+    [isGatewayActive, modelUsesGateway, userModel]
+  );
 
   // Always call usePersistedState, but only *use* it when scopeId is provided.
   // This prevents draft switching from leaking name state across different creation drafts.
@@ -191,14 +231,11 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       generationPromiseRef.current = { promise, resolve: safeResolve, requestId };
 
       try {
-        // Backend handles model selection with intelligent fallback:
-        // 1. Tries preferred small/fast models (Haiku, GPT-Mini)
-        // 2. Tries gateway/OpenRouter variants
-        // 3. Tries user's selected model (for Ollama/Bedrock/custom)
-        // 4. Falls back to any available configured model
+        // Frontend builds candidate list with gateway prefs applied.
+        // Backend tries candidates in order with retry on API errors.
         const result = await api.nameGeneration.generate({
           message: forMessage,
-          userModel,
+          candidates,
         });
 
         // Check if this request is still current (wasn't cancelled)
@@ -245,7 +282,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         }
       }
     },
-    [api, setStored, userModel]
+    [api, setStored, candidates]
   );
 
   // Debounced generation effect
