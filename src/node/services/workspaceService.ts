@@ -1584,11 +1584,8 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
-      // Block fork for remote runtimes - creates broken workspaces
-      // Sub-agent task spawning uses a different code path (TaskService.create)
-      if (isSSHRuntime(sourceRuntimeConfig)) {
-        return Err("Forking SSH workspaces is not supported. Create a new workspace instead.");
-      }
+      // Block fork for Docker runtimes - creates broken workspaces.
+      // Sub-agent task spawning uses a different code path (TaskService.create).
       if (isDockerRuntime(sourceRuntimeConfig)) {
         return Err("Forking Docker workspaces is not supported. Create a new workspace instead.");
       }
@@ -1699,6 +1696,17 @@ export class WorkspaceService extends EventEmitter {
         sourceRuntimeConfig,
         forkResult
       );
+
+      if (forkResult.sourceRuntimeConfig) {
+        const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
+        const updatedMetadata = allMetadataUpdated.find((m) => m.id === sourceWorkspaceId) ?? null;
+        const sourceSession = this.sessions.get(sourceWorkspaceId);
+        if (sourceSession) {
+          sourceSession.emitMetadata(updatedMetadata);
+        } else {
+          this.emit("metadata", { workspaceId: sourceWorkspaceId, metadata: updatedMetadata });
+        }
+      }
 
       // Compute namedWorkspacePath for frontend metadata
       const namedWorkspacePath = runtime.getWorkspacePath(foundProjectPath, newName);
