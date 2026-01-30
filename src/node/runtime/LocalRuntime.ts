@@ -1,4 +1,6 @@
 import type {
+  EnsureReadyOptions,
+  EnsureReadyResult,
   WorkspaceCreationParams,
   WorkspaceCreationResult,
   WorkspaceInitParams,
@@ -36,6 +38,20 @@ export class LocalRuntime extends LocalBaseRuntime {
    */
   getWorkspacePath(_projectPath: string, _workspaceName: string): string {
     return this.projectPath;
+  }
+
+  override ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
+    const statusSink = options?.statusSink;
+    statusSink?.({
+      phase: "checking",
+      runtimeType: "local",
+      detail: "Checking repository...",
+    });
+
+    // Non-git projects are explicitly supported for LocalRuntime; avoid blocking readiness
+    // on missing .git so local-only workflows continue to work.
+    statusSink?.({ phase: "ready", runtimeType: "local" });
+    return Promise.resolve({ ready: true });
   }
 
   /**
