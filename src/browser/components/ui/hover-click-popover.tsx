@@ -86,12 +86,15 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
     setIsPinned((prev) => !prev);
   };
 
-  const handleTriggerPointerEnter = () => {
+  const handleTriggerPointerEnter = (event: React.PointerEvent<HTMLButtonElement>) => {
+    // Avoid disabling hover for mouse on hybrid devices: only ignore *touch* pointers.
+    if (event.pointerType === "touch") return;
     cancelPendingClose();
     setIsHovering(true);
   };
 
   const handleTriggerPointerLeave = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (event.pointerType === "touch") return;
     const relatedTarget = event.relatedTarget;
     if (relatedTarget instanceof Node && contentRef.current?.contains(relatedTarget)) {
       return;
@@ -99,12 +102,14 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
     scheduleClose();
   };
 
-  const handleContentPointerEnter = () => {
+  const handleContentPointerEnter = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "touch") return;
     cancelPendingClose();
     setIsHovering(true);
   };
 
   const handleContentPointerLeave = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "touch") return;
     const relatedTarget = event.relatedTarget;
     if (relatedTarget instanceof Node && triggerRef.current?.contains(relatedTarget)) {
       return;
