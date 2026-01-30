@@ -50,6 +50,10 @@ import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation, getFirstProjectPath } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
+import {
+  clearPendingWorkspaceAiSettings,
+  markPendingWorkspaceAiSettings,
+} from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal";
 import { Button } from "./components/ui/button";
 import { ProjectPage } from "@/browser/components/ProjectPage";
@@ -356,13 +360,24 @@ function AppInner() {
 
       // Persist to backend so the palette change follows the workspace across devices.
       if (api) {
+        markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
+          model,
+          thinkingLevel: normalized,
+        });
+
         api.workspace
           .updateAgentAISettings({
             workspaceId,
             agentId: normalizedAgentId,
             aiSettings: { model, thinkingLevel: normalized },
           })
+          .then((result) => {
+            if (!result.success) {
+              clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
+            }
+          })
           .catch(() => {
+            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
             // Best-effort only.
           });
       }

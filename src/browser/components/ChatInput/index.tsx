@@ -33,6 +33,10 @@ import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { migrateGatewayModel } from "@/browser/hooks/useGatewayModels";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import {
+  clearPendingWorkspaceAiSettings,
+  markPendingWorkspaceAiSettings,
+} from "@/browser/utils/workspaceAiSettingsSync";
+import {
   getModelKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -485,13 +489,24 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         return;
       }
 
+      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
+        model: canonicalModel,
+        thinkingLevel,
+      });
+
       api.workspace
         .updateAgentAISettings({
           workspaceId,
           agentId: normalizedAgentId,
           aiSettings: { model: canonicalModel, thinkingLevel },
         })
+        .then((result) => {
+          if (!result.success) {
+            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
+          }
+        })
         .catch(() => {
+          clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
           // Best-effort only. If offline or backend is old, sendMessage will persist.
         });
     },
