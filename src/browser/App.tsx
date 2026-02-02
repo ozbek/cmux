@@ -15,6 +15,7 @@ import {
   updatePersistedState,
   readPersistedState,
 } from "./hooks/usePersistedState";
+import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
@@ -42,6 +43,8 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   EXPANDED_PROJECTS_KEY,
+  LEFT_SIDEBAR_COLLAPSED_KEY,
+  LEFT_SIDEBAR_WIDTH_KEY,
 } from "@/common/constants/storage";
 import { migrateGatewayModel } from "@/browser/hooks/useGatewayModels";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
@@ -112,10 +115,41 @@ function AppInner() {
 
   // Auto-collapse sidebar on mobile by default
   const isMobile = typeof window !== "undefined" && window.innerWidth <= 768;
-  const [sidebarCollapsed, setSidebarCollapsed] = usePersistedState("sidebarCollapsed", isMobile, {
-    listener: true,
-  });
+  const [sidebarCollapsed, setSidebarCollapsed] = usePersistedState(
+    LEFT_SIDEBAR_COLLAPSED_KEY,
+    isMobile,
+    {
+      listener: true,
+    }
+  );
 
+  // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
+  // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
+  const leftSidebar = useResizableSidebar({
+    enabled: true,
+    defaultWidth: 288,
+    minWidth: 200,
+    maxWidth: 600,
+    // Keep enough room for the main content so you can't drag-resize the left sidebar
+    // to a point where the chat pane becomes unusably narrow.
+    getMaxWidthPx: () => {
+      // Match LeftSidebar's mobile overlay gate. In that mode we don't want viewport-based clamping
+      // because the sidebar width is controlled by CSS and shouldn't rewrite the user's desktop
+      // width preference.
+      const isMobileTouch =
+        typeof window !== "undefined" &&
+        window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+      if (isMobileTouch) {
+        return Number.POSITIVE_INFINITY;
+      }
+
+      const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 1200;
+      // ChatPane uses tailwind `min-w-96`.
+      return viewportWidth - 384;
+    },
+    storageKey: LEFT_SIDEBAR_WIDTH_KEY,
+    side: "left",
+  });
   // Sync sidebar collapse state to root element for CSS-based titlebar insets
   useEffect(() => {
     document.documentElement.dataset.leftSidebarCollapsed = String(sidebarCollapsed);
@@ -801,6 +835,9 @@ function AppInner() {
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
+          widthPx={leftSidebar.width}
+          isResizing={leftSidebar.isResizing}
+          onStartResize={leftSidebar.startResize}
           sortedWorkspacesByProject={sortedWorkspacesByProject}
           workspaceRecency={workspaceRecency}
         />
