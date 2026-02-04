@@ -3,6 +3,7 @@ import { EventEmitter } from "events";
 import * as path from "path";
 import { createHash } from "crypto";
 import { readFile } from "fs/promises";
+import YAML from "yaml";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
@@ -1808,13 +1809,20 @@ export class AgentSession {
     const resolved = await readAgentSkill(runtime, skillDiscoveryPath, parsedName.data);
     const skill = resolved.package;
 
+    const frontmatterYaml = YAML.stringify(skill.frontmatter).trimEnd();
+
     const body =
       skill.body.length > MAX_AGENT_SKILL_SNAPSHOT_CHARS
         ? `${skill.body.slice(0, MAX_AGENT_SKILL_SNAPSHOT_CHARS)}\n\n[Skill body truncated to ${MAX_AGENT_SKILL_SNAPSHOT_CHARS} characters]`
         : skill.body;
 
     const snapshotText = `<agent-skill name="${skill.frontmatter.name}" scope="${skill.scope}">\n${body}\n</agent-skill>`;
-    const sha256 = createHash("sha256").update(snapshotText).digest("hex");
+
+    // Include the parsed YAML frontmatter in the hash so frontmatter-only edits (e.g. description)
+    // generate a new snapshot and keep the UI hover preview in sync.
+    const sha256 = createHash("sha256")
+      .update(JSON.stringify({ snapshotText, frontmatterYaml }))
+      .digest("hex");
 
     // Dedupe: if we recently persisted the same snapshot, avoid inserting again.
     const historyResult = await this.historyService.getHistory(this.workspaceId);
@@ -1842,6 +1850,7 @@ export class AgentSession {
         skillName: skill.frontmatter.name,
         scope: skill.scope,
         sha256,
+        frontmatterYaml,
       },
     });
 
