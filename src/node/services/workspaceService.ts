@@ -801,6 +801,9 @@ export class WorkspaceService extends EventEmitter {
       logComplete: (exitCode: number) => {
         void this.initStateManager.endInit(workspaceId, exitCode);
       },
+      enterHookPhase: () => {
+        this.initStateManager.enterHookPhase(workspaceId);
+      },
     };
   }
 
@@ -1458,6 +1461,11 @@ export class WorkspaceService extends EventEmitter {
       } else {
         log.error(`Could not find metadata for workspace ${workspaceId}, creating phantom cleanup`);
       }
+
+      // Avoid leaking init waiters/logs after workspace deletion.
+      // This must happen before deleting the session directory so queued init-status writes
+      // don't recreate ~/.mux/sessions/<workspaceId>/ after removal.
+      this.initStateManager.clearInMemoryState(workspaceId);
 
       // Remove session data
       try {
