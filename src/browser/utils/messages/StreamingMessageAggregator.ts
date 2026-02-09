@@ -1954,6 +1954,16 @@ export class StreamingMessageAggregator {
         }
       }
 
+      // When a compaction boundary arrives during a live session, prune messages
+      // older than the penultimate boundary so the UI matches what a fresh load
+      // would show (emitHistoricalEvents reads from skip=1, the penultimate boundary).
+      // The user sees the previous epoch + current epoch; older epochs are pruned.
+      // Without this, all pre-boundary messages persist until the next page refresh.
+      // TODO: support paginated history loading so users can view older epochs on demand.
+      if (this.isCompactionBoundarySummaryMessage(incomingMessage)) {
+        this.pruneBeforePenultimateBoundary(incomingMessage);
+      }
+
       // Now add the new message
       this.addMessage(incomingMessage);
 
@@ -2000,6 +2010,51 @@ export class StreamingMessageAggregator {
       message.role === "assistant" &&
       (message.metadata?.compactionBoundary === true || muxMeta?.type === "compaction-summary")
     );
+  }
+
+  /**
+   * Keep the previous epoch visible: when the new (Nth) boundary arrives,
+   * find the penultimate (N-1) boundary among existing messages and prune
+   * everything before it. This matches the backend's getHistoryFromLatestBoundary
+   * which reads from the n-1 boundary.
+   *
+   * If only one boundary exists (the incoming one), nothing is pruned — the
+   * user sees their full first-epoch history.
+   */
+  private pruneBeforePenultimateBoundary(_incomingBoundary: MuxMessage): void {
+    // Find the penultimate boundary among the *existing* messages (before adding
+    // the incoming one). With the incoming boundary about to become the latest,
+    // the existing latest boundary becomes the penultimate one.
+    let penultimateBoundarySeq: number | undefined;
+    for (const [, msg] of this.messages.entries()) {
+      if (!this.isCompactionBoundarySummaryMessage(msg)) continue;
+      const seq = msg.metadata?.historySequence;
+      if (seq === undefined) continue;
+      // The highest-sequence boundary in existing messages is the one that
+      // will become the penultimate once the incoming boundary is added.
+      if (penultimateBoundarySeq === undefined || seq > penultimateBoundarySeq) {
+        penultimateBoundarySeq = seq;
+      }
+    }
+
+    // No existing boundary → this is the first compaction, nothing to prune
+    if (penultimateBoundarySeq === undefined) return;
+
+    const toRemove: string[] = [];
+    for (const [id, msg] of this.messages.entries()) {
+      const seq = msg.metadata?.historySequence;
+      if (seq !== undefined && seq < penultimateBoundarySeq) {
+        toRemove.push(id);
+      }
+    }
+
+    for (const id of toRemove) {
+      this.deleteMessage(id);
+    }
+
+    if (toRemove.length > 0) {
+      this.invalidateCache();
+    }
   }
 
   private createCompactionBoundaryRow(

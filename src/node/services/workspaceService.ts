@@ -1217,8 +1217,10 @@ export class WorkspaceService extends EventEmitter {
       };
     }
 
-    // Fallback: compute tracked files from message history (survives reloads)
-    const historyResult = await this.historyService.getHistory(workspaceId);
+    // Fallback: compute tracked files from message history (survives reloads).
+    // Only the current compaction epoch matters — post-compaction files are from
+    // the active epoch only.
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     const messages = historyResult.success ? historyResult.data : [];
     const allPaths = extractEditedFilePaths(messages);
 
@@ -3138,8 +3140,9 @@ export class WorkspaceService extends EventEmitter {
           }
         }
 
-        // 2) Fall back to chat history (partial may have already been committed)
-        const historyResult = await this.historyService.getHistory(workspaceId);
+        // 2) Fall back to chat history (partial may have already been committed).
+        // Only the current compaction epoch matters — pending tool calls don't survive compaction.
+        const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
         if (!historyResult.success) {
           return Err(historyResult.error);
         }
@@ -3360,7 +3363,10 @@ export class WorkspaceService extends EventEmitter {
           "append-compaction-boundary replace mode requires an assistant summary message"
         );
 
-        const historyResult = await this.historyService.getHistory(workspaceId);
+        // Only need the current epoch's messages — the latest boundary marker holds
+        // the max compaction epoch, and epochs are monotonically increasing with
+        // append-only compaction. Falls back to full history for uncompacted workspaces.
+        const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
         if (!historyResult.success) {
           return Err(
             `Failed to read history for append-compaction-boundary mode: ${historyResult.error}`
@@ -3471,7 +3477,10 @@ export class WorkspaceService extends EventEmitter {
   }
   async getChatHistory(workspaceId: string): Promise<MuxMessage[]> {
     try {
-      const history = await this.historyService.getHistory(workspaceId);
+      // Only return messages from the latest compaction boundary onward.
+      // Pre-boundary messages are summarized in the boundary marker.
+      // TODO: allow users to opt in to viewing full pre-boundary history.
+      const history = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       return history.success ? history.data : [];
     } catch (error) {
       log.error("Failed to get chat history:", error);

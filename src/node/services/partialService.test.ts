@@ -20,7 +20,7 @@ const createMockConfig = (): Config => {
 const createMockHistoryService = (): HistoryService => {
   return {
     appendToHistory: mock(() => Promise.resolve(Ok(undefined))),
-    getHistory: mock(() => Promise.resolve(Ok([]))),
+    getHistoryFromLatestBoundary: mock(() => Promise.resolve(Ok([]))),
     updateHistory: mock(() => Promise.resolve(Ok(undefined))),
     truncateAfterMessage: mock(() => Promise.resolve(Ok(undefined))),
     clearHistory: mock(() => Promise.resolve(Ok(undefined))),
@@ -63,8 +63,8 @@ describe("PartialService - Error Recovery", () => {
     // Mock deletePartial
     partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
 
-    // Mock getHistory to return no existing messages
-    mockHistoryService.getHistory = mock(() => Promise.resolve(Ok([])));
+    // Mock getHistoryFromLatestBoundary to return no existing messages
+    mockHistoryService.getHistoryFromLatestBoundary = mock(() => Promise.resolve(Ok([])));
 
     // Call commitToHistory
     const result = await partialService.commitToHistory(workspaceId);
@@ -131,8 +131,10 @@ describe("PartialService - Error Recovery", () => {
     // Mock deletePartial
     partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
 
-    // Mock getHistory to return existing placeholder
-    mockHistoryService.getHistory = mock(() => Promise.resolve(Ok([existingPlaceholder])));
+    // Mock getHistoryFromLatestBoundary to return existing placeholder
+    mockHistoryService.getHistoryFromLatestBoundary = mock(() =>
+      Promise.resolve(Ok([existingPlaceholder]))
+    );
 
     // Call commitToHistory
     const result = await partialService.commitToHistory(workspaceId);
@@ -183,7 +185,7 @@ describe("PartialService - Error Recovery", () => {
 
     partialService.readPartial = mock(() => Promise.resolve(toolOnlyPartial));
     partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
-    mockHistoryService.getHistory = mock(() => Promise.resolve(Ok([])));
+    mockHistoryService.getHistoryFromLatestBoundary = mock(() => Promise.resolve(Ok([])));
 
     const result = await partialService.commitToHistory(workspaceId);
     expect(result.success).toBe(true);
@@ -218,8 +220,8 @@ describe("PartialService - Error Recovery", () => {
     // Mock deletePartial
     partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
 
-    // Mock getHistory to return no existing messages
-    mockHistoryService.getHistory = mock(() => Promise.resolve(Ok([])));
+    // Mock getHistoryFromLatestBoundary to return no existing messages
+    mockHistoryService.getHistoryFromLatestBoundary = mock(() => Promise.resolve(Ok([])));
 
     // Call commitToHistory
     const result = await partialService.commitToHistory(workspaceId);
