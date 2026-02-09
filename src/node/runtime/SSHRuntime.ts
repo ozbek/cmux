@@ -39,9 +39,16 @@ import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { getProjectName, execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
 import { type SSHRuntimeConfig } from "./sshConnectionPool";
-import { execAsync } from "@/node/utils/disposableExec";
+import { getOriginUrlForBundle } from "./gitBundleSync";
 import type { PtyHandle, PtySessionParams, SSHTransport } from "./transports";
 import { streamToString, shescape } from "./streamUtils";
+
+/** Name of the shared bare repo directory under each project on the remote. */
+const BASE_REPO_DIR = ".mux-base.git";
+
+/** Staging namespace for bundle-imported branch refs. Branches land here instead
+ *  of refs/heads/* so they don't collide with branches checked out in worktrees. */
+const BUNDLE_REF_PREFIX = "refs/mux-bundle/";
 
 function logSSHBackoffWait(initLogger: InitLogger, waitMs: number): void {
   const secs = Math.max(1, Math.ceil(waitMs / 1000));
@@ -135,6 +142,18 @@ function truncateSSHError(stderr: string): string {
 
 // Re-export SSHRuntimeConfig from connection pool (defined there to avoid circular deps)
 export type { SSHRuntimeConfig } from "./sshConnectionPool";
+
+/**
+ * Compute the path to the shared bare base repo for a project on the remote.
+ * Convention: <srcBaseDir>/<projectName>/.mux-base.git
+ *
+ * Exported for unit testing; runtime code should use the private
+ * `SSHRuntime.getBaseRepoPath()` method instead.
+ */
+export function computeBaseRepoPath(srcBaseDir: string, projectPath: string): string {
+  const projectName = getProjectName(projectPath);
+  return path.posix.join(srcBaseDir, projectName, BASE_REPO_DIR);
+}
 
 /**
  * SSH runtime implementation that executes commands and file operations
@@ -309,11 +328,9 @@ export class SSHRuntime extends RemoteRuntime {
   /**
    * Path to the shared bare repo for a project on the remote.
    * All worktree-based workspaces share this object store.
-   * Convention: ~/<srcBaseDir>/<projectName>/.mux-base.git
    */
-  getBaseRepoPath(projectPath: string): string {
-    const projectName = getProjectName(projectPath);
-    return path.posix.join(this.config.srcBaseDir, projectName, ".mux-base.git");
+  private getBaseRepoPath(projectPath: string): string {
+    return computeBaseRepoPath(this.config.srcBaseDir, projectPath);
   }
 
   /**
@@ -385,7 +402,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<string | null> {
     // Preferred: exact match for the expected trunk branch.
-    const preferredRef = `refs/mux-bundle/${trunkBranch}`;
+    const preferredRef = `${BUNDLE_REF_PREFIX}${trunkBranch}`;
     const check = await execBuffered(
       this,
       `git -C ${baseRepoPathArg} rev-parse --verify ${shescape.quote(preferredRef)}`,
@@ -398,7 +415,7 @@ export class SSHRuntime extends RemoteRuntime {
     // Fallback: pick the first ref under refs/mux-bundle/ (handles main↔master mismatch).
     const listResult = await execBuffered(
       this,
-      `git -C ${baseRepoPathArg} for-each-ref --format='%(refname)' refs/mux-bundle/ --count=1`,
+      `git -C ${baseRepoPathArg} for-each-ref --format='%(refname)' ${BUNDLE_REF_PREFIX} --count=1`,
       { cwd: "/tmp", timeout: 10, abortSignal }
     );
     const fallbackRef = listResult.stdout.trim();
@@ -673,7 +690,7 @@ export class SSHRuntime extends RemoteRuntime {
       initLogger.logStep("Importing bundle into shared base repository...");
       const fetchResult = await execBuffered(
         this,
-        `git -C ${baseRepoPathArg} fetch ${remoteBundlePathArg} '+refs/heads/*:refs/mux-bundle/*' '+refs/tags/*:refs/tags/*'`,
+        `git -C ${baseRepoPathArg} fetch ${remoteBundlePathArg} '+refs/heads/*:${BUNDLE_REF_PREFIX}*' '+refs/tags/*:refs/tags/*'`,
         { cwd: "/tmp", timeout: 300, abortSignal }
       );
       if (fetchResult.exitCode !== 0) {
@@ -713,19 +730,7 @@ export class SSHRuntime extends RemoteRuntime {
     projectPath: string,
     initLogger: InitLogger
   ): Promise<{ originUrl: string | null }> {
-    try {
-      using proc = execAsync(`git -C "${projectPath}" remote get-url origin`);
-      const { stdout } = await proc.result;
-      const url = stdout.trim();
-      if (url && !url.includes(".bundle") && !url.includes(".mux-bundle")) {
-        return { originUrl: url };
-      }
-      return { originUrl: null };
-    } catch (error) {
-      log.debug("Could not get origin URL", { error: getErrorMessage(error) });
-      initLogger.logStderr(`Note: Could not detect origin URL`);
-      return { originUrl: null };
-    }
+    return getOriginUrlForBundle(projectPath, initLogger, /* logErrors */ false);
   }
 
   async createWorkspace(params: WorkspaceCreationParams): Promise<WorkspaceCreationResult> {
@@ -1280,7 +1285,10 @@ export class SSHRuntime extends RemoteRuntime {
 
       const checkStream = await this.exec(checkScript, {
         cwd: this.config.srcBaseDir,
-        timeout: 10,
+        // Non-force path includes `git fetch origin` (network op) that can
+        // easily exceed 10s on slow SSH connections. Force path only checks
+        // existence, so a short timeout is fine.
+        timeout: force ? 10 : 30,
         abortSignal,
       });
 
@@ -1347,7 +1355,10 @@ export class SSHRuntime extends RemoteRuntime {
           const fallbackStream = await this.exec(
             // Use quoteForRemote (expandTildeForSSH) to match the quoting in the
             // worktree remove command above — shescape.quote doesn't expand tilde.
-            `rm -rf ${this.quoteForRemote(deletedPath)} && git -C ${baseRepoPathArg} worktree prune`,
+            // `worktree prune` is best-effort: if the base repo was externally
+            // deleted/corrupted the prune fails, but the workspace IS gone after
+            // rm -rf — don't report failure for a cosmetic prune error.
+            `rm -rf ${this.quoteForRemote(deletedPath)} && (git -C ${baseRepoPathArg} worktree prune 2>/dev/null || true)`,
             { cwd: this.config.srcBaseDir, timeout: 30, abortSignal }
           );
           await fallbackStream.stdin.abort();
@@ -1359,6 +1370,18 @@ export class SSHRuntime extends RemoteRuntime {
               error: `Failed to delete worktree: ${stderr.trim() || fallbackStderr.trim() || "Unknown error"}`,
             };
           }
+        }
+        // Best-effort: delete the orphaned branch ref from the base repo so
+        // that re-forking with the same workspace name can use the fast worktree
+        // path (git worktree add -b fails if the branch already exists).
+        // Skip protected trunk branch names to avoid accidental deletion.
+        const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
+        if (!PROTECTED_BRANCHES.includes(workspaceName)) {
+          await execBuffered(
+            this,
+            `git -C ${baseRepoPathArg} branch -D ${shescape.quote(workspaceName)} 2>/dev/null || true`,
+            { cwd: "/tmp", timeout: 10 }
+          ).catch(() => undefined);
         }
       } else {
         // Legacy full clone: rm -rf to remove the directory on the remote host.
@@ -1387,7 +1410,7 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
-    const { projectPath, sourceWorkspaceName, newWorkspaceName, initLogger } = params;
+    const { projectPath, sourceWorkspaceName, newWorkspaceName, initLogger, abortSignal } = params;
 
     // Compute workspace paths using canonical method
     const sourceWorkspacePath = this.getWorkspacePath(projectPath, sourceWorkspaceName);
@@ -1403,6 +1426,7 @@ export class SSHRuntime extends RemoteRuntime {
         const exists = await execBuffered(this, `test -e ${newWorkspacePathArg}`, {
           cwd: "/tmp",
           timeout: 10,
+          abortSignal,
         });
         if (exists.exitCode === 0) {
           return { success: false, error: `Workspace already exists at ${newWorkspacePath}` };
@@ -1417,6 +1441,7 @@ export class SSHRuntime extends RemoteRuntime {
         {
           cwd: "/tmp",
           timeout: 30,
+          abortSignal,
         }
       );
       const sourceBranch = branchResult.stdout.trim();
@@ -1432,6 +1457,11 @@ export class SSHRuntime extends RemoteRuntime {
       // Falls back to full directory copy when the base repo is missing OR when
       // worktree creation fails (e.g. forking a legacy workspace whose branch
       // only exists locally and not in the base repo).
+      //
+      // Note: worktree-based fork creates a clean checkout from sourceBranch's
+      // committed HEAD. Uncommitted working-tree changes from the source are NOT
+      // carried over (inherent git worktree limitation). The cp -R -P fallback
+      // preserves full working-tree state including uncommitted changes.
       const baseRepoPath = this.getBaseRepoPath(projectPath);
       const baseRepoPathArg = expandTildeForSSH(baseRepoPath);
       let usedWorktree = false;
@@ -1439,21 +1469,35 @@ export class SSHRuntime extends RemoteRuntime {
       const hasBaseRepo = await execBuffered(this, `test -d ${baseRepoPathArg}`, {
         cwd: "/tmp",
         timeout: 10,
+        abortSignal,
       });
 
       if (hasBaseRepo.exitCode === 0) {
         initLogger.logStep("Creating worktree for forked workspace...");
+        // Use -b (not -B) so we fail instead of silently resetting an existing
+        // branch that another worktree might reference. initWorkspace uses -B
+        // because it owns the branch lifecycle; fork is creating a new name.
         const worktreeCmd = `git -C ${baseRepoPathArg} worktree add ${newWorkspacePathArg} -b ${shescape.quote(newWorkspaceName)} ${shescape.quote(sourceBranch)}`;
         const worktreeResult = await execBuffered(this, worktreeCmd, {
           cwd: "/tmp",
           timeout: 60,
+          abortSignal,
         });
 
         if (worktreeResult.exitCode === 0) {
           usedWorktree = true;
         } else {
           // Source branch likely doesn't exist in the base repo (legacy workspace).
-          // Fall through to the cp -R -P path below.
+          // Clean up any partial directory left by the failed `worktree add`
+          // before falling through to cp -R -P (which behaves differently if
+          // the target dir already exists — it copies *into* it, creating a
+          // nested mess instead of a clean clone).
+          await execBuffered(this, `rm -rf ${newWorkspacePathArg}`, {
+            cwd: "/tmp",
+            timeout: 10,
+            // Best-effort cleanup — ignore failures since we're about to fall
+            // through to the cp path which will overwrite the target anyway.
+          }).catch(() => undefined);
           log.info(
             `Worktree fork failed (${(worktreeResult.stderr || worktreeResult.stdout).trim()}); falling back to full copy`
           );
@@ -1468,6 +1512,7 @@ export class SSHRuntime extends RemoteRuntime {
         const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {
           cwd: "/tmp",
           timeout: 10,
+          abortSignal,
         });
         if (mkdirResult.exitCode !== 0) {
           return {
@@ -1482,7 +1527,7 @@ export class SSHRuntime extends RemoteRuntime {
         const copyResult = await execBuffered(
           this,
           `cp -R -P ${sourceWorkspacePathArg} ${newWorkspacePathArg}`,
-          { cwd: "/tmp", timeout: 300 }
+          { cwd: "/tmp", timeout: 300, abortSignal }
         );
         if (copyResult.exitCode !== 0) {
           try {
