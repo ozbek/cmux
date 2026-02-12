@@ -52,6 +52,7 @@ import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { resolveProjectPathFromProjectQuery } from "@/common/utils/deepLink";
 import { shouldApplyWorkspaceAiSettingsFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { migrateGatewayModel } from "@/browser/hooks/useGatewayModels";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -835,6 +836,20 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [navigateToWorkspace, navigateToHome]
   );
 
+  /**
+   * Clear the workspace selection and navigate to a specific project page
+   * instead of home.  Use this when deselecting a workspace where we know
+   * which project the user was working in (archive, delete fallback, etc.).
+   */
+  const clearSelectionToProject = useCallback(
+    (projectPath: string) => {
+      selectedWorkspaceRef.current = null;
+      updatePersistedState(SELECTED_WORKSPACE_KEY, null);
+      navigateToProject(projectPath);
+    },
+    [navigateToProject]
+  );
+
   // Used by async subscription handlers to safely access the most recent metadata map
   // without triggering render-phase state updates.
   const workspaceMetadataRef = useRef(workspaceMetadata);
@@ -993,12 +1008,20 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // If the currently-selected workspace is being archived, navigate away *before*
           // removing it from the active metadata map. Otherwise we can briefly render the
           // welcome screen while still on `/workspace/:id`.
+          //
+          // Prefer the next workspace in sidebar DOM order (like Ctrl+J) so the user
+          // stays in flow; fall back to the project page when no siblings remain.
           if (meta !== null && isNowArchived) {
             const currentSelection = selectedWorkspaceRef.current;
             if (currentSelection?.workspaceId === event.workspaceId) {
-              selectedWorkspaceRef.current = null;
-              updatePersistedState(SELECTED_WORKSPACE_KEY, null);
-              navigateToProject(meta.projectPath);
+              const nextId = findAdjacentWorkspaceId(event.workspaceId);
+              const nextMeta = nextId ? workspaceMetadataRef.current.get(nextId) : null;
+
+              if (nextMeta) {
+                setSelectedWorkspace(toWorkspaceSelection(nextMeta));
+              } else {
+                clearSelectionToProject(meta.projectPath);
+              }
             }
           }
 
@@ -1068,14 +1091,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
               );
 
             if (fallbackMeta) {
-              setSelectedWorkspace({
-                workspaceId: fallbackMeta.id,
-                projectPath: fallbackMeta.projectPath,
-                projectName: fallbackMeta.projectName,
-                namedWorkspacePath: fallbackMeta.namedWorkspacePath,
-              });
+              setSelectedWorkspace(toWorkspaceSelection(fallbackMeta));
             } else if (projectPath) {
-              navigateToProject(projectPath);
+              clearSelectionToProject(projectPath);
             } else {
               setSelectedWorkspace(null);
             }
@@ -1091,7 +1109,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     return () => {
       controller.abort();
     };
-  }, [navigateToProject, refreshProjects, setSelectedWorkspace, setWorkspaceMetadata, api]);
+  }, [clearSelectionToProject, refreshProjects, setSelectedWorkspace, setWorkspaceMetadata, api]);
 
   const createWorkspace = useCallback(
     async (
