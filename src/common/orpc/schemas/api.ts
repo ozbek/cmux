@@ -1615,6 +1615,54 @@ export const general = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
+  getLogPath: {
+    input: z.void(),
+    output: z.object({ path: z.string() }),
+  },
+  clearLogs: {
+    input: z.void(),
+    output: z.object({
+      success: z.boolean(),
+      error: z.string().nullish(),
+    }),
+  },
+  subscribeLogs: {
+    input: z.object({
+      level: z.enum(["error", "warn", "info", "debug"]).nullish(),
+    }),
+    output: eventIterator(
+      z.discriminatedUnion("type", [
+        z.object({
+          type: z.literal("snapshot"),
+          epoch: z.number(),
+          entries: z.array(
+            z.object({
+              timestamp: z.number(),
+              level: z.enum(["error", "warn", "info", "debug"]),
+              message: z.string(),
+              location: z.string(),
+            })
+          ),
+        }),
+        z.object({
+          type: z.literal("append"),
+          epoch: z.number(),
+          entries: z.array(
+            z.object({
+              timestamp: z.number(),
+              level: z.enum(["error", "warn", "info", "debug"]),
+              message: z.string(),
+              location: z.string(),
+            })
+          ),
+        }),
+        z.object({
+          type: z.literal("reset"),
+          epoch: z.number(),
+        }),
+      ])
+    ),
+  },
 };
 
 // Menu events (main→renderer notifications)

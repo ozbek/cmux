@@ -18,6 +18,9 @@ import type {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { createAuthMiddleware } from "./authMiddleware";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import { clearLogFiles, getLogFilePath } from "@/node/services/log";
+import type { LogEntry } from "@/node/services/logBuffer";
+import { clearLogEntries, subscribeLogFeed } from "@/node/services/logBuffer";
 import { createReplayBufferedStreamMessageRelay } from "./replayBufferedStreamMessageRelay";
 
 import { createRuntime, checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
@@ -1270,6 +1273,90 @@ export const router = (authToken?: string) => {
             if (i < input.count) {
               await new Promise((r) => setTimeout(r, input.intervalMs));
             }
+          }
+        }),
+      getLogPath: t
+        .input(schemas.general.getLogPath.input)
+        .output(schemas.general.getLogPath.output)
+        .handler(() => {
+          return { path: getLogFilePath() };
+        }),
+      clearLogs: t
+        .input(schemas.general.clearLogs.input)
+        .output(schemas.general.clearLogs.output)
+        .handler(async () => {
+          try {
+            await clearLogFiles();
+            clearLogEntries();
+            return { success: true };
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return { success: false, error: message };
+          }
+        }),
+      subscribeLogs: t
+        .input(schemas.general.subscribeLogs.input)
+        .output(schemas.general.subscribeLogs.output)
+        .handler(async function* ({ input, signal }) {
+          const LOG_LEVEL_PRIORITY: Record<LogEntry["level"], number> = {
+            error: 0,
+            warn: 1,
+            info: 2,
+            debug: 3,
+          };
+
+          function shouldInclude(
+            entryLevel: LogEntry["level"],
+            minLevel: LogEntry["level"]
+          ): boolean {
+            return (
+              (LOG_LEVEL_PRIORITY[entryLevel] ?? LOG_LEVEL_PRIORITY.debug) <=
+              (LOG_LEVEL_PRIORITY[minLevel] ?? LOG_LEVEL_PRIORITY.info)
+            );
+          }
+
+          const minLevel = input.level ?? "info";
+
+          const queue = createAsyncMessageQueue<
+            | { type: "snapshot"; epoch: number; entries: LogEntry[] }
+            | { type: "append"; epoch: number; entries: LogEntry[] }
+            | { type: "reset"; epoch: number }
+          >();
+
+          // Atomic handshake: register listener + snapshot in one step.
+          // No events can be lost between snapshot and subscription.
+          const { snapshot, unsubscribe } = subscribeLogFeed((event) => {
+            if (signal?.aborted) {
+              return;
+            }
+
+            if (event.type === "append") {
+              if (shouldInclude(event.entry.level, minLevel)) {
+                queue.push({ type: "append", epoch: event.epoch, entries: [event.entry] });
+              }
+              return;
+            }
+
+            queue.push({ type: "reset", epoch: event.epoch });
+          }, minLevel);
+
+          queue.push({
+            type: "snapshot",
+            epoch: snapshot.epoch,
+            entries: snapshot.entries.filter((e) => shouldInclude(e.level, minLevel)),
+          });
+
+          const onAbort = () => {
+            queue.end();
+          };
+          signal?.addEventListener("abort", onAbort);
+
+          try {
+            yield* queue.iterate();
+          } finally {
+            signal?.removeEventListener("abort", onAbort);
+            unsubscribe();
+            queue.end();
           }
         }),
       openInEditor: t

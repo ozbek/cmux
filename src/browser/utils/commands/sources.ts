@@ -6,7 +6,11 @@ import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
 import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
 import assert from "@/common/utils/assert";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
+import {
+  getRightSidebarLayoutKey,
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  RIGHT_SIDEBAR_TAB_KEY,
+} from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { disableAutoRetryPreference } from "@/browser/utils/messages/autoRetryPreference";
 import { CommandIds } from "@/browser/utils/commandIds";
@@ -20,10 +24,12 @@ import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLay
 import {
   addToolToFocusedTabset,
   getDefaultRightSidebarLayoutState,
+  hasTab,
   parseRightSidebarLayoutState,
   selectTabInTabset,
   setFocusedTabset,
   splitFocusedTabset,
+  toggleTab,
 } from "@/browser/utils/rightSidebarLayout";
 
 import type { ProjectConfig } from "@/node/config";
@@ -117,6 +123,15 @@ const getRightSidebarTabFallback = (): TabType => {
   return isTabType(raw) ? raw : "costs";
 };
 
+const readRightSidebarLayout = (workspaceId: string) => {
+  const fallback = getRightSidebarTabFallback();
+  const raw = readPersistedState(
+    getRightSidebarLayoutKey(workspaceId),
+    getDefaultRightSidebarLayoutState(fallback)
+  );
+  return parseRightSidebarLayoutState(raw, fallback);
+};
+
 const updateRightSidebarLayout = (
   workspaceId: string,
   updater: (
@@ -132,6 +147,23 @@ const updateRightSidebarLayout = (
     defaultLayout
   );
 };
+
+function toFileUrl(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, "/");
+
+  // Windows drive letter paths: C:/...
+  if (/^[A-Za-z]:\//.test(normalized)) {
+    return `file:///${encodeURI(normalized)}`;
+  }
+
+  // POSIX absolute paths: /...
+  if (normalized.startsWith("/")) {
+    return `file://${encodeURI(normalized)}`;
+  }
+
+  // Fall back to treating the string as a path-ish URL segment.
+  return `file://${encodeURI(normalized)}`;
+}
 
 const findFirstTerminalSessionTab = (
   node: ReturnType<typeof parseRightSidebarLayoutState>["root"]
@@ -424,6 +456,32 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     if (wsId) {
       list.push(
         {
+          id: CommandIds.navToggleOutput(),
+          title: hasTab(readRightSidebarLayout(wsId), "output") ? "Hide Output" : "Show Output",
+          section: section.navigation,
+          keywords: ["log", "logs", "output"],
+          run: () => {
+            const isOutputVisible = hasTab(readRightSidebarLayout(wsId), "output");
+            updateRightSidebarLayout(wsId, (s) => toggleTab(s, "output"));
+            if (!isOutputVisible) {
+              updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            }
+          },
+        },
+        {
+          id: CommandIds.navOpenLogFile(),
+          title: "Open Log File",
+          section: section.navigation,
+          keywords: ["log", "logs"],
+          run: async () => {
+            const result = await p.api?.general.getLogPath();
+            const logPath = result?.path;
+            if (!logPath) return;
+
+            window.open(toFileUrl(logPath), "_blank", "noopener");
+          },
+        },
+        {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
           section: section.navigation,
@@ -464,9 +522,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 label: "Tool",
                 placeholder: "Select a tool…",
                 getOptions: () =>
-                  (["costs", "review", "terminal"] as TabType[]).map((tab) => ({
+                  (["costs", "review", "output", "terminal"] as TabType[]).map((tab) => ({
                     id: tab,
-                    label: tab === "costs" ? "Costs" : tab === "review" ? "Review" : "Terminal",
+                    label:
+                      tab === "costs"
+                        ? "Costs"
+                        : tab === "review"
+                          ? "Review"
+                          : tab === "output"
+                            ? "Output"
+                            : "Terminal",
                     keywords: [tab],
                   })),
               },
