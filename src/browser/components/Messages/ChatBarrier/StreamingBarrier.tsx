@@ -8,9 +8,15 @@ import {
   PREFERRED_COMPACTION_MODEL_KEY,
 } from "@/common/constants/storage";
 import { readPersistedState, readPersistedString } from "@/browser/hooks/usePersistedState";
-import { useWorkspaceState, useWorkspaceAggregator } from "@/browser/stores/WorkspaceStore";
+import {
+  useWorkspaceState,
+  useWorkspaceAggregator,
+  useWorkspaceStoreRaw,
+} from "@/browser/stores/WorkspaceStore";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { useSettings } from "@/browser/contexts/SettingsContext";
+import { useAPI } from "@/browser/contexts/API";
+import { disableAutoRetryPreference } from "@/browser/utils/messages/autoRetryPreference";
 
 type StreamingPhase =
   | "starting" // Message sent, waiting for stream-start
@@ -22,16 +28,27 @@ type StreamingPhase =
 interface StreamingBarrierProps {
   workspaceId: string;
   className?: string;
+  /**
+   * Optional compaction-specific cancel hook.
+   * When provided, this path should preserve compaction edit state + follow-up content.
+   */
+  onCancelCompaction?: () => void;
 }
 
 /**
  * Self-contained streaming status barrier.
- * Computes all state internally from workspaceId - no props drilling needed.
+ * Computes streaming state internally from workspaceId.
  * Returns null when there's nothing to show.
  */
-export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({ workspaceId, className }) => {
+export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
+  workspaceId,
+  className,
+  onCancelCompaction,
+}) => {
   const workspaceState = useWorkspaceState(workspaceId);
   const aggregator = useWorkspaceAggregator(workspaceId);
+  const storeRaw = useWorkspaceStoreRaw();
+  const { api } = useAPI();
   const { open: openSettings } = useSettings();
 
   const {
@@ -119,6 +136,39 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({ workspaceId,
     }
   })();
 
+  const canTapCancel = phase === "streaming" || phase === "compacting";
+  const handleCancelClick = () => {
+    if (!api) {
+      return;
+    }
+
+    // Keep this strict: ask_user_question and starting states are intentionally not interruptable
+    // from this UI control to match keyboard shortcut semantics.
+    if (phase !== "streaming" && phase !== "compacting") {
+      return;
+    }
+
+    disableAutoRetryPreference(workspaceId);
+
+    if (phase === "compacting") {
+      // Reuse the established compaction-cancel flow from keyboard shortcuts so we keep
+      // edit restoration + follow-up content behavior consistent across input methods.
+      if (onCancelCompaction) {
+        onCancelCompaction();
+        return;
+      }
+
+      void api.workspace.interruptStream({
+        workspaceId,
+        options: { abandonPartial: true },
+      });
+      return;
+    }
+
+    storeRaw.setInterrupting(workspaceId);
+    void api.workspace.interruptStream({ workspaceId });
+  };
+
   // Show settings hint during compaction if no custom compaction model is configured
   const showCompactionHint =
     phase === "compacting" && !readPersistedString(PREFERRED_COMPACTION_MODEL_KEY);
@@ -129,6 +179,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({ workspaceId,
       tokenCount={tokenCount}
       tps={tps}
       cancelText={cancelText}
+      onCancel={canTapCancel ? handleCancelClick : undefined}
       className={className}
       hintElement={
         showCompactionHint ? (
