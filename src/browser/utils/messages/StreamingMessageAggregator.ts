@@ -112,6 +112,7 @@ interface StreamingContext {
   isComplete: boolean;
   isCompacting: boolean;
   hasCompactionContinue: boolean;
+  isReplay: boolean;
   model: string;
   routedThroughGateway?: boolean;
 
@@ -499,6 +500,27 @@ export class StreamingMessageAggregator {
 
     context.lastServerTimestamp = serverTimestamp;
     context.clockOffsetMs = Date.now() - serverTimestamp;
+  }
+
+  /**
+   * Detect the replay→live transition for reconnect streams.
+   *
+   * During reconnect, `replayStream()` emits all catch-up events with `replay: true`.
+   * Once the catch-up phase is over, fresh live deltas arrive without the flag.
+   * This helper flips `isReplay` to false on the first non-replay event so that
+   * `streamPresentation.source` correctly transitions to "live" and smoothing
+   * resumes instead of staying bypassed.
+   *
+   * IMPORTANT: Only call from content handlers (handleStreamDelta, handleReasoningDelta).
+   * Tool events are not buffered by the reconnect relay and can arrive before replay
+   * text finishes flushing — calling this from tool handlers would prematurely end
+   * replay phase and reclassify catch-up content as live.
+   */
+  private syncReplayPhase(messageId: string, replay?: boolean): void {
+    const context = this.activeStreams.get(messageId);
+    if (context && context.isReplay && replay !== true) {
+      context.isReplay = false;
+    }
   }
 
   private translateServerTime(context: StreamingContext, serverTimestamp: number): number {
@@ -1395,6 +1417,7 @@ export class StreamingMessageAggregator {
       isComplete: false,
       isCompacting,
       hasCompactionContinue,
+      isReplay: data.replay === true,
       model: data.model,
       routedThroughGateway: data.routedThroughGateway,
       serverFirstTokenTime: null,
@@ -1457,6 +1480,8 @@ export class StreamingMessageAggregator {
   handleStreamDelta(data: StreamDeltaEvent): void {
     const message = this.messages.get(data.messageId);
     if (!message) return;
+
+    this.syncReplayPhase(data.messageId, data.replay);
 
     const context = this.activeStreams.get(data.messageId);
     if (context) {
@@ -1989,6 +2014,8 @@ export class StreamingMessageAggregator {
     const message = this.messages.get(data.messageId);
     if (!message) return;
 
+    this.syncReplayPhase(data.messageId, data.replay);
+
     const context = this.activeStreams.get(data.messageId);
     if (context) {
       this.updateStreamClock(context, data.timestamp);
@@ -2355,6 +2382,7 @@ export class StreamingMessageAggregator {
       // Check if this message has an active stream (for inferring streaming status)
       // Direct Map.has() check - O(1) instead of O(n) iteration
       const hasActiveStream = this.activeStreams.has(message.id);
+      const streamContext = hasActiveStream ? this.activeStreams.get(message.id) : undefined;
 
       // isPartial from metadata (set by stream-abort event)
       const isPartial = message.metadata?.partial === true;
@@ -2400,6 +2428,9 @@ export class StreamingMessageAggregator {
             isPartial,
             isLastPartOfMessage: isLastPart,
             timestamp: part.timestamp ?? baseTimestamp,
+            streamPresentation: isStreaming
+              ? { source: streamContext?.isReplay ? "replay" : "live" }
+              : undefined,
           });
         } else if (part.type === "text" && part.text) {
           // Skip empty text parts
@@ -2421,6 +2452,9 @@ export class StreamingMessageAggregator {
             mode: message.metadata?.mode,
             agentId: message.metadata?.agentId ?? message.metadata?.mode,
             timestamp: part.timestamp ?? baseTimestamp,
+            streamPresentation: isStreaming
+              ? { source: streamContext?.isReplay ? "replay" : "live" }
+              : undefined,
           });
         } else if (isDynamicToolPart(part)) {
           // Determine status based on part state and result
