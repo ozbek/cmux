@@ -2431,6 +2431,19 @@ export class AgentSession {
         continue;
       }
 
+      // Verify the tool succeeded.
+      if (!this.isOkSwitchAgentOutput(part.output)) {
+        continue;
+      }
+
+      // Primary path: read switch details from tool input args.
+      const parsedInput = this.parseSwitchAgentInput(part.input);
+      if (parsedInput) {
+        return parsedInput;
+      }
+
+      // Defensive fallback: degraded streams can lose input metadata (input=null)
+      // when tool-call correlation fails. Recover from output if possible.
       const parsedOutput = this.parseSwitchAgentOutput(part.output);
       if (parsedOutput) {
         return parsedOutput;
@@ -2440,15 +2453,29 @@ export class AgentSession {
     return undefined;
   }
 
-  private parseSwitchAgentOutput(output: unknown): SwitchAgentResult | undefined {
+  private isOkSwitchAgentOutput(output: unknown): boolean {
     if (typeof output !== "object" || output === null) {
-      return undefined;
+      return false;
     }
 
     const candidate = output as Record<string, unknown>;
-    if (candidate.ok !== true) {
+    return candidate.ok === true;
+  }
+
+  private parseSwitchAgentInput(input: unknown): SwitchAgentResult | undefined {
+    return this.parseSwitchAgentCandidate(input);
+  }
+
+  private parseSwitchAgentOutput(output: unknown): SwitchAgentResult | undefined {
+    return this.parseSwitchAgentCandidate(output);
+  }
+
+  private parseSwitchAgentCandidate(value: unknown): SwitchAgentResult | undefined {
+    if (typeof value !== "object" || value === null) {
       return undefined;
     }
+
+    const candidate = value as Record<string, unknown>;
     if (typeof candidate.agentId !== "string") {
       return undefined;
     }

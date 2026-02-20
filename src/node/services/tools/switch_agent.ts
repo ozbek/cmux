@@ -9,15 +9,15 @@ export const createSwitchAgentTool: ToolFactory = (_config: ToolConfiguration) =
     execute: (args) => {
       // Validation of whether the target agent is UI-selectable happens in the
       // AgentSession follow-up handler, not here. This tool is a signal tool:
-      // StreamManager stops the stream on success, and AgentSession enqueues
-      // a follow-up with the new agentId.
+      // StreamManager stops the stream on success, and AgentSession reads
+      // switch details from the tool input before enqueueing a follow-up.
       //
-      // We do basic validation here (the schema handles agentId format).
+      // Defensive fallback: include target agentId in output so degraded streams
+      // that lose input metadata can still recover the destination agent without
+      // repeating follow-up payload in context.
       return {
         ok: true,
         agentId: args.agentId,
-        reason: args.reason ?? undefined,
-        followUp: args.followUp ?? undefined,
       };
     },
   });
