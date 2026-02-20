@@ -16,9 +16,7 @@ import {
   type LoadedSkill,
   type SkillLoadError,
 } from "@/browser/utils/messages/StreamingMessageAggregator";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { isAbortError } from "@/browser/utils/isAbortError";
-import { getRetryStateKey } from "@/common/constants/storage";
 import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { useCallback, useSyncExternalStore } from "react";
@@ -49,13 +47,22 @@ import { normalizeGatewayModel } from "@/common/utils/ai/models";
 import type { z } from "zod";
 import type { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import { createFreshRetryState } from "@/browser/utils/messages/retryState";
 import {
   appendLiveBashOutputChunk,
   type LiveBashOutputInternal,
   type LiveBashOutputView,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAutoCompactionThresholdKey, getAutoRetryKey } from "@/common/constants/storage";
+import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
 import { trackStreamCompleted } from "@/common/telemetry";
+
+export type AutoRetryStatus = Extract<
+  WorkspaceChatMessage,
+  | { type: "auto-retry-scheduled" }
+  | { type: "auto-retry-starting" }
+  | { type: "auto-retry-abandoned" }
+>;
 
 export interface WorkspaceState {
   name: string; // User-facing workspace name (e.g., "feature-branch")
@@ -82,6 +89,7 @@ export interface WorkspaceState {
   pendingStreamModel: string | null;
   // Runtime status from ensureReady (for Coder workspace starting UX)
   runtimeStatus: RuntimeStatusEvent | null;
+  autoRetryStatus: AutoRetryStatus | null;
   // Live streaming stats (updated on each stream-delta)
   streamingTokenCount: number | undefined;
   streamingTPS: number | undefined;
@@ -233,6 +241,7 @@ interface WorkspaceChatTransientState {
   queuedMessage: QueuedMessage | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveTaskIds: Map<string, string>;
+  autoRetryStatus: AutoRetryStatus | null;
 }
 
 interface HistoryPaginationCursor {
@@ -281,6 +290,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     queuedMessage: null,
     liveBashOutput: new Map(),
     liveTaskIds: new Map(),
+    autoRetryStatus: null,
   };
 }
 
@@ -433,7 +443,7 @@ export class WorkspaceStore {
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
 
-  // Idle compaction notification callbacks (called when backend signals idle compaction needed)
+  // Idle compaction notification callbacks (called when backend signals idle compaction started)
   private idleCompactionCallbacks = new Set<(workspaceId: string) => void>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
@@ -487,8 +497,11 @@ export class WorkspaceStore {
       if (this.onModelUsed) {
         this.onModelUsed((data as { model: string }).model);
       }
-      // Don't reset retry state here - stream might still fail after starting
-      // Retry state will be reset on stream-end (successful completion)
+
+      // A new stream supersedes any prior retry banner state.
+      const transient = this.assertChatTransientState(workspaceId);
+      transient.autoRetryStatus = null;
+
       this.states.bump(workspaceId);
       // Bump usage store so liveUsage is recomputed with new activeStreamId
       this.usageStore.bump(workspaceId);
@@ -504,8 +517,8 @@ export class WorkspaceStore {
       // Track stream completion telemetry
       this.trackStreamCompletedTelemetry(streamEndData, false);
 
-      // Reset retry state on successful stream completion
-      updatePersistedState(getRetryStateKey(workspaceId), createFreshRetryState());
+      const transient = this.assertChatTransientState(workspaceId);
+      transient.autoRetryStatus = null;
 
       // Update local session usage (mirrors backend's addUsage)
       const model = streamEndData.metadata?.model;
@@ -555,7 +568,6 @@ export class WorkspaceStore {
       // Flush any pending debounced bump before final bump to avoid double-bump
       this.cancelPendingIdleBump(workspaceId);
       this.states.bump(workspaceId);
-      this.dispatchResumeCheck(workspaceId);
       this.finalizeUsageStats(workspaceId, streamAbortData.metadata);
     },
     "tool-call-start": (workspaceId, aggregator, data) => {
@@ -623,6 +635,40 @@ export class WorkspaceStore {
     },
     "runtime-status": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.states.bump(workspaceId);
+    },
+    "auto-compaction-triggered": (workspaceId) => {
+      // Informational event from backend auto-compaction monitor.
+      // We bump workspace state so warning/banner components can react immediately.
+      this.states.bump(workspaceId);
+    },
+    "auto-compaction-completed": (workspaceId) => {
+      // Compaction resets context usage; force both stores to recompute from compacted history.
+      this.usageStore.bump(workspaceId);
+      this.states.bump(workspaceId);
+    },
+    "auto-retry-scheduled": (workspaceId, _aggregator, data) => {
+      const transient = this.assertChatTransientState(workspaceId);
+      transient.autoRetryStatus = data as Extract<
+        WorkspaceChatMessage,
+        { type: "auto-retry-scheduled" }
+      >;
+      this.states.bump(workspaceId);
+    },
+    "auto-retry-starting": (workspaceId, _aggregator, data) => {
+      const transient = this.assertChatTransientState(workspaceId);
+      transient.autoRetryStatus = data as Extract<
+        WorkspaceChatMessage,
+        { type: "auto-retry-starting" }
+      >;
+      this.states.bump(workspaceId);
+    },
+    "auto-retry-abandoned": (workspaceId, _aggregator, data) => {
+      const transient = this.assertChatTransientState(workspaceId);
+      transient.autoRetryStatus = data as Extract<
+        WorkspaceChatMessage,
+        { type: "auto-retry-abandoned" }
+      >;
       this.states.bump(workspaceId);
     },
     "session-usage-delta": (workspaceId, _aggregator, data) => {
@@ -940,18 +986,6 @@ export class WorkspaceStore {
     for (const aggregator of this.aggregators.values()) {
       aggregator.onResponseComplete = callback;
     }
-  }
-
-  /**
-   * Dispatch resume check event for a workspace.
-   * Triggers useResumeManager to check if interrupted stream can be resumed.
-   */
-  private dispatchResumeCheck(workspaceId: string): void {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.RESUME_CHECK_REQUESTED, { workspaceId }));
   }
 
   /**
@@ -1325,6 +1359,7 @@ export class WorkspaceStore {
         agentStatus: aggregator.getAgentStatus(),
         pendingStreamStartTime,
         pendingStreamModel: aggregator.getPendingStreamModel(),
+        autoRetryStatus: transient.autoRetryStatus,
         runtimeStatus: aggregator.getRuntimeStatus(),
         streamingTokenCount,
         streamingTPS,
@@ -2211,6 +2246,68 @@ export class WorkspaceStore {
     this.checkAndBumpRecencyIfChanged();
   }
 
+  private getStartupAutoCompactionThreshold(
+    workspaceId: string,
+    retryModelHint?: string | null
+  ): number {
+    const metadata = this.workspaceMetadata.get(workspaceId);
+    const modelFromActiveAgent = metadata?.agentId
+      ? metadata.aiSettingsByAgent?.[metadata.agentId]?.model
+      : undefined;
+    const pendingModel =
+      retryModelHint ??
+      modelFromActiveAgent ??
+      metadata?.aiSettingsByAgent?.exec?.model ??
+      metadata?.aiSettings?.model;
+    const thresholdKey = getAutoCompactionThresholdKey(pendingModel ?? "default");
+    const persistedThreshold = readPersistedState<unknown>(
+      thresholdKey,
+      DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT
+    );
+    const thresholdPercent =
+      typeof persistedThreshold === "number" && Number.isFinite(persistedThreshold)
+        ? persistedThreshold
+        : DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT;
+
+    if (thresholdPercent !== persistedThreshold) {
+      // Self-heal malformed localStorage so future startup syncs remain valid.
+      updatePersistedState<number>(thresholdKey, DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT);
+    }
+
+    return Math.max(0.1, Math.min(1, thresholdPercent / 100));
+  }
+
+  /**
+   * Best-effort startup threshold sync so backend recovery uses the user's persisted
+   * per-model threshold before AgentSession startup recovery kicks in.
+   */
+  private async syncAutoCompactionThresholdAtStartup(
+    client: RouterClient<AppRouter>,
+    workspaceId: string
+  ): Promise<void> {
+    try {
+      // Startup auto-retry can resume a turn with a model different from the current
+      // workspace selector. Ask backend for that retry-turn model first so threshold
+      // sync uses the matching per-model localStorage key.
+      const startupRetryModelResult = await client.workspace.getStartupAutoRetryModel?.({
+        workspaceId,
+      });
+      const startupRetryModel = startupRetryModelResult?.success
+        ? startupRetryModelResult.data
+        : null;
+
+      await client.workspace.setAutoCompactionThreshold({
+        workspaceId,
+        threshold: this.getStartupAutoCompactionThreshold(workspaceId, startupRetryModel),
+      });
+    } catch (error) {
+      console.warn(
+        `[WorkspaceStore] Failed to sync startup auto-compaction threshold for ${workspaceId}:`,
+        error
+      );
+    }
+  }
+
   /**
    * Subscribe to workspace chat events (history replay + live streaming).
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
@@ -2264,10 +2361,34 @@ export class WorkspaceStore {
           }
         }
 
-        const iterator = await client.workspace.onChat(
-          { workspaceId, mode },
-          { signal: attemptController.signal }
-        );
+        await this.syncAutoCompactionThresholdAtStartup(client, workspaceId);
+
+        const autoRetryKey = getAutoRetryKey(workspaceId);
+        const legacyAutoRetryEnabledRaw = readPersistedState<unknown>(autoRetryKey, undefined);
+        const legacyAutoRetryEnabled =
+          typeof legacyAutoRetryEnabledRaw === "boolean" ? legacyAutoRetryEnabledRaw : undefined;
+
+        if (legacyAutoRetryEnabledRaw !== undefined && legacyAutoRetryEnabled === undefined) {
+          // Self-heal malformed legacy values so onChat subscription retries do not
+          // keep failing schema validation on every reconnect attempt.
+          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+        }
+
+        const onChatInput =
+          legacyAutoRetryEnabled === undefined
+            ? { workspaceId, mode }
+            : { workspaceId, mode, legacyAutoRetryEnabled };
+
+        const iterator = await client.workspace.onChat(onChatInput, {
+          signal: attemptController.signal,
+        });
+
+        if (legacyAutoRetryEnabled !== undefined) {
+          // One-way migration: once we have successfully forwarded the legacy value
+          // to the backend, clear the renderer key so future sessions rely solely
+          // on backend persistence.
+          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+        }
 
         // Full replay: clear stale derived/transient state now that the subscription
         // is active. Deferred to after the iterator is established so the UI continues
@@ -2605,18 +2726,18 @@ export class WorkspaceStore {
 
   /**
    * Subscribe to idle compaction events.
-   * Callback is called when backend signals a workspace needs idle compaction.
+   * Callback is called when backend signals a workspace started idle compaction.
    * Returns unsubscribe function.
    */
-  onIdleCompactionNeeded(callback: (workspaceId: string) => void): () => void {
+  onIdleCompactionStarted(callback: (workspaceId: string) => void): () => void {
     this.idleCompactionCallbacks.add(callback);
     return () => this.idleCompactionCallbacks.delete(callback);
   }
 
   /**
-   * Notify all listeners that a workspace needs idle compaction.
+   * Notify all listeners that a workspace started idle compaction.
    */
-  private notifyIdleCompactionNeeded(workspaceId: string): void {
+  private notifyIdleCompactionStarted(workspaceId: string): void {
     for (const callback of this.idleCompactionCallbacks) {
       try {
         callback(workspaceId);
@@ -2775,6 +2896,10 @@ export class WorkspaceStore {
         // queued-message-changed snapshot before caught-up.
         transient.queuedMessage = null;
 
+        // Auto-retry status is ephemeral and may have resolved while disconnected.
+        // Clear stale banners so reconnect UI reflects replayed events only.
+        transient.autoRetryStatus = null;
+
         // Server can downgrade a requested since reconnect to full replay.
         // Clear stale interruption suppression state so retry UI is derived solely
         // from the replayed transcript instead of a pre-disconnect abort reason.
@@ -2841,9 +2966,9 @@ export class WorkspaceStore {
       return;
     }
 
-    // Handle idle-compaction-needed event (workspace became eligible while connected)
-    if ("type" in data && data.type === "idle-compaction-needed") {
-      this.notifyIdleCompactionNeeded(workspaceId);
+    // Handle idle-compaction-started event from backend execution.
+    if ("type" in data && data.type === "idle-compaction-started") {
+      this.notifyIdleCompactionStarted(workspaceId);
       return;
     }
 
@@ -2892,24 +3017,7 @@ export class WorkspaceStore {
 
       applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects });
 
-      // Increment retry attempt counter when stream fails.
-      updatePersistedState(
-        getRetryStateKey(workspaceId),
-        (prev) => {
-          const newAttempt = prev.attempt + 1;
-          console.debug(
-            `[retry] ${workspaceId} stream-error: incrementing attempt ${prev.attempt} → ${newAttempt}`
-          );
-          return {
-            attempt: newAttempt,
-            retryStartTime: Date.now(),
-          };
-        },
-        { attempt: 0, retryStartTime: Date.now() }
-      );
-
       this.states.bump(workspaceId);
-      this.dispatchResumeCheck(workspaceId);
       return;
     }
 
@@ -3031,8 +3139,8 @@ function getStoreInstance(): WorkspaceStore {
  * Use this for non-hook subscriptions (e.g., in useEffect callbacks).
  */
 export const workspaceStore = {
-  onIdleCompactionNeeded: (callback: (workspaceId: string) => void) =>
-    getStoreInstance().onIdleCompactionNeeded(callback),
+  onIdleCompactionStarted: (callback: (workspaceId: string) => void) =>
+    getStoreInstance().onIdleCompactionStarted(callback),
   subscribeFileModifyingTool: (listener: (workspaceId: string) => void, workspaceId?: string) =>
     getStoreInstance().subscribeFileModifyingTool(listener, workspaceId),
   getFileModifyingToolMs: (workspaceId: string) =>

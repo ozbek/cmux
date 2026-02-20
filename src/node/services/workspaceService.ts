@@ -31,6 +31,7 @@ import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStora
 import { listLocalBranches } from "@/node/git";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
+import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { fileExists } from "@/node/utils/runtime/fileExists";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
@@ -61,7 +62,7 @@ import {
   AskUserQuestionToolResultSchema,
 } from "@/common/utils/tools/toolDefinitions";
 import type { UIMode } from "@/common/types/mode";
-import type { MuxMessage } from "@/common/types/message";
+import type { MuxMessageMetadata, MuxMessage } from "@/common/types/message";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   hasSrcBaseDir,
@@ -71,6 +72,7 @@ import {
 } from "@/common/types/runtime";
 import { isValidModelFormat, normalizeGatewayModel } from "@/common/utils/ai/models";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type { StreamEndEvent, StreamAbortEvent } from "@/common/types/stream";
 import type { TerminalService } from "@/node/services/terminalService";
@@ -3076,6 +3078,8 @@ export class WorkspaceService extends EventEmitter {
       allowQueuedAgentTask?: boolean;
       skipAutoResumeReset?: boolean;
       synthetic?: boolean;
+      /** When true, reject instead of queueing if the workspace is busy. */
+      requireIdle?: boolean;
     }
   ): Promise<Result<void, SendMessageError>> {
     log.debug("sendMessage handler: Received", {
@@ -3194,6 +3198,13 @@ export class WorkspaceService extends EventEmitter {
       const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
 
       if (shouldQueue) {
+        if (internal?.requireIdle) {
+          return Err({
+            type: "unknown",
+            raw: "Workspace is busy; idle-only send was skipped.",
+          });
+        }
+
         const pendingAskUserQuestion = askUserQuestionManager.getLatestPending(workspaceId);
         if (pendingAskUserQuestion) {
           try {
@@ -3211,7 +3222,9 @@ export class WorkspaceService extends EventEmitter {
           }
         }
 
-        session.queueMessage(message, normalizedOptions);
+        session.queueMessage(message, normalizedOptions, {
+          synthetic: internal?.synthetic,
+        });
         return Ok(undefined);
       }
 
@@ -3253,7 +3266,7 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     options: SendMessageOptions,
     internal?: { allowQueuedAgentTask?: boolean }
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<Result<{ started: boolean }, SendMessageError>> {
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -3340,6 +3353,46 @@ export class WorkspaceService extends EventEmitter {
         raw: `Failed to resume stream: ${errorMessage}`,
       };
       return Err(sendError);
+    }
+  }
+
+  async setAutoRetryEnabled(
+    workspaceId: string,
+    enabled: boolean,
+    persist = true
+  ): Promise<Result<{ previousEnabled: boolean; enabled: boolean }>> {
+    try {
+      const session = this.getOrCreateSession(workspaceId);
+      const state = await session.setAutoRetryEnabled(enabled, { persist });
+      return Ok(state);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      log.error("Unexpected error in setAutoRetryEnabled handler:", error);
+      return Err(`Failed to set auto-retry enabled state: ${errorMessage}`);
+    }
+  }
+
+  async getStartupAutoRetryModel(workspaceId: string): Promise<Result<string | null>> {
+    try {
+      const session = this.getOrCreateSession(workspaceId);
+      const model = await session.getStartupAutoRetryModelHint();
+      return Ok(model);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      log.error("Unexpected error in getStartupAutoRetryModel handler:", error);
+      return Err(`Failed to inspect startup auto-retry model: ${errorMessage}`);
+    }
+  }
+
+  setAutoCompactionThreshold(workspaceId: string, threshold: number): Result<void> {
+    try {
+      const session = this.getOrCreateSession(workspaceId);
+      session.setAutoCompactionThreshold(threshold);
+      return Ok(undefined);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      log.error("Unexpected error in setAutoCompactionThreshold handler:", error);
+      return Err(`Failed to set auto-compaction threshold: ${errorMessage}`);
     }
   }
 
@@ -4268,13 +4321,147 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Emit an idle-compaction-needed event to a workspace's stream.
-   * Called by IdleCompactionService when a workspace becomes eligible while connected.
+   * Execute idle compaction for a workspace directly from the backend.
+   *
+   * This path is frontend-independent: compaction still runs even if no UI is open.
+   * Throws on failure so IdleCompactionService can log and continue with the next workspace.
    */
-  emitIdleCompactionNeeded(workspaceId: string): void {
+  async executeIdleCompaction(workspaceId: string): Promise<void> {
+    assert(workspaceId.trim().length > 0, "executeIdleCompaction requires a non-empty workspaceId");
+
+    const sendOptions = await this.buildIdleCompactionSendOptions(workspaceId);
+
+    const muxMetadata: MuxMessageMetadata = {
+      type: "compaction-request",
+      rawCommand: "/compact",
+      commandPrefix: "/compact",
+      parsed: {
+        model: sendOptions.model,
+      },
+      requestedModel: sendOptions.model,
+      source: "idle-compaction",
+      displayStatus: { emoji: "💤", message: "Compacting idle workspace..." },
+    };
+
+    const session = this.getOrCreateSession(workspaceId);
+    if (session.isBusy()) {
+      throw new Error(
+        "Failed to execute idle compaction: Workspace is busy; idle-only send was skipped."
+      );
+    }
+
+    const sendResult = await this.sendMessage(
+      workspaceId,
+      buildCompactionMessageText({}),
+      {
+        ...sendOptions,
+        muxMetadata,
+      },
+      {
+        // Idle compaction runs in background; avoid mutating auto-resume counters.
+        skipAutoResumeReset: true,
+        // Backend-initiated maintenance turn: do not treat as explicit user re-engagement.
+        synthetic: true,
+        // If the workspace became active after eligibility checks, skip instead of queueing
+        // stale maintenance work for later.
+        requireIdle: true,
+      }
+    );
+
+    if (!sendResult.success) {
+      const rawError = sendResult.error;
+      const formattedError =
+        typeof rawError === "object" && rawError !== null
+          ? "raw" in rawError && typeof rawError.raw === "string"
+            ? rawError.raw
+            : "message" in rawError && typeof rawError.message === "string"
+              ? rawError.message
+              : "type" in rawError && typeof rawError.type === "string"
+                ? rawError.type
+                : JSON.stringify(rawError)
+          : String(rawError);
+      throw new Error(`Failed to execute idle compaction: ${formattedError}`);
+    }
+
+    // Notify listeners only after dispatch succeeds so UI state reflects real work.
+    this.emitIdleCompactionStarted(workspaceId);
+  }
+
+  private async buildIdleCompactionSendOptions(workspaceId: string): Promise<SendMessageOptions> {
+    const config = this.config.loadConfigOrDefault();
+    const workspaceMatch = this.config.findWorkspace(workspaceId);
+
+    const workspaceEntry = workspaceMatch
+      ? (() => {
+          const project = config.projects.get(workspaceMatch.projectPath);
+          return (
+            project?.workspaces.find((workspace) => workspace.id === workspaceId) ??
+            project?.workspaces.find((workspace) => workspace.path === workspaceMatch.workspacePath)
+          );
+        })()
+      : undefined;
+
+    const activity = await this.extensionMetadata.getMetadata(workspaceId);
+
+    const compactAgentSettings = workspaceEntry?.aiSettingsByAgent?.compact;
+    const execAgentSettings =
+      workspaceEntry?.aiSettingsByAgent?.[WORKSPACE_DEFAULTS.agentId] ?? workspaceEntry?.aiSettings;
+
+    const preferredCompactionModel =
+      typeof config.preferredCompactionModel === "string"
+        ? normalizeGatewayModel(config.preferredCompactionModel.trim())
+        : undefined;
+
+    const normalizedPreferredCompactionModel =
+      preferredCompactionModel && isValidModelFormat(preferredCompactionModel)
+        ? preferredCompactionModel
+        : undefined;
+
+    const fallbackModel =
+      normalizedPreferredCompactionModel ??
+      compactAgentSettings?.model ??
+      execAgentSettings?.model ??
+      activity?.lastModel ??
+      WORKSPACE_DEFAULTS.model;
+
+    let model = normalizeGatewayModel(fallbackModel);
+    if (!isValidModelFormat(model)) {
+      log.warn("Idle compaction resolved invalid model; falling back to workspace default", {
+        workspaceId,
+        model,
+      });
+      model = WORKSPACE_DEFAULTS.model;
+    }
+
+    const requestedThinking =
+      compactAgentSettings?.thinkingLevel ??
+      execAgentSettings?.thinkingLevel ??
+      activity?.lastThinkingLevel ??
+      WORKSPACE_DEFAULTS.thinkingLevel;
+
+    const normalizedThinkingLevel =
+      coerceThinkingLevel(requestedThinking) ?? WORKSPACE_DEFAULTS.thinkingLevel;
+
+    return {
+      model,
+      agentId: "compact",
+      thinkingLevel: enforceThinkingPolicy(model, normalizedThinkingLevel),
+      maxOutputTokens: undefined,
+      // Disable all tools during compaction - regex .* matches all tool names.
+      toolPolicy: [{ regex_match: ".*", action: "disable" }],
+      // Compaction should not mutate persisted workspace AI defaults.
+      skipAiSettingsPersistence: true,
+    };
+  }
+
+  /**
+   * Emit an idle-compaction-started event to a workspace's stream.
+   * This is a transient UI hint while backend-initiated compaction is running.
+   */
+  emitIdleCompactionStarted(workspaceId: string): void {
     const session = this.sessions.get(workspaceId);
     if (session) {
-      session.emitChatEvent({ type: "idle-compaction-needed" });
+      session.emitChatEvent({ type: "idle-compaction-started" });
     }
   }
 }

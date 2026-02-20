@@ -34,11 +34,10 @@ import {
 } from "@/browser/utils/messages/messageUtils";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import { BashOutputCollapsedIndicator } from "./tools/BashOutputCollapsedIndicator";
-import { enableAutoRetryPreference } from "@/browser/utils/messages/autoRetryPreference";
 import {
   getInterruptionContext,
   getLastNonDecorativeMessage,
-} from "@/browser/utils/messages/retryEligibility";
+} from "@/common/utils/messages/retryEligibility";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
@@ -59,16 +58,14 @@ import { CompactionWarning } from "./CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "./ContextSwitchWarning";
 import { ConcurrentLocalWarning } from "./ConcurrentLocalWarning";
 import { BackgroundProcessesBanner } from "./BackgroundProcessesBanner";
-import { checkAutoCompaction } from "@/browser/utils/compaction/autoCompactionCheck";
+import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
 import type { ContextSwitchWarning } from "@/browser/utils/compaction/contextSwitchCheck";
-import { executeCompaction } from "@/browser/utils/chatCommands";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "../hooks/useAutoCompactionSettings";
 import { useContextSwitchWarning } from "@/browser/hooks/useContextSwitchWarning";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
-import { useForceCompaction } from "@/browser/hooks/useForceCompaction";
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
 import { useAPI } from "@/browser/contexts/API";
 import { useReviews } from "@/browser/hooks/useReviews";
@@ -194,6 +191,19 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
     pendingModel
   );
 
+  useEffect(() => {
+    if (!api) {
+      return;
+    }
+
+    // Keep backend session threshold in sync with the persisted per-model slider value.
+    const normalizedThreshold = Math.max(0.1, Math.min(1, autoCompactionThreshold / 100));
+    void api.workspace.setAutoCompactionThreshold({
+      workspaceId,
+      threshold: normalizedThreshold,
+    });
+  }, [api, workspaceId, autoCompactionThreshold]);
+
   const [editingState, setEditingState] = useState(() => ({
     workspaceId,
     message: undefined as EditingMessageState | undefined,
@@ -303,33 +313,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   // Context-switch warning takes priority so we don't show competing banners.
   const shouldShowCompactionWarning =
     !isCompacting && autoCompactionResult.shouldShowWarning && !contextSwitchWarning;
-
-  // Handle force compaction callback - memoized to avoid effect re-runs.
-  // We pass a default continueMessage of "Continue" as a resume sentinel so the backend can
-  // auto-send it after compaction. The compaction prompt builder special-cases this sentinel
-  // to avoid injecting it into the summarization request.
-  const handleForceCompaction = useCallback(() => {
-    if (!api) return;
-
-    // Force compaction queues a message while a stream is active.
-    // Match user-send semantics: background any running foreground bash so we don't block.
-    autoBackgroundOnSend();
-
-    void executeCompaction({
-      api,
-      workspaceId,
-      sendMessageOptions: pendingSendOptions,
-      followUpContent: { text: "Continue" },
-    });
-  }, [api, workspaceId, pendingSendOptions, autoBackgroundOnSend]);
-
-  // Force compaction when live usage shows we're about to hit context limit
-  useForceCompaction({
-    shouldForceCompact: autoCompactionResult.shouldForceCompact,
-    canInterrupt,
-    isCompacting,
-    onTrigger: handleForceCompaction,
-  });
 
   // Vim mode state - needed for keybind selection (Ctrl+C in vim, Esc otherwise)
   const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
@@ -460,11 +443,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
     [addReview]
   );
 
-  // Handler for manual compaction from CompactionWarning click
-  const handleCompactClick = useCallback(() => {
-    chatInputAPI.current?.prependText("/compact\n");
-  }, []);
-
   // Handlers for editing messages
   const handleEditUserMessage = useCallback(
     (message: EditingMessageState) => {
@@ -556,11 +534,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
 
     // Enable auto-scroll when user sends a message
     setAutoScroll(true);
-
-    // Reset autoRetry when user sends a message
-    // User action = clear intent: "I'm actively using this workspace"
-    enableAutoRetryPreference(workspaceId);
-  }, [setAutoScroll, autoBackgroundOnSend, workspaceId]);
+  }, [setAutoScroll, autoBackgroundOnSend]);
 
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
@@ -601,9 +575,8 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, workspaceState?.loading]);
 
-  // Compute showRetryBarrier once for both keybinds and UI
-  // Track if last message was interrupted or errored (for RetryBarrier)
-  // Uses same logic as useResumeManager for DRY
+  // Compute showRetryBarrier once for both keybinds and UI.
+  // Track if last message was interrupted or errored (for RetryBarrier).
   const interruption = workspaceState
     ? getInterruptionContext(
         workspaceState.messages,
@@ -613,14 +586,18 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
       )
     : null;
 
+  const hasInterruptedStream = interruption?.hasInterruptedStream ?? false;
   const showRetryBarrier = workspaceState
-    ? !workspaceState.canInterrupt && (interruption?.hasInterruptedStream ?? false)
+    ? !workspaceState.canInterrupt && hasInterruptedStream
     : false;
 
   const lastActionableMessage = getLastNonDecorativeMessage(workspaceState.messages);
   const suppressRetryBarrier =
     lastActionableMessage?.type === "stream-error" &&
     lastActionableMessage.errorType === "context_exceeded";
+  // Keep RetryBarrier mounted (but visually hidden) while a resumed stream is in flight
+  // so its temporary auto-retry rollback effect can observe terminal stream outcomes.
+  const shouldMountRetryBarrier = hasInterruptedStream && !suppressRetryBarrier;
   const showRetryBarrierUI = showRetryBarrier && !suppressRetryBarrier;
 
   const handleLoadOlderHistory = useCallback(() => {
@@ -863,7 +840,12 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
                         );
                       })}
                       {/* Show RetryBarrier after the last message if needed */}
-                      {showRetryBarrierUI && <RetryBarrier workspaceId={workspaceId} />}
+                      {shouldMountRetryBarrier && (
+                        <RetryBarrier
+                          workspaceId={workspaceId}
+                          className={!showRetryBarrierUI ? "hidden" : undefined}
+                        />
+                      )}
                     </>
                   </MessageListProvider>
                 )}
@@ -943,14 +925,12 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
             onContextSwitchCompact={handleContextSwitchCompact}
             onContextSwitchDismiss={handleContextSwitchDismiss}
             onModelChange={handleModelChange}
-            onCompactClick={handleCompactClick}
             onMessageSent={handleMessageSent}
             onTruncateHistory={handleClearHistory}
             editingMessage={editingMessage}
             onCancelEdit={handleCancelEdit}
             onEditLastUserMessage={handleEditLastUserMessageClick}
             onChatInputReady={handleChatInputReady}
-            hasQueuedCompaction={Boolean(workspaceState.queuedMessage?.hasCompactionRequest)}
             reviews={reviews}
             onCheckReviews={handleCheckReviews}
           />
@@ -975,14 +955,12 @@ interface ChatInputPaneProps {
   onContextSwitchCompact: () => void;
   onContextSwitchDismiss: () => void;
   onModelChange?: (model: string) => void;
-  onCompactClick: () => void;
   onMessageSent: () => void;
   onTruncateHistory: (percentage?: number) => Promise<void>;
   editingMessage: EditingMessageState | undefined;
   onCancelEdit: () => void;
   onEditLastUserMessage: () => void;
   onChatInputReady: (api: ChatInputAPI) => void;
-  hasQueuedCompaction: boolean;
   reviews: ReviewsState;
   onCheckReviews: (ids: string[]) => void;
 }
@@ -997,7 +975,6 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
           usagePercentage={props.autoCompactionResult.usagePercentage}
           thresholdPercentage={props.autoCompactionResult.thresholdPercentage}
           isStreaming={props.canInterrupt}
-          onCompactClick={props.onCompactClick}
         />
       )}
       {props.contextSwitchWarning && (
@@ -1035,8 +1012,6 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onEditLastUserMessage={props.onEditLastUserMessage}
         canInterrupt={props.canInterrupt}
         onReady={props.onChatInputReady}
-        autoCompactionCheck={props.autoCompactionResult}
-        hasQueuedCompaction={props.hasQueuedCompaction}
         attachedReviews={reviews.attachedReviews}
         onDetachReview={reviews.detachReview}
         onDetachAllReviews={reviews.detachAllAttached}

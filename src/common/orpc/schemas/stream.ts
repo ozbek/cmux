@@ -74,7 +74,7 @@ export const CaughtUpMessageSchema = z.object({
   cursor: OnChatCursorSchema.optional(),
 });
 
-/** Sent when a workspace becomes eligible for idle compaction while connected */
+/** Sent when backend starts idle compaction for a workspace */
 
 /**
  * Progress event for runtime readiness checks.
@@ -89,8 +89,36 @@ export const RuntimeStatusEventSchema = z.object({
   detail: z.string().optional(), // Human-readable status like "Starting Coder workspace..."
 });
 
-export const IdleCompactionNeededEventSchema = z.object({
-  type: z.literal("idle-compaction-needed"),
+export const IdleCompactionStartedEventSchema = z.object({
+  type: z.literal("idle-compaction-started"),
+});
+
+export const AutoCompactionTriggeredEventSchema = z.object({
+  type: z.literal("auto-compaction-triggered"),
+  reason: z.enum(["on-send", "mid-stream", "idle"]),
+  usagePercent: z.number(),
+});
+
+export const AutoCompactionCompletedEventSchema = z.object({
+  type: z.literal("auto-compaction-completed"),
+  newUsagePercent: z.number(),
+});
+
+export const AutoRetryScheduledEventSchema = z.object({
+  type: z.literal("auto-retry-scheduled"),
+  attempt: z.number(),
+  delayMs: z.number(),
+  scheduledAt: z.number(),
+});
+
+export const AutoRetryStartingEventSchema = z.object({
+  type: z.literal("auto-retry-starting"),
+  attempt: z.number(),
+});
+
+export const AutoRetryAbandonedEventSchema = z.object({
+  type: z.literal("auto-retry-abandoned"),
+  reason: z.string(),
 });
 
 export const StreamErrorMessageSchema = z.object({
@@ -477,8 +505,15 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   SessionUsageDeltaEventSchema,
   QueuedMessageChangedEventSchema,
   RestoreToInputEventSchema,
+  // Auto-compaction status events
+  AutoCompactionTriggeredEventSchema,
+  AutoCompactionCompletedEventSchema,
   // Idle compaction notification
-  IdleCompactionNeededEventSchema,
+  IdleCompactionStartedEventSchema,
+  // Auto-retry status events
+  AutoRetryScheduledEventSchema,
+  AutoRetryStartingEventSchema,
+  AutoRetryAbandonedEventSchema,
   // Runtime status events
   RuntimeStatusEventSchema,
   // Init events

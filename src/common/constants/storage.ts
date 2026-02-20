@@ -189,18 +189,12 @@ export function getPendingWorkspaceSendErrorKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for auto-retry preference for a workspace
+ * LEGACY: Get the localStorage key for pre-backend auto-retry preference.
+ *
+ * Kept only for one-way migration during onChat subscription.
  */
 export function getAutoRetryKey(workspaceId: string): string {
   return `${workspaceId}-autoRetry`;
-}
-
-/**
- * Get the localStorage key for retry state for a workspace
- * Stores: { attempt, totalRetryTime, retryStartTime }
- */
-export function getRetryStateKey(workspaceId: string): string {
-  return `${workspaceId}-retryState`;
 }
 
 /**
@@ -588,8 +582,6 @@ const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string>
   getAgentIdKey,
   getPinnedAgentIdKey,
   getThinkingLevelKey,
-  getAutoRetryKey,
-  getRetryStateKey,
   getReviewStateKey,
   getHunkFirstSeenKey,
   getReviewExpandStateKey,

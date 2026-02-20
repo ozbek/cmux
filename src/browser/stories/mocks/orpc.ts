@@ -1111,7 +1111,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       fork: () => Promise.resolve({ success: false, error: "Not implemented in mock" }),
       sendMessage: () => Promise.resolve({ success: true, data: undefined }),
-      resumeStream: () => Promise.resolve({ success: true, data: undefined }),
+      resumeStream: () => Promise.resolve({ success: true, data: { started: true } }),
+      setAutoRetryEnabled: () =>
+        Promise.resolve({
+          success: true,
+          data: { previousEnabled: true, enabled: true },
+        }),
+      getStartupAutoRetryModel: () => Promise.resolve({ success: true, data: null }),
+      setAutoCompactionThreshold: () => Promise.resolve({ success: true, data: undefined }),
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),
       truncateHistory: () => Promise.resolve({ success: true, data: undefined }),

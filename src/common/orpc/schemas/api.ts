@@ -914,7 +914,38 @@ export const workspace = {
       workspaceId: z.string(),
       options: SendMessageOptionsSchema,
     }),
-    output: ResultSchema(z.void(), SendMessageErrorSchema),
+    output: ResultSchema(
+      z.object({
+        started: z.boolean(),
+      }),
+      SendMessageErrorSchema
+    ),
+  },
+  setAutoRetryEnabled: {
+    input: z.object({
+      workspaceId: z.string(),
+      enabled: z.boolean(),
+      // Runtime-only toggle for temporary retry flows (do not mutate persisted preference).
+      persist: z.boolean().nullish(),
+    }),
+    output: ResultSchema(
+      z.object({
+        previousEnabled: z.boolean(),
+        enabled: z.boolean(),
+      }),
+      z.string()
+    ),
+  },
+  getStartupAutoRetryModel: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.string().nullable(), z.string()),
+  },
+  setAutoCompactionThreshold: {
+    input: z.object({
+      workspaceId: z.string(),
+      threshold: z.number().finite().min(0.1).max(1.0),
+    }),
+    output: ResultSchema(z.void(), z.string()),
   },
   interruptStream: {
     input: z.object({
@@ -1046,6 +1077,9 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       mode: OnChatModeSchema.optional(),
+      // One-shot migration hint: legacy renderer localStorage opt-out value.
+      // Used only when backend auto-retry preference file is missing.
+      legacyAutoRetryEnabled: z.boolean().optional(),
     }),
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },

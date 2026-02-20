@@ -2582,6 +2582,43 @@ export const router = (authToken?: string) => {
                 : result.error;
             return { success: false, error };
           }
+          return { success: true, data: result.data };
+        }),
+      setAutoRetryEnabled: t
+        .input(schemas.workspace.setAutoRetryEnabled.input)
+        .output(schemas.workspace.setAutoRetryEnabled.output)
+        .handler(async ({ context, input }) => {
+          const result = await context.workspaceService.setAutoRetryEnabled(
+            input.workspaceId,
+            input.enabled,
+            input.persist ?? true
+          );
+          if (!result.success) {
+            return { success: false, error: result.error };
+          }
+          return { success: true, data: result.data };
+        }),
+      getStartupAutoRetryModel: t
+        .input(schemas.workspace.getStartupAutoRetryModel.input)
+        .output(schemas.workspace.getStartupAutoRetryModel.output)
+        .handler(async ({ context, input }) => {
+          const result = await context.workspaceService.getStartupAutoRetryModel(input.workspaceId);
+          if (!result.success) {
+            return { success: false, error: result.error };
+          }
+          return { success: true, data: result.data };
+        }),
+      setAutoCompactionThreshold: t
+        .input(schemas.workspace.setAutoCompactionThreshold.input)
+        .output(schemas.workspace.setAutoCompactionThreshold.output)
+        .handler(({ context, input }) => {
+          const result = context.workspaceService.setAutoCompactionThreshold(
+            input.workspaceId,
+            input.threshold
+          );
+          if (!result.success) {
+            return { success: false, error: result.error };
+          }
           return { success: true, data: undefined };
         }),
       interruptStream: t
@@ -2861,6 +2898,10 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.onChat.output)
         .handler(async function* ({ context, input, signal }) {
           const session = context.workspaceService.getOrCreateSession(input.workspaceId);
+          if (typeof input.legacyAutoRetryEnabled === "boolean") {
+            session.setLegacyAutoRetryEnabledHint(input.legacyAutoRetryEnabled);
+          }
+
           const { push, iterate, end } = createAsyncMessageQueue<WorkspaceChatMessage>();
 
           const onAbort = () => {
@@ -2897,6 +2938,10 @@ export const router = (authToken?: string) => {
           }, input.mode);
 
           replayRelay.finishReplay();
+
+          // Startup recovery: after replay catches the client up, recover any
+          // crash-stranded compaction follow-ups and then evaluate auto-retry.
+          session.scheduleStartupRecovery();
 
           // 3. Heartbeat to keep the connection alive during long operations (tool calls, subagents).
           // Client uses this to detect stalled connections vs. intentionally idle streams.

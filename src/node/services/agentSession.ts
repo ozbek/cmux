@@ -2,7 +2,8 @@ import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import * as path from "path";
 import { createHash } from "crypto";
-import { readFile } from "fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "fs/promises";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import YAML from "yaml";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
@@ -11,7 +12,7 @@ import type { AIService } from "@/node/services/aiService";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -23,9 +24,11 @@ import type {
   DeleteMessage,
   OnChatMode,
   OnChatCursor,
+  ProvidersConfigMap,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type { SendMessageError } from "@/common/types/errors";
+import type { StreamAbortReason } from "@/common/types/stream";
 import { AgentIdSchema, SkillNameSchema } from "@/common/orpc/schemas";
 import {
   buildStreamErrorEventData,
@@ -46,13 +49,16 @@ import {
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
+import { coerceThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import {
   createMuxMessage,
   isCompactionSummaryMetadata,
+  pickPreservedSendOptions,
+  pickStartupRetrySendOptions,
   prepareUserMessageForSend,
   type CompactionFollowUpRequest,
-  type MuxFrontendMetadata,
+  type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
   type ReviewNoteDataForDisplay,
@@ -70,6 +76,7 @@ import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/r
 import { MessageQueue } from "./messageQueue";
 import type { StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
 import { CompactionHandler } from "./compactionHandler";
+import { RetryManager, type RetryFailureError, type RetryStatusEvent } from "./retryManager";
 import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
@@ -79,11 +86,23 @@ import type { PostCompactionAttachment, PostCompactionExclusions } from "@/commo
 import { TURNS_BETWEEN_ATTACHMENTS } from "@/common/constants/attachments";
 
 import { extractEditedFileDiffs } from "@/common/utils/messages/extractEditedFiles";
+import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
+import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { getModelCapabilities } from "@/common/utils/ai/modelCapabilities";
-import { normalizeGatewayModel, isValidModelFormat } from "@/common/utils/ai/models";
+import {
+  normalizeGatewayModel,
+  isValidModelFormat,
+  supports1MContext,
+} from "@/common/utils/ai/models";
+import {
+  isNonRetryableSendError,
+  isNonRetryableStreamError,
+} from "@/common/utils/messages/retryEligibility";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { getErrorMessage } from "@/common/utils/errors";
+import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
 
 /**
  * Tracked file state for detecting external edits.
@@ -96,6 +115,7 @@ export type { FileState, EditedFileAttachment } from "@/node/services/utils/file
 // Supports both new `followUpContent` and legacy `continueMessage` for backwards compatibility
 interface CompactionRequestMetadata {
   type: "compaction-request";
+  source?: "idle-compaction" | "auto-compaction";
   parsed: {
     followUpContent?: CompactionFollowUpRequest;
     // Legacy field - older persisted requests may use this instead of followUpContent
@@ -103,7 +123,7 @@ interface CompactionRequestMetadata {
       text?: string;
       imageParts?: FilePart[];
       reviews?: ReviewNoteDataForDisplay[];
-      muxMetadata?: MuxFrontendMetadata;
+      muxMetadata?: MuxMessageMetadata;
       model?: string;
       agentId?: string;
       mode?: "exec" | "plan"; // Legacy: older versions stored mode instead of agentId
@@ -151,6 +171,9 @@ function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMe
 }
 
 const MAX_AGENT_SKILL_SNAPSHOT_CHARS = 50_000;
+const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
+const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
+const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 
 export interface AgentSessionChatEvent {
   workspaceId: string;
@@ -185,6 +208,8 @@ enum TurnPhase {
   COMPLETING = "completing",
 }
 
+type StartupAutoRetryCheckOutcome = "completed" | "deferred";
+
 export class AgentSession {
   private readonly workspaceId: string;
   private readonly config: Config;
@@ -216,6 +241,26 @@ export class AgentSession {
   private idleWaiters: Array<() => void> = [];
   private readonly messageQueue = new MessageQueue();
   private readonly compactionHandler: CompactionHandler;
+  private readonly compactionMonitor: CompactionMonitor;
+
+  private readonly retryManager: RetryManager;
+  private lastAutoRetryOptions?: SendMessageOptions;
+  /** Startup recovery should run once per session to avoid duplicate retry timers on reconnect. */
+  private startupRecoveryScheduled = false;
+  private startupRecoveryPromise: Promise<void> | null = null;
+  private startupAutoRetryCheckScheduled = false;
+  private startupAutoRetryCheckPromise: Promise<void> | null = null;
+  private startupAutoRetryHistoryReadFailureCount = 0;
+  private startupAutoRetryDeferredRetryDelayMs = 0;
+  private autoRetryEnabledPreference: boolean | null = null;
+  private legacyAutoRetryEnabledHint: boolean | null = null;
+  private startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null = null;
+
+  /** Latest context-usage snapshot used for on-send compaction checks. */
+  private lastUsageState?: AutoCompactionUsageState;
+
+  /** Prevent duplicate mid-stream compaction interrupts while we are already transitioning. */
+  private midStreamCompactionPending = false;
 
   /** Tracks file state for detecting external edits. */
   private readonly fileChangeTracker = new FileChangeTracker();
@@ -260,6 +305,18 @@ export class AgentSession {
   /** True once we see any model/tool output for the current stream (retry guard). */
   private activeStreamHadAnyDelta = false;
 
+  /**
+   * True when AIService has already emitted an `error` event for the current stream attempt.
+   * Used to avoid duplicate retry scheduling when streamMessage later returns the same failure.
+   */
+  private activeStreamErrorEventReceived = false;
+
+  /**
+   * True when the latest streamWithHistory() failure path already updated retry/abandon state.
+   * retryActiveStream() uses this to avoid double-processing handled failures.
+   */
+  private activeStreamFailureHandled = false;
+
   /** Tracks whether the current stream included post-compaction attachments. */
   private activeStreamHadPostCompactionInjection = false;
 
@@ -268,12 +325,14 @@ export class AgentSession {
     modelString: string;
     options?: SendMessageOptions;
     openaiTruncationModeOverride?: "auto" | "disabled";
+    providersConfig: ProvidersConfigMap | null;
   };
 
   private activeCompactionRequest?: {
     id: string;
     modelString: string;
     options?: SendMessageOptions;
+    source?: "idle-compaction" | "auto-compaction";
   };
 
   constructor(options: AgentSessionOptions) {
@@ -314,6 +373,19 @@ export class AgentSession {
       onCompactionComplete,
     });
 
+    this.compactionMonitor = new CompactionMonitor(
+      this.workspaceId,
+      (event: CompactionStatusEvent) => this.emitChatEvent(event)
+    );
+
+    this.retryManager = new RetryManager(
+      this.workspaceId,
+      async () => {
+        await this.retryActiveStream();
+      },
+      (event) => this.emitRetryEvent(event)
+    );
+
     this.attachAiListeners();
     this.attachInitListeners();
   }
@@ -326,6 +398,8 @@ export class AgentSession {
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
+
+    this.retryManager.dispose();
 
     // Stop any active stream (fire and forget - disposal shouldn't block)
     void this.aiService.stopStream(this.workspaceId, { abandonPartial: true });
@@ -368,11 +442,7 @@ export class AgentSession {
     const unsubscribe = this.onChatEvent(listener);
     await this.emitHistoricalEvents(listener);
 
-    // Crash recovery: check if the last message is a compaction summary with
-    // a pending follow-up that was never dispatched. If so, dispatch it now.
-    // This handles the case where the app crashed after compaction completed
-    // but before the follow-up was sent.
-    void this.dispatchPendingFollowUp();
+    this.scheduleStartupRecovery();
 
     return unsubscribe;
   }
@@ -418,6 +488,796 @@ export class AgentSession {
     }
 
     return streamLastTimestamp;
+  }
+
+  private emitRetryEvent(event: RetryStatusEvent): void {
+    if (this.disposed) {
+      return;
+    }
+    this.emitChatEvent(event);
+  }
+
+  private async handleStreamFailureForAutoRetry(error: RetryFailureError): Promise<void> {
+    assert(
+      typeof error.type === "string" && error.type.length > 0,
+      "handleStreamFailureForAutoRetry requires a non-empty error.type"
+    );
+
+    // Load persisted preference before scheduling retries so an on-disk opt-out is
+    // honored even when the first failure happens before startup recovery runs.
+    await this.loadAutoRetryEnabledPreference();
+    this.retryManager.handleStreamFailure(error);
+  }
+
+  private extractRetryFailureMessage(error: SendMessageError): string | undefined {
+    if ("message" in error && typeof error.message === "string") {
+      return error.message;
+    }
+
+    if ("raw" in error && typeof error.raw === "string") {
+      return error.raw;
+    }
+
+    return undefined;
+  }
+
+  private async retryActiveStream(): Promise<void> {
+    const options = this.lastAutoRetryOptions;
+    if (!options) {
+      this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
+      return;
+    }
+
+    const result = await this.resumeStream(options);
+    if (result.success) {
+      if (!result.data.started) {
+        // resumeStream can defer when a turn is still PREPARING/COMPLETING.
+        // Treat this as retriable so auto-retry keeps progressing instead of
+        // stalling after the "auto-retry-starting" status event.
+        await this.handleStreamFailureForAutoRetry({
+          type: "unknown",
+          message: "retry_deferred_busy",
+        });
+        return;
+      }
+
+      // Retry resumed the stream successfully. Clear stale startup-abandon markers now
+      // (not only on stream-end) so a crash/restart mid-stream doesn't suppress recovery.
+      await this.clearStartupAutoRetryAbandon();
+      return;
+    }
+
+    if (this.activeStreamFailureHandled) {
+      // resumeStream() failure paths already flowed through streamWithHistory() /
+      // handleStreamError(), which scheduled retry and persisted abandon state.
+      // Re-processing here would double-increment backoff attempts.
+      return;
+    }
+
+    // Fallback: resumeStream() can fail before stream error handlers run
+    // (for example commitPartial/history read failures). Handle those here so
+    // auto-retry continues instead of stalling after auto-retry-starting.
+    await this.handleStreamFailureForAutoRetry({
+      type: result.error.type,
+      message: this.extractRetryFailureMessage(result.error),
+    });
+    await this.updateStartupAutoRetryAbandonFromFailure(
+      result.error.type,
+      this.activeStreamUserMessageId
+    );
+  }
+
+  private getAutoRetryPreferencePath(): string {
+    return path.join(this.config.getSessionDir(this.workspaceId), AUTO_RETRY_PREFERENCE_FILE);
+  }
+
+  setLegacyAutoRetryEnabledHint(enabled: boolean): void {
+    this.assertNotDisposed("setLegacyAutoRetryEnabledHint");
+    assert(typeof enabled === "boolean", "setLegacyAutoRetryEnabledHint requires a boolean");
+
+    if (this.autoRetryEnabledPreference !== null) {
+      return;
+    }
+
+    this.legacyAutoRetryEnabledHint = enabled;
+  }
+
+  private parseStartupAutoRetryAbandon(
+    value: unknown
+  ): { reason: string; userMessageId?: string } | null {
+    if (typeof value !== "object" || value === null) {
+      return null;
+    }
+
+    const parsed = value as { reason?: unknown; userMessageId?: unknown };
+    if (typeof parsed.reason !== "string" || parsed.reason.trim().length === 0) {
+      return null;
+    }
+
+    const userMessageId =
+      typeof parsed.userMessageId === "string" && parsed.userMessageId.trim().length > 0
+        ? parsed.userMessageId
+        : undefined;
+
+    return {
+      reason: parsed.reason,
+      ...(userMessageId ? { userMessageId } : {}),
+    };
+  }
+
+  private async loadAutoRetryEnabledPreference(): Promise<boolean> {
+    if (this.autoRetryEnabledPreference !== null) {
+      return this.autoRetryEnabledPreference;
+    }
+
+    const preferencePath = this.getAutoRetryPreferencePath();
+    try {
+      const raw = await readFile(preferencePath, "utf-8");
+      const parsed = JSON.parse(raw) as {
+        enabled?: unknown;
+        startupAutoRetryAbandon?: unknown;
+      };
+      const enabled = parsed.enabled !== false;
+      this.autoRetryEnabledPreference = enabled;
+      this.legacyAutoRetryEnabledHint = null;
+      this.startupAutoRetryAbandon = this.parseStartupAutoRetryAbandon(
+        parsed.startupAutoRetryAbandon
+      );
+      this.retryManager.setEnabled(enabled);
+      return enabled;
+    } catch (error) {
+      // Missing preference file is the default path. Use any legacy frontend hint
+      // (captured at onChat subscribe time) before falling back to enabled.
+      const errno =
+        typeof error === "object" && error !== null && "code" in error
+          ? (error as { code?: unknown }).code
+          : undefined;
+      const defaultEnabled =
+        errno === "ENOENT" && this.legacyAutoRetryEnabledHint === false ? false : true;
+
+      this.autoRetryEnabledPreference = defaultEnabled;
+      this.legacyAutoRetryEnabledHint = null;
+      this.startupAutoRetryAbandon = null;
+      this.retryManager.setEnabled(defaultEnabled);
+
+      if (errno === "ENOENT" && defaultEnabled === false) {
+        // Persist migrated legacy opt-out so restart behavior no longer depends
+        // on renderer localStorage keys.
+        await this.persistAutoRetryState();
+      } else if (errno !== "ENOENT") {
+        log.warn("Failed to load auto-retry preference; defaulting to enabled", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+
+      return defaultEnabled;
+    }
+  }
+
+  private async persistAutoRetryState(): Promise<void> {
+    const preferencePath = this.getAutoRetryPreferencePath();
+    const enabled = this.autoRetryEnabledPreference !== false;
+    const hasStartupAbandonState = this.startupAutoRetryAbandon !== null;
+
+    if (enabled && !hasStartupAbandonState) {
+      try {
+        await unlink(preferencePath);
+      } catch (error) {
+        const errno =
+          typeof error === "object" && error !== null && "code" in error
+            ? (error as { code?: unknown }).code
+            : undefined;
+        if (errno !== "ENOENT") {
+          log.debug("Failed to clear auto-retry preference file", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+      return;
+    }
+
+    const payload: {
+      enabled?: false;
+      startupAutoRetryAbandon?: { reason: string; userMessageId?: string };
+    } = {};
+
+    if (!enabled) {
+      payload.enabled = false;
+    }
+
+    if (this.startupAutoRetryAbandon) {
+      payload.startupAutoRetryAbandon = this.startupAutoRetryAbandon;
+    }
+
+    try {
+      await mkdir(path.dirname(preferencePath), { recursive: true });
+      await writeFile(preferencePath, JSON.stringify(payload) + "\n", "utf-8");
+    } catch (error) {
+      log.warn("Failed to persist auto-retry preference", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async persistAutoRetryEnabledPreference(enabled: boolean): Promise<void> {
+    this.autoRetryEnabledPreference = enabled;
+    await this.persistAutoRetryState();
+  }
+
+  private async persistStartupAutoRetryAbandon(
+    reason: string,
+    userMessageId?: string
+  ): Promise<void> {
+    this.startupAutoRetryAbandon = {
+      reason,
+      ...(userMessageId ? { userMessageId } : {}),
+    };
+    await this.persistAutoRetryState();
+  }
+
+  private async clearStartupAutoRetryAbandon(): Promise<void> {
+    if (this.startupAutoRetryAbandon === null) {
+      return;
+    }
+
+    this.startupAutoRetryAbandon = null;
+    await this.persistAutoRetryState();
+  }
+
+  private async updateStartupAutoRetryAbandonFromFailure(
+    errorType: string,
+    userMessageId?: string
+  ): Promise<void> {
+    if (
+      isNonRetryableSendError({ type: errorType }) ||
+      isNonRetryableStreamError({ type: errorType })
+    ) {
+      await this.persistStartupAutoRetryAbandon(errorType, userMessageId);
+      return;
+    }
+
+    await this.clearStartupAutoRetryAbandon();
+  }
+
+  private async updateStartupAutoRetryAbandonFromAbort(
+    abortReason: StreamAbortReason | undefined,
+    userMessageId?: string
+  ): Promise<void> {
+    // "system" and "startup" aborts come from backend-orchestrated flows
+    // (for example, mid-stream auto-compaction or canceling a pending startup).
+    // They are not user intent and must not poison startup recovery with a
+    // persisted non-retryable "aborted" marker.
+    if (abortReason === "system" || abortReason === "startup") {
+      return;
+    }
+
+    await this.updateStartupAutoRetryAbandonFromFailure("aborted", userMessageId);
+  }
+
+  private isAiStreaming(): boolean {
+    const aiService = this.aiService as Partial<Pick<AIService, "isStreaming">>;
+    if (typeof aiService.isStreaming !== "function") {
+      return false;
+    }
+    return aiService.isStreaming(this.workspaceId);
+  }
+
+  private normalizeStartupModel(model: unknown): string | undefined {
+    if (typeof model !== "string") {
+      return undefined;
+    }
+
+    const trimmed = model.trim();
+    if (trimmed.length === 0) {
+      return undefined;
+    }
+
+    const normalized = normalizeGatewayModel(trimmed);
+    if (!isValidModelFormat(normalized)) {
+      return undefined;
+    }
+
+    return normalized;
+  }
+
+  private normalizeAgentIdForRetry(agentId: unknown): string | undefined {
+    if (typeof agentId !== "string") {
+      return undefined;
+    }
+
+    const normalized = agentId.trim().toLowerCase();
+    if (normalized.length === 0) {
+      return undefined;
+    }
+
+    const parsed = AgentIdSchema.safeParse(normalized);
+    return parsed.success ? parsed.data : undefined;
+  }
+
+  private isPendingAskUserQuestion(message: MuxMessage | null | undefined): boolean {
+    if (!message || message.role !== "assistant") {
+      return false;
+    }
+
+    return message.parts.some(
+      (part) =>
+        part.type === "dynamic-tool" &&
+        part.toolName === "ask_user_question" &&
+        part.state === "input-available"
+    );
+  }
+
+  private isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
+    return (
+      message.role === "user" &&
+      message.metadata?.synthetic === true &&
+      (message.metadata.fileAtMentionSnapshot !== undefined ||
+        message.metadata.agentSkillSnapshot !== undefined)
+    );
+  }
+
+  private getLastNonSystemHistoryMessage(historyTail: MuxMessage[]): MuxMessage | undefined {
+    for (let index = historyTail.length - 1; index >= 0; index -= 1) {
+      const candidate = historyTail[index];
+      if (candidate.role === "system") {
+        continue;
+      }
+      if (this.isSyntheticSnapshotUserMessage(candidate)) {
+        continue;
+      }
+      return candidate;
+    }
+    return undefined;
+  }
+
+  private async getWorkspaceMetadataForRetry(): Promise<WorkspaceMetadata | undefined> {
+    const aiService = this.aiService as Partial<Pick<AIService, "getWorkspaceMetadata">>;
+    if (typeof aiService.getWorkspaceMetadata !== "function") {
+      return undefined;
+    }
+
+    const metadataResult = await aiService.getWorkspaceMetadata(this.workspaceId);
+    if (!metadataResult.success) {
+      return undefined;
+    }
+
+    return metadataResult.data;
+  }
+
+  private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
+    if (message.role !== "user") {
+      return false;
+    }
+
+    if (this.isSyntheticSnapshotUserMessage(message)) {
+      return false;
+    }
+
+    // Include UI-visible synthetic rows (e.g., crash-recovered compaction follow-ups)
+    // so retries continue the most recent pending user intent.
+    if (message.metadata?.synthetic === true) {
+      return (
+        message.metadata?.uiVisible === true ||
+        isCompactionRequestMetadata(message.metadata?.muxMetadata)
+      );
+    }
+
+    return true;
+  }
+
+  private async deriveStartupAutoRetryOptions(params: {
+    partial: MuxMessage | null;
+    historyTail: MuxMessage[];
+  }): Promise<SendMessageOptions | undefined> {
+    const lastUserMessage = [...params.historyTail]
+      .reverse()
+      .find((message): message is MuxMessage & { role: "user" } =>
+        this.shouldUseUserMessageForRetry(message)
+      );
+
+    const lastAssistantMessage =
+      params.partial?.role === "assistant"
+        ? params.partial
+        : [...params.historyTail]
+            .reverse()
+            .find(
+              (message): message is MuxMessage & { role: "assistant" } =>
+                message.role === "assistant"
+            );
+
+    const workspaceMetadata = await this.getWorkspaceMetadataForRetry();
+
+    const persistedRetrySendOptions = lastUserMessage?.metadata?.retrySendOptions;
+
+    const workspaceAgentId =
+      this.normalizeAgentIdForRetry(workspaceMetadata?.agentId ?? workspaceMetadata?.agentType) ??
+      WORKSPACE_DEFAULTS.agentId;
+    const persistedAgentId = this.normalizeAgentIdForRetry(persistedRetrySendOptions?.agentId);
+    const assistantAgentId = this.normalizeAgentIdForRetry(lastAssistantMessage?.metadata?.agentId);
+    const baseAgentId = persistedAgentId ?? assistantAgentId ?? workspaceAgentId;
+
+    const agentSettings =
+      workspaceMetadata?.aiSettingsByAgent?.[baseAgentId] ??
+      workspaceMetadata?.aiSettingsByAgent?.[workspaceAgentId] ??
+      workspaceMetadata?.aiSettings;
+    const compactSettings = workspaceMetadata?.aiSettingsByAgent?.compact;
+
+    const persistedModel = this.normalizeStartupModel(persistedRetrySendOptions?.model);
+    const baseModel =
+      persistedModel ??
+      this.normalizeStartupModel(lastAssistantMessage?.metadata?.model) ??
+      this.normalizeStartupModel(agentSettings?.model) ??
+      DEFAULT_MODEL;
+
+    const persistedThinkingLevel = coerceThinkingLevel(persistedRetrySendOptions?.thinkingLevel);
+    const baseThinkingLevel =
+      persistedThinkingLevel ??
+      coerceThinkingLevel(lastAssistantMessage?.metadata?.thinkingLevel) ??
+      coerceThinkingLevel(agentSettings?.thinkingLevel);
+
+    const persistedSystem1ThinkingLevel = coerceThinkingLevel(
+      persistedRetrySendOptions?.system1ThinkingLevel
+    );
+    const persistedSystem1Model = this.normalizeStartupModel(
+      persistedRetrySendOptions?.system1Model
+    );
+
+    const persistedToolPolicy =
+      lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy;
+    const persistedDisableWorkspaceAgents =
+      lastUserMessage?.metadata?.disableWorkspaceAgents ??
+      persistedRetrySendOptions?.disableWorkspaceAgents;
+    const persistedAdditionalSystemInstructions =
+      persistedRetrySendOptions?.additionalSystemInstructions;
+    const persistedMaxOutputTokens =
+      typeof persistedRetrySendOptions?.maxOutputTokens === "number"
+        ? persistedRetrySendOptions.maxOutputTokens
+        : undefined;
+    const persistedProviderOptions = persistedRetrySendOptions?.providerOptions;
+    const persistedExperiments = persistedRetrySendOptions?.experiments;
+
+    const lastUserMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
+    if (isCompactionRequestMetadata(lastUserMuxMetadata)) {
+      const compactionModel =
+        this.normalizeStartupModel(lastUserMuxMetadata.parsed.model) ?? baseModel;
+      const requestedThinkingLevel =
+        baseThinkingLevel ?? coerceThinkingLevel(compactSettings?.thinkingLevel) ?? "off";
+
+      const compactionOptions: SendMessageOptions = {
+        model: compactionModel,
+        agentId: "compact",
+        thinkingLevel: enforceThinkingPolicy(compactionModel, requestedThinkingLevel),
+        maxOutputTokens:
+          typeof lastUserMuxMetadata.parsed.maxOutputTokens === "number"
+            ? lastUserMuxMetadata.parsed.maxOutputTokens
+            : persistedMaxOutputTokens,
+        toolPolicy: [{ regex_match: ".*", action: "disable" }],
+        skipAiSettingsPersistence: true,
+        disableWorkspaceAgents: persistedDisableWorkspaceAgents,
+      };
+
+      if (persistedAdditionalSystemInstructions !== undefined) {
+        compactionOptions.additionalSystemInstructions = persistedAdditionalSystemInstructions;
+      }
+      if (persistedProviderOptions) {
+        compactionOptions.providerOptions = persistedProviderOptions;
+      }
+      if (persistedExperiments) {
+        compactionOptions.experiments = persistedExperiments;
+      }
+      if (persistedSystem1ThinkingLevel) {
+        compactionOptions.system1ThinkingLevel = persistedSystem1ThinkingLevel;
+      }
+      if (persistedSystem1Model) {
+        compactionOptions.system1Model = persistedSystem1Model;
+      }
+
+      return compactionOptions;
+    }
+
+    const retryOptions: SendMessageOptions = {
+      model: baseModel,
+      agentId: baseAgentId,
+    };
+    if (baseThinkingLevel) {
+      retryOptions.thinkingLevel = baseThinkingLevel;
+    }
+    if (persistedSystem1ThinkingLevel) {
+      retryOptions.system1ThinkingLevel = persistedSystem1ThinkingLevel;
+    }
+    if (persistedSystem1Model) {
+      retryOptions.system1Model = persistedSystem1Model;
+    }
+    if (persistedToolPolicy) {
+      retryOptions.toolPolicy = persistedToolPolicy;
+    }
+    if (persistedAdditionalSystemInstructions !== undefined) {
+      retryOptions.additionalSystemInstructions = persistedAdditionalSystemInstructions;
+    }
+    if (persistedMaxOutputTokens !== undefined) {
+      retryOptions.maxOutputTokens = persistedMaxOutputTokens;
+    }
+    if (persistedProviderOptions) {
+      retryOptions.providerOptions = persistedProviderOptions;
+    }
+    if (persistedExperiments) {
+      retryOptions.experiments = persistedExperiments;
+    }
+    if (typeof persistedDisableWorkspaceAgents === "boolean") {
+      retryOptions.disableWorkspaceAgents = persistedDisableWorkspaceAgents;
+    }
+
+    return retryOptions;
+  }
+
+  async getStartupAutoRetryModelHint(): Promise<string | null> {
+    this.assertNotDisposed("getStartupAutoRetryModelHint");
+
+    if (this.lastAutoRetryOptions?.model) {
+      return this.lastAutoRetryOptions.model;
+    }
+
+    const [partial, historyResult] = await Promise.all([
+      this.historyService.readPartial(this.workspaceId),
+      this.historyService.getLastMessages(this.workspaceId, 20),
+    ]);
+    if (!historyResult.success) {
+      return null;
+    }
+
+    if (partial && this.isPendingAskUserQuestion(partial)) {
+      return null;
+    }
+
+    const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
+    const interruptedByPartial = partial?.role === "assistant";
+    const interruptedByHistory =
+      lastHistoryMessage?.role === "user" ||
+      (lastHistoryMessage?.role === "assistant" &&
+        lastHistoryMessage.metadata?.partial === true &&
+        !this.isPendingAskUserQuestion(lastHistoryMessage));
+
+    if (!interruptedByPartial && !interruptedByHistory) {
+      return null;
+    }
+
+    const retryOptions = await this.deriveStartupAutoRetryOptions({
+      partial,
+      historyTail: historyResult.data,
+    });
+    return retryOptions?.model ?? null;
+  }
+
+  private resetStartupAutoRetryHistoryReadBackoff(): void {
+    this.startupAutoRetryHistoryReadFailureCount = 0;
+    this.startupAutoRetryDeferredRetryDelayMs = 0;
+  }
+
+  private markStartupAutoRetryHistoryReadFailure(): void {
+    this.startupAutoRetryHistoryReadFailureCount += 1;
+    const attempt = this.startupAutoRetryHistoryReadFailureCount - 1;
+    const exponentialDelay =
+      STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS * 2 ** Math.max(0, attempt);
+    this.startupAutoRetryDeferredRetryDelayMs = Math.min(
+      exponentialDelay,
+      STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS
+    );
+  }
+
+  private async scheduleStartupAutoRetryIfNeeded(): Promise<StartupAutoRetryCheckOutcome> {
+    if (this.disposed || this.isBusy() || this.isAiStreaming()) {
+      // Busy/streaming deferrals are state-driven; do not carry history-error backoff.
+      this.startupAutoRetryDeferredRetryDelayMs = 0;
+      return "deferred";
+    }
+
+    const autoRetryEnabled = await this.loadAutoRetryEnabledPreference();
+    if (!autoRetryEnabled) {
+      this.resetStartupAutoRetryHistoryReadBackoff();
+      return "completed";
+    }
+
+    const [partial, historyResult] = await Promise.all([
+      this.historyService.readPartial(this.workspaceId),
+      this.historyService.getLastMessages(this.workspaceId, 20),
+    ]);
+
+    if (!historyResult.success) {
+      this.markStartupAutoRetryHistoryReadFailure();
+      log.warn("Failed to inspect history for startup auto-retry", {
+        workspaceId: this.workspaceId,
+        error: historyResult.error,
+        retryDelayMs: this.startupAutoRetryDeferredRetryDelayMs,
+        consecutiveHistoryReadFailures: this.startupAutoRetryHistoryReadFailureCount,
+      });
+      return "deferred";
+    }
+
+    this.resetStartupAutoRetryHistoryReadBackoff();
+
+    if (partial && this.isPendingAskUserQuestion(partial)) {
+      return "completed";
+    }
+
+    const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
+    const interruptedByPartial = partial?.role === "assistant";
+    const interruptedByHistory =
+      lastHistoryMessage?.role === "user" ||
+      (lastHistoryMessage?.role === "assistant" &&
+        lastHistoryMessage.metadata?.partial === true &&
+        !this.isPendingAskUserQuestion(lastHistoryMessage));
+
+    if (!interruptedByPartial && !interruptedByHistory) {
+      return "completed";
+    }
+
+    const startupRetryUserMessage = [...historyResult.data]
+      .reverse()
+      .find((message): message is MuxMessage & { role: "user" } =>
+        this.shouldUseUserMessageForRetry(message)
+      );
+
+    if (this.startupAutoRetryAbandon) {
+      const abandonReason = this.startupAutoRetryAbandon.reason;
+      const abandonMatchesCurrentTail =
+        this.startupAutoRetryAbandon.userMessageId === undefined ||
+        this.startupAutoRetryAbandon.userMessageId === startupRetryUserMessage?.id;
+
+      if (
+        abandonMatchesCurrentTail &&
+        (isNonRetryableSendError({ type: abandonReason }) ||
+          isNonRetryableStreamError({ type: abandonReason }))
+      ) {
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: abandonReason });
+        return "completed";
+      }
+    }
+
+    const retryOptions =
+      this.lastAutoRetryOptions ??
+      (await this.deriveStartupAutoRetryOptions({
+        partial,
+        historyTail: historyResult.data,
+      }));
+
+    if (!retryOptions) {
+      this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
+      return "completed";
+    }
+
+    // Disk reads above may race with user actions; retry once the current work settles
+    // instead of permanently suppressing startup auto-retry for this session.
+    if (this.disposed || this.isBusy() || this.isAiStreaming()) {
+      this.startupAutoRetryDeferredRetryDelayMs = 0;
+      return "deferred";
+    }
+
+    this.lastAutoRetryOptions = retryOptions;
+    await this.handleStreamFailureForAutoRetry({
+      type: "unknown",
+      message: "startup_interrupted_stream",
+    });
+    return "completed";
+  }
+
+  private async waitForStartupAutoRetryRerunWindow(retryDelayMs = 0): Promise<void> {
+    const delayMs = Math.max(0, Math.trunc(retryDelayMs));
+    if (delayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      if (this.disposed) {
+        return;
+      }
+    }
+
+    while (!this.disposed) {
+      await this.waitForIdle();
+      if (!this.isAiStreaming()) {
+        return;
+      }
+
+      await new Promise<void>((resolve) => {
+        const maybeResolve = (...args: unknown[]) => {
+          const [payload] = args;
+          if (
+            typeof payload === "object" &&
+            payload !== null &&
+            "workspaceId" in payload &&
+            (payload as { workspaceId: unknown }).workspaceId !== this.workspaceId
+          ) {
+            return;
+          }
+
+          if (this.disposed || !this.isAiStreaming()) {
+            cleanup();
+            resolve();
+          }
+        };
+
+        const cleanup = () => {
+          this.aiService.off("stream-end", maybeResolve as never);
+          this.aiService.off("stream-abort", maybeResolve as never);
+          this.aiService.off("error", maybeResolve as never);
+        };
+
+        this.aiService.on("stream-end", maybeResolve as never);
+        this.aiService.on("stream-abort", maybeResolve as never);
+        this.aiService.on("error", maybeResolve as never);
+
+        // Defensive: stream state may have changed between waitForIdle() and listener setup.
+        maybeResolve({ workspaceId: this.workspaceId });
+      });
+    }
+  }
+
+  ensureStartupAutoRetryCheck(): void {
+    if (this.disposed || this.startupAutoRetryCheckScheduled || this.startupAutoRetryCheckPromise) {
+      return;
+    }
+
+    let rerunWhenIdle = false;
+
+    this.startupAutoRetryCheckPromise = this.scheduleStartupAutoRetryIfNeeded()
+      .then((outcome) => {
+        if (outcome === "deferred") {
+          this.startupAutoRetryCheckScheduled = false;
+          rerunWhenIdle = true;
+          return;
+        }
+
+        this.startupAutoRetryCheckScheduled = true;
+      })
+      .catch((error: unknown) => {
+        this.startupAutoRetryCheckScheduled = true;
+        log.warn("Startup auto-retry check failed", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        this.startupAutoRetryCheckPromise = null;
+
+        if (!rerunWhenIdle || this.disposed) {
+          return;
+        }
+
+        const rerunDelayMs = this.startupAutoRetryDeferredRetryDelayMs;
+        this.startupAutoRetryDeferredRetryDelayMs = 0;
+
+        void this.waitForStartupAutoRetryRerunWindow(rerunDelayMs).then(() => {
+          if (!this.disposed) {
+            this.ensureStartupAutoRetryCheck();
+          }
+        });
+      });
+  }
+
+  scheduleStartupRecovery(): void {
+    if (this.disposed || this.startupRecoveryScheduled || this.startupRecoveryPromise) {
+      return;
+    }
+
+    // Crash recovery: check if the last message is a compaction summary with
+    // a pending follow-up that was never dispatched. If so, dispatch it now.
+    // This handles the case where the app crashed after compaction completed
+    // but before the follow-up was sent.
+    this.startupRecoveryPromise = this.dispatchPendingFollowUp()
+      .then(() => {
+        this.startupRecoveryScheduled = true;
+      })
+      .catch((error) => {
+        this.startupRecoveryScheduled = false;
+        log.warn("Failed to dispatch pending follow-up during startup recovery", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        this.startupRecoveryPromise = null;
+        this.ensureStartupAutoRetryCheck();
+      });
   }
 
   private async emitHistoricalEvents(
@@ -707,6 +1567,16 @@ export class AgentSession {
         },
       });
 
+      // Rehydrate pending auto-retry countdown state on reconnect/reload so
+      // RetryBarrier keeps showing "Stop" while a backend timer is already armed.
+      const pendingRetrySnapshot = this.retryManager.getScheduledStatusSnapshot();
+      if (pendingRetrySnapshot) {
+        listener({
+          workspaceId: this.workspaceId,
+          message: pendingRetrySnapshot,
+        });
+      }
+
       // Send caught-up after ALL historical data (including init events)
       // This signals frontend that replay is complete and future events are real-time
       listener({
@@ -977,7 +1847,7 @@ export class AgentSession {
     // toolPolicy is properly typed via Zod schema inference
     const typedToolPolicy = options?.toolPolicy;
     // muxMetadata is z.any() in schema - cast to proper type
-    const typedMuxMetadata = options?.muxMetadata as MuxFrontendMetadata | undefined;
+    const typedMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
     const isCompactionRequest = isCompactionRequestMetadata(typedMuxMetadata);
 
     // Validate model BEFORE persisting message to prevent orphaned messages on invalid model
@@ -994,10 +1864,8 @@ export class AgentSession {
 
     // Preserve explicit mux-gateway prefixes from legacy clients so backend routing can
     // honor the opt-in even before muxGatewayModels has synchronized.
-    const modelForStream = rawModelString.startsWith("mux-gateway:")
-      ? rawModelString
-      : options.model;
-    const optionsForStream = rawSystem1Model?.startsWith("mux-gateway:")
+    let modelForStream = rawModelString.startsWith("mux-gateway:") ? rawModelString : options.model;
+    let optionsForStream = rawSystem1Model?.startsWith("mux-gateway:")
       ? { ...options, system1Model: rawSystem1Model }
       : options;
 
@@ -1058,6 +1926,8 @@ export class AgentSession {
       {
         timestamp: Date.now(),
         toolPolicy: typedToolPolicy,
+        disableWorkspaceAgents: options?.disableWorkspaceAgents,
+        retrySendOptions: pickStartupRetrySendOptions(optionsForStream),
         muxMetadata: typedMuxMetadata, // Pass through frontend metadata as black-box
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && { synthetic: true, uiVisible: true }),
@@ -1080,9 +1950,100 @@ export class AgentSession {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
 
-    // Persist snapshots (if any) BEFORE the user message so they precede it in the prompt.
-    // Order matters: @file snapshot first, then agent-skill snapshot.
-    if (snapshotResult?.snapshotMessage) {
+    // Check compaction threshold BEFORE persisting the user message.
+    // Note: snapshots are materialized above, but persistence is deferred until after
+    // this decision so on-send compaction can run against the pre-turn context.
+    // Persisting snapshots too early can bloat the compaction request context and
+    // make compaction itself fail near the context limit.
+    // If on-send compaction is needed, we skip persisting the user's message now — it becomes
+    // the follow-up content sent after compaction completes. This avoids duplicating the user
+    // turn in model context (the compaction would otherwise summarize a transcript that already
+    // contains the new prompt, then replay it again post-compaction).
+    let autoCompactionMessage: MuxMessage | null = null;
+    if (!isCompactionRequest && !editMessageId) {
+      // Seed usage state from persisted history on the first send after restart
+      // so the compaction monitor can detect context limits even before any live
+      // stream events have populated lastUsageState.
+      await this.seedUsageStateFromHistory();
+
+      const providersConfigForCompaction = this.getProvidersConfigForCompaction();
+      const compactionResult = this.compactionMonitor.checkBeforeSend({
+        model: modelForStream,
+        usage: this.getUsageState(),
+        use1MContext: this.is1MContextEnabledForModel(modelForStream, optionsForStream),
+        providersConfig: providersConfigForCompaction,
+      });
+
+      // On-send compaction uses the configured threshold directly so we compact
+      // before dispatching a risky user turn near the context limit.
+      // `shouldForceCompact` remains a stricter (threshold + buffer) signal for
+      // mid-stream forcing where we want to avoid abrupt interruptions too early.
+      const shouldCompactBeforeSend =
+        compactionResult.usagePercentage >= compactionResult.thresholdPercentage;
+      if (shouldCompactBeforeSend) {
+        const followUpFileParts = effectiveFileParts?.map((part) => ({
+          url: part.url,
+          mediaType: part.mediaType,
+          filename: part.filename,
+        }));
+
+        const followUpContent = this.buildAutoCompactionFollowUp({
+          messageText: message,
+          options: optionsForStream,
+          modelForStream,
+          fileParts: followUpFileParts,
+          muxMetadata: typedMuxMetadata,
+        });
+
+        const autoCompactionRequest = this.buildAutoCompactionRequest({
+          followUpContent,
+          baseOptions: optionsForStream,
+          reason: "on-send",
+        });
+
+        autoCompactionMessage = createMuxMessage(
+          createUserMessageId(),
+          "user",
+          autoCompactionRequest.messageText,
+          {
+            timestamp: Date.now(),
+            toolPolicy: autoCompactionRequest.sendOptions.toolPolicy,
+            disableWorkspaceAgents: optionsForStream.disableWorkspaceAgents,
+            retrySendOptions: pickStartupRetrySendOptions(autoCompactionRequest.sendOptions),
+            muxMetadata: autoCompactionRequest.metadata,
+            synthetic: true,
+            uiVisible: true,
+          }
+        );
+
+        // Persist compaction request (NOT the user message — it's the follow-up)
+        const appendCompactionResult = await this.historyService.appendToHistory(
+          this.workspaceId,
+          autoCompactionMessage
+        );
+        if (!appendCompactionResult.success) {
+          return Err(createUnknownSendMessageError(appendCompactionResult.error));
+        }
+
+        this.emitChatEvent({
+          type: "auto-compaction-triggered",
+          reason: "on-send",
+          usagePercent: Math.round(compactionResult.usagePercentage),
+        });
+
+        modelForStream = autoCompactionRequest.sendOptions.model;
+        optionsForStream = {
+          ...autoCompactionRequest.sendOptions,
+          muxMetadata: autoCompactionRequest.metadata,
+        };
+      }
+    }
+
+    // Persist snapshots only when this turn will be sent immediately.
+    // On on-send compaction paths, snapshots are deferred with the follow-up turn.
+    const shouldPersistTurnSnapshots = autoCompactionMessage === null;
+
+    if (shouldPersistTurnSnapshots && snapshotResult?.snapshotMessage) {
       const snapshotAppendResult = await this.historyService.appendToHistory(
         this.workspaceId,
         snapshotResult.snapshotMessage
@@ -1092,7 +2053,7 @@ export class AgentSession {
       }
     }
 
-    if (skillSnapshotResult?.snapshotMessage) {
+    if (shouldPersistTurnSnapshots && skillSnapshotResult?.snapshotMessage) {
       const skillSnapshotAppendResult = await this.historyService.appendToHistory(
         this.workspaceId,
         skillSnapshotResult.snapshotMessage
@@ -1102,12 +2063,16 @@ export class AgentSession {
       }
     }
 
-    const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
-    if (!appendResult.success) {
-      // Note: If we get here with snapshots, one or more snapshots may already be persisted but user message
-      // failed. This is a rare edge case (disk full mid-operation). The next edit will clean up
-      // the orphan via the truncation logic that removes preceding snapshots.
-      return Err(createUnknownSendMessageError(appendResult.error));
+    // When on-send compaction triggers, the user message is NOT persisted to history
+    // (it's sent as follow-up after compaction). Otherwise, persist normally.
+    if (!autoCompactionMessage) {
+      const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
+      if (!appendResult.success) {
+        // Note: If we get here with snapshots, one or more snapshots may already be persisted but user message
+        // failed. This is a rare edge case (disk full mid-operation). The next edit will clean up
+        // the orphan via the truncation logic that removes preceding snapshots.
+        return Err(createUnknownSendMessageError(appendResult.error));
+      }
     }
 
     // Workspace may be tearing down while we await filesystem IO.
@@ -1116,24 +2081,47 @@ export class AgentSession {
       return Ok(undefined);
     }
 
-    // Emit snapshots first (if any), then user message - maintains prompt ordering in UI
-    if (snapshotResult?.snapshotMessage) {
+    // Emit snapshots only for immediately-sent turns. On on-send compaction paths,
+    // snapshots are deferred with the follow-up message to avoid duplicate ephemeral
+    // snapshot rows that were never persisted.
+    if (shouldPersistTurnSnapshots && snapshotResult?.snapshotMessage) {
       this.emitChatEvent({ ...snapshotResult.snapshotMessage, type: "message" });
     }
 
-    if (skillSnapshotResult?.snapshotMessage) {
+    if (shouldPersistTurnSnapshots && skillSnapshotResult?.snapshotMessage) {
       this.emitChatEvent({ ...skillSnapshotResult.snapshotMessage, type: "message" });
     }
 
-    // Add type: "message" for discriminated union (createMuxMessage doesn't add it)
-    this.emitChatEvent({ ...userMessage, type: "message" });
+    // When on-send compaction triggers, the original user message is NOT emitted now —
+    // it was not persisted and will be dispatched (persisted + emitted) as a follow-up
+    // after compaction completes. Emitting it here would cause a duplicate in the
+    // live transcript once the follow-up path re-sends the same text.
+    if (autoCompactionMessage) {
+      this.emitChatEvent({ ...autoCompactionMessage, type: "message" });
+    } else {
+      this.emitChatEvent({ ...userMessage, type: "message" });
+    }
+
+    // Only explicit user sends should reset auto-retry intent, and only after the
+    // send has passed validation + been accepted into history.
+    // Synthetic/system sends (mid-stream compaction, task recovery prompts, etc.)
+    // must not silently opt users back into auto-retry after they've disabled it.
+    if (internal?.synthetic !== true) {
+      // A fresh accepted user send supersedes any persisted startup-abandon
+      // classification from previous turns.
+      await this.clearStartupAutoRetryAbandon();
+      this.retryManager.cancel();
+      this.retryManager.setEnabled(true);
+      await this.persistAutoRetryEnabledPreference(true);
+    }
 
     this.setTurnPhase(TurnPhase.PREPARING);
 
     try {
-      // If this is a compaction request, terminate background processes first
-      // They won't be included in the summary, so continuing with orphaned processes would be confusing
-      if (isCompactionRequest && !this.keepBackgroundProcesses) {
+      // If this is a compaction request, terminate background processes first.
+      // They won't be included in the summary, so continuing with orphaned processes would be confusing.
+      const isCompactionStreamRequest = isCompactionRequest || autoCompactionMessage !== null;
+      if (isCompactionStreamRequest && !this.keepBackgroundProcesses) {
         await this.backgroundProcessManager.cleanup(this.workspaceId);
 
         if (this.disposed) {
@@ -1161,7 +2149,9 @@ export class AgentSession {
     }
   }
 
-  async resumeStream(options: SendMessageOptions): Promise<Result<void, SendMessageError>> {
+  async resumeStream(
+    options: SendMessageOptions
+  ): Promise<Result<{ started: boolean }, SendMessageError>> {
     this.assertNotDisposed("resumeStream");
 
     assert(options, "resumeStream requires options");
@@ -1184,7 +2174,7 @@ export class AgentSession {
     // Guard against auto-retry starting a second stream while the initial send is
     // still waiting for init hooks to complete (or while completion cleanup is running).
     if (this.isBusy()) {
-      return Ok(undefined);
+      return Ok({ started: false });
     }
 
     this.setTurnPhase(TurnPhase.PREPARING);
@@ -1192,11 +2182,373 @@ export class AgentSession {
       // Must await here so the finally block runs after streaming completes,
       // not immediately when the Promise is returned.
       const result = await this.streamWithHistory(modelForStream, optionsForStream);
-      return result;
+      if (!result.success) {
+        return result;
+      }
+
+      return Ok({ started: true });
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
         this.setTurnPhase(TurnPhase.IDLE);
       }
+    }
+  }
+
+  async setAutoRetryEnabled(
+    enabled: boolean,
+    options?: { persist?: boolean }
+  ): Promise<{ previousEnabled: boolean; enabled: boolean }> {
+    this.assertNotDisposed("setAutoRetryEnabled");
+    assert(typeof enabled === "boolean", "setAutoRetryEnabled requires a boolean");
+
+    const previousEnabled = await this.loadAutoRetryEnabledPreference();
+
+    this.retryManager.setEnabled(enabled);
+    if (!enabled) {
+      this.retryManager.cancel();
+    }
+
+    if (options?.persist ?? true) {
+      await this.persistAutoRetryEnabledPreference(enabled);
+    }
+
+    return { previousEnabled, enabled };
+  }
+
+  setAutoCompactionThreshold(threshold: number): void {
+    this.assertNotDisposed("setAutoCompactionThreshold");
+    this.compactionMonitor.setThreshold(threshold);
+  }
+
+  private getUsageState(): AutoCompactionUsageState | undefined {
+    return this.lastUsageState;
+  }
+
+  private getProvidersConfigForCompaction(): ProvidersConfigMap | null {
+    try {
+      // Some unit tests provide a minimal Config mock without providers helpers.
+      const maybeConfig = this.config as Config & {
+        loadProvidersConfig?: () => ProvidersConfigMap | null;
+      };
+      if (typeof maybeConfig.loadProvidersConfig !== "function") {
+        return null;
+      }
+
+      const providersConfig = maybeConfig.loadProvidersConfig();
+      if (!providersConfig) {
+        return null;
+      }
+
+      // Compaction limit resolution only reads provider model overrides (models[*].contextWindow*).
+      // Runtime config stores these in providers.jsonc, so the raw config shape is sufficient here.
+      return providersConfig as unknown as ProvidersConfigMap;
+    } catch {
+      // Best-effort read: if config cannot be loaded, keep null and rely on
+      // built-in model limits. This matches prior behavior without crashing.
+      return null;
+    }
+  }
+
+  private is1MContextEnabledForModel(modelString: string, options?: SendMessageOptions): boolean {
+    const normalizedModel = normalizeGatewayModel(modelString);
+    if (!supports1MContext(normalizedModel)) {
+      return false;
+    }
+
+    const anthropicOptions = options?.providerOptions?.anthropic;
+    if (!anthropicOptions) {
+      return false;
+    }
+
+    return (
+      anthropicOptions.use1MContext === true ||
+      anthropicOptions.use1MContextModels?.includes(normalizedModel) === true ||
+      anthropicOptions.use1MContextModels?.includes(modelString) === true
+    );
+  }
+
+  private updateUsageStateFromModelUsage(params: {
+    model: string;
+    usage: LanguageModelV2Usage | undefined;
+    providerMetadata?: Record<string, unknown>;
+    live: boolean;
+  }): void {
+    if (!params.usage) {
+      return;
+    }
+
+    const usageForDisplay = createDisplayUsage(params.usage, params.model, params.providerMetadata);
+    if (!usageForDisplay) {
+      return;
+    }
+
+    const totalTokens = params.usage.totalTokens ?? this.lastUsageState?.totalTokens;
+    if (params.live) {
+      this.lastUsageState = {
+        ...this.lastUsageState,
+        liveUsage: usageForDisplay,
+        totalTokens,
+      };
+      return;
+    }
+
+    this.lastUsageState = {
+      ...this.lastUsageState,
+      lastContextUsage: usageForDisplay,
+      liveUsage: undefined,
+      totalTokens,
+    };
+  }
+
+  private clearLiveUsageState(): void {
+    if (!this.lastUsageState?.liveUsage) {
+      return;
+    }
+
+    this.lastUsageState = {
+      ...this.lastUsageState,
+      liveUsage: undefined,
+    };
+  }
+
+  /**
+   * Seed `lastUsageState` from persisted history so the compaction monitor
+   * can trigger on-send compaction even when no live stream has occurred yet
+   * (e.g., after an app restart). Walks the last N messages backwards to find
+   * the most recent assistant message carrying `contextUsage` metadata.
+   *
+   * This is a lazy one-shot: called from `sendMessage` only when
+   * `lastUsageState` is still undefined.
+   */
+  private async seedUsageStateFromHistory(): Promise<void> {
+    if (this.lastUsageState !== undefined) {
+      return;
+    }
+
+    try {
+      // Seed from the active compaction epoch only. Using a generic tail read can
+      // accidentally pull context usage from pre-boundary assistant rows after
+      // compaction, which makes post-compaction turns immediately re-compact.
+      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+        this.workspaceId
+      );
+      if (!historyResult.success) {
+        return;
+      }
+
+      // Walk backwards to find the most recent message with contextUsage.
+      for (let i = historyResult.data.length - 1; i >= 0; i--) {
+        const msg = historyResult.data[i];
+        const meta = msg.metadata;
+        if (!meta?.contextUsage || !meta.model) {
+          continue;
+        }
+
+        this.updateUsageStateFromModelUsage({
+          model: meta.model,
+          usage: meta.contextUsage,
+          providerMetadata: meta.contextProviderMetadata ?? meta.providerMetadata,
+          live: false,
+        });
+        return;
+      }
+    } catch {
+      // Best-effort: seeding is an optimization so the compaction monitor
+      // works after restart. If it fails, the first live stream-end will
+      // populate lastUsageState and compaction kicks in from then on.
+    }
+  }
+
+  private buildAutoCompactionFollowUp(params: {
+    messageText: string;
+    options: SendMessageOptions;
+    modelForStream: string;
+    fileParts?: FilePart[];
+    muxMetadata?: MuxMessageMetadata;
+  }): CompactionFollowUpRequest {
+    const followUp: CompactionFollowUpRequest = {
+      text: params.messageText,
+      model: params.modelForStream,
+      agentId: params.options.agentId,
+      ...pickPreservedSendOptions(params.options),
+    };
+
+    if (params.fileParts && params.fileParts.length > 0) {
+      followUp.fileParts = params.fileParts;
+    }
+
+    if (params.muxMetadata) {
+      followUp.muxMetadata = params.muxMetadata;
+    }
+
+    return followUp;
+  }
+
+  private getPreferredCompactionModel(): string | null {
+    try {
+      const maybeConfig = this.config as Config & {
+        loadConfigOrDefault?: () => { preferredCompactionModel?: string } | null;
+      };
+      if (typeof maybeConfig.loadConfigOrDefault !== "function") {
+        return null;
+      }
+
+      const preferredCompactionModel = maybeConfig.loadConfigOrDefault()?.preferredCompactionModel;
+      if (typeof preferredCompactionModel !== "string") {
+        return null;
+      }
+
+      const normalized = normalizeGatewayModel(preferredCompactionModel.trim());
+      if (!isValidModelFormat(normalized)) {
+        return null;
+      }
+
+      return normalized;
+    } catch {
+      return null;
+    }
+  }
+
+  private buildAutoCompactionRequest(params: {
+    followUpContent: CompactionFollowUpRequest;
+    baseOptions: SendMessageOptions;
+    reason: "on-send" | "mid-stream";
+  }): {
+    messageText: string;
+    metadata: MuxMessageMetadata;
+    sendOptions: SendMessageOptions;
+  } {
+    const compactionModel = this.getPreferredCompactionModel() ?? params.baseOptions.model;
+    assert(
+      typeof compactionModel === "string" && compactionModel.trim().length > 0,
+      "auto-compaction requires a non-empty model"
+    );
+
+    const sendOptions: SendMessageOptions = {
+      ...params.baseOptions,
+      agentId: "compact",
+      skipAiSettingsPersistence: true,
+      model: compactionModel,
+      thinkingLevel: enforceThinkingPolicy(
+        compactionModel,
+        params.baseOptions.thinkingLevel ?? "off"
+      ),
+      maxOutputTokens: undefined,
+      toolPolicy: [{ regex_match: ".*", action: "disable" }],
+    };
+
+    const messageText = buildCompactionMessageText({ followUpContent: params.followUpContent });
+
+    const metadata: MuxMessageMetadata = {
+      type: "compaction-request",
+      rawCommand: "/compact",
+      commandPrefix: "/compact",
+      parsed: {
+        model: sendOptions.model,
+        followUpContent: params.followUpContent,
+      },
+      requestedModel: sendOptions.model,
+      source: "auto-compaction",
+      displayStatus: {
+        emoji: "🔄",
+        message:
+          params.reason === "on-send"
+            ? "Auto-compacting before sending..."
+            : "Auto-compacting to continue...",
+      },
+    };
+
+    return {
+      messageText,
+      metadata,
+      sendOptions,
+    };
+  }
+
+  private async interruptForCompaction(): Promise<void> {
+    if (this.midStreamCompactionPending || this.disposed) {
+      return;
+    }
+
+    const streamContext = this.activeStreamContext;
+    if (!streamContext?.modelString || !streamContext.options) {
+      return;
+    }
+
+    const interruptedUserMessageId = this.activeStreamUserMessageId;
+
+    this.midStreamCompactionPending = true;
+    try {
+      const stopResult = await this.aiService.stopStream(this.workspaceId, {
+        abortReason: "system",
+      });
+      if (!stopResult.success) {
+        log.warn("Failed to stop stream for mid-stream compaction", {
+          workspaceId: this.workspaceId,
+          error: stopResult.error,
+        });
+        return;
+      }
+
+      await this.waitForIdle();
+      if (this.disposed) {
+        return;
+      }
+
+      const followUpContent = this.buildAutoCompactionFollowUp({
+        // Keep mid-stream auto-compaction on the shared default sentinel so
+        // buildCompactionMessageText can hide the internal resume marker.
+        messageText: "Continue",
+        options: streamContext.options,
+        modelForStream: streamContext.modelString,
+      });
+      const autoCompactionRequest = this.buildAutoCompactionRequest({
+        followUpContent,
+        baseOptions: streamContext.options,
+        reason: "mid-stream",
+      });
+
+      const sendResult = await this.sendMessage(
+        autoCompactionRequest.messageText,
+        {
+          ...autoCompactionRequest.sendOptions,
+          muxMetadata: autoCompactionRequest.metadata,
+        },
+        { synthetic: true }
+      );
+      if (!sendResult.success) {
+        log.warn("Failed to dispatch mid-stream compaction request", {
+          workspaceId: this.workspaceId,
+          error: sendResult.error,
+        });
+
+        const failureType = sendResult.error.type;
+        const handledByNestedSend = this.activeStreamFailureHandled;
+
+        if (!handledByNestedSend) {
+          await this.handleStreamFailureForAutoRetry({
+            type: failureType,
+            message: this.extractRetryFailureMessage(sendResult.error),
+          });
+          await this.updateStartupAutoRetryAbandonFromFailure(
+            failureType,
+            interruptedUserMessageId
+          );
+        }
+
+        if (
+          !handledByNestedSend ||
+          failureType === "runtime_not_ready" ||
+          failureType === "runtime_start_failed"
+        ) {
+          // Mid-stream compaction already interrupted the original turn. Surface the
+          // nested dispatch failure so the user gets an explicit retry/error affordance.
+          const streamError = buildStreamErrorEventData(sendResult.error);
+          this.emitChatEvent(createStreamErrorMessage(streamError));
+        }
+      }
+    } finally {
+      this.midStreamCompactionPending = false;
     }
   }
 
@@ -1219,6 +2571,9 @@ export class AgentSession {
     abandonPartial?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
+
+    // Explicit user interruption should immediately stop any pending auto-retry loop.
+    this.retryManager.cancel();
 
     // For hard interrupts, delete partial BEFORE stopping to prevent abort handler
     // from committing it. For soft interrupts, defer to stream-abort handler since
@@ -1307,13 +2662,20 @@ export class AgentSession {
     }
 
     // Reset per-stream flags (used for retries / crash-safe bookkeeping).
+    this.compactionMonitor.resetForNewStream();
+    this.clearLiveUsageState();
     this.ackPendingPostCompactionStateOnStreamEnd = false;
     this.activeStreamHadAnyDelta = false;
+    this.activeStreamErrorEventReceived = false;
+    this.activeStreamFailureHandled = false;
     this.activeStreamHadPostCompactionInjection = false;
+    this.lastAutoRetryOptions = options;
+    const providersConfigForCompaction = this.getProvidersConfigForCompaction();
     this.activeStreamContext = {
       modelString,
       options,
       openaiTruncationModeOverride,
+      providersConfig: providersConfigForCompaction,
     };
     this.activeStreamUserMessageId = undefined;
 
@@ -1410,14 +2772,30 @@ export class AgentSession {
     });
 
     if (!streamResult.success) {
-      this.activeCompactionRequest = undefined;
+      // Deduplicate failures when AIService already emitted an `error` event for
+      // this stream attempt. attachAiListeners schedules retry via handleStreamError
+      // on that channel; re-handling here would bump attempt/backoff twice.
+      if (this.activeStreamErrorEventReceived) {
+        this.activeStreamFailureHandled = true;
+        return streamResult;
+      }
 
-      // If stream startup failed before any stream events were emitted (e.g., missing API key),
-      // emit a synthetic stream-error so the UI can surface the failure immediately.
-      if (
-        streamResult.error.type !== "runtime_not_ready" &&
-        streamResult.error.type !== "runtime_start_failed"
-      ) {
+      const failureType = streamResult.error.type;
+
+      // Runtime startup failures can happen before any stream events are emitted.
+      // Handle them directly when the `error` channel did not fire.
+      if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
+        this.activeStreamFailureHandled = true;
+        const failedUserMessageId = this.activeStreamUserMessageId;
+        this.activeCompactionRequest = undefined;
+        this.resetActiveStreamState();
+        await this.handleStreamFailureForAutoRetry({
+          type: failureType,
+          message: this.extractRetryFailureMessage(streamResult.error),
+        });
+        await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+      } else {
+        this.activeStreamFailureHandled = true;
         const streamError = buildStreamErrorEventData(streamResult.error);
         await this.handleStreamError(streamError);
       }
@@ -1430,19 +2808,28 @@ export class AgentSession {
     history: MuxMessage[],
     modelString: string,
     options?: SendMessageOptions
-  ): { id: string; modelString: string; options?: SendMessageOptions } | undefined {
+  ):
+    | {
+        id: string;
+        modelString: string;
+        options?: SendMessageOptions;
+        source?: "idle-compaction" | "auto-compaction";
+      }
+    | undefined {
     for (let index = history.length - 1; index >= 0; index -= 1) {
       const message = history[index];
       if (message.role !== "user") {
         continue;
       }
-      if (!isCompactionRequestMetadata(message.metadata?.muxMetadata)) {
+      const muxMetadata = message.metadata?.muxMetadata;
+      if (!isCompactionRequestMetadata(muxMetadata)) {
         return undefined;
       }
       return {
         id: message.id,
         modelString,
         options,
+        source: muxMetadata.source,
       };
     }
     return undefined;
@@ -1999,6 +3386,7 @@ export class AgentSession {
   private async handleStreamError(data: StreamErrorPayload): Promise<void> {
     this.setTurnPhase(TurnPhase.COMPLETING);
 
+    this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
       await this.maybeRetryCompactionOnContextExceeded({
@@ -2028,12 +3416,20 @@ export class AgentSession {
     }
 
     // Terminal error — no retry succeeded
+    const failedUserMessageId = this.activeStreamUserMessageId;
+    const failureType = data.errorType ?? "unknown";
     this.activeCompactionRequest = undefined;
     this.resetActiveStreamState();
 
     if (hadCompactionRequest && !this.disposed) {
       this.clearQueue();
     }
+
+    await this.handleStreamFailureForAutoRetry({
+      type: failureType,
+      message: data.error,
+    });
+    await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
 
     this.emitChatEvent(createStreamErrorMessage(data));
     this.setTurnPhase(TurnPhase.IDLE);
@@ -2110,8 +3506,49 @@ export class AgentSession {
       this.emitChatEvent(payload);
     });
     forward("reasoning-end", (payload) => this.emitChatEvent(payload));
-    forward("usage-delta", (payload) => this.emitChatEvent(payload));
-    forward("stream-abort", (payload) => {
+    forward("usage-delta", async (payload) => {
+      this.emitChatEvent(payload);
+
+      if (payload.type !== "usage-delta") {
+        return;
+      }
+
+      const modelForUsage = this.activeStreamContext?.modelString;
+      if (!modelForUsage) {
+        return;
+      }
+
+      this.updateUsageStateFromModelUsage({
+        model: modelForUsage,
+        usage: payload.usage,
+        providerMetadata: payload.providerMetadata,
+        live: true,
+      });
+
+      // Never recurse compaction while we're already running a compaction request.
+      if (this.activeCompactionRequest || this.midStreamCompactionPending) {
+        return;
+      }
+
+      const streamContext = this.activeStreamContext;
+      const streamOptions = streamContext?.options;
+      const shouldInterruptForCompaction = this.compactionMonitor.checkMidStream({
+        model: modelForUsage,
+        usage: payload.usage,
+        use1MContext: this.is1MContextEnabledForModel(modelForUsage, streamOptions),
+        providersConfig: streamContext?.providersConfig ?? null,
+      });
+
+      if (shouldInterruptForCompaction) {
+        await this.interruptForCompaction();
+      }
+    });
+    forward("stream-abort", async (payload) => {
+      if (payload.type !== "stream-abort") {
+        this.emitChatEvent(payload);
+        return;
+      }
+
       // stopStream() emits synthetic aborts even when no real stream is active
       // (e.g., during PREPARING or after COMPLETING). We must still forward the
       // event to the renderer so it clears "starting…" / "interrupting…" UI, but
@@ -2124,11 +3561,31 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           turnPhase: this.turnPhase,
         });
+
+        const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
+        await this.updateStartupAutoRetryAbandonFromAbort(
+          preStreamAbortReason,
+          this.activeStreamUserMessageId
+        );
+
         this.emitChatEvent(payload);
         return;
       }
 
       this.setTurnPhase(TurnPhase.COMPLETING);
+      const activeModelForAbort = this.activeStreamContext?.modelString;
+      if (activeModelForAbort) {
+        this.updateUsageStateFromModelUsage({
+          model: activeModelForAbort,
+          usage: payload.metadata?.contextUsage,
+          providerMetadata:
+            payload.metadata?.contextProviderMetadata ?? payload.metadata?.providerMetadata,
+          live: false,
+        });
+      }
+      this.clearLiveUsageState();
+
+      const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       this.activeCompactionRequest = undefined;
       this.resetActiveStreamState();
@@ -2136,20 +3593,44 @@ export class AgentSession {
         this.clearQueue();
       }
       this.pendingAgentSwitchingSync = undefined;
+      const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
+      await this.handleStreamFailureForAutoRetry({
+        type: "aborted",
+        message: abortReason,
+      });
+      await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
       this.emitChatEvent(payload);
       this.setTurnPhase(TurnPhase.IDLE);
     });
     forward("runtime-status", (payload) => this.emitChatEvent(payload));
 
     forward("stream-end", async (payload) => {
-      this.setTurnPhase(TurnPhase.COMPLETING);
+      if (payload.type !== "stream-end") {
+        this.emitChatEvent(payload);
+        return;
+      }
 
-      const streamEndPayload = payload as StreamEndEvent;
+      this.setTurnPhase(TurnPhase.COMPLETING);
+      this.retryManager.handleStreamSuccess();
+      await this.clearStartupAutoRetryAbandon();
+
+      const streamEndPayload = payload;
       const activeStreamOptions = this.activeStreamContext?.options;
 
       let emittedStreamEnd = false;
       try {
+        const completedCompactionRequest = this.activeCompactionRequest;
         this.activeCompactionRequest = undefined;
+        this.updateUsageStateFromModelUsage({
+          model: streamEndPayload.metadata.model,
+          usage: streamEndPayload.metadata.contextUsage,
+          providerMetadata:
+            streamEndPayload.metadata.contextProviderMetadata ??
+            streamEndPayload.metadata.providerMetadata,
+          live: false,
+        });
+        this.clearLiveUsageState();
+
         const handled = await this.compactionHandler.handleCompletion(streamEndPayload);
 
         if (!handled) {
@@ -2172,6 +3653,18 @@ export class AgentSession {
           // CompactionHandler emits its own sanitized stream-end; mark as handled
           // so the catch block doesn't re-emit the unsanitized original payload.
           emittedStreamEnd = true;
+
+          // Compaction collapses history to a boundary summary, so prior context-usage snapshots
+          // are stale. Clear them to prevent immediate re-trigger loops on the follow-up turn.
+          this.lastUsageState = undefined;
+
+          if (completedCompactionRequest?.source === "auto-compaction") {
+            this.emitChatEvent({
+              type: "auto-compaction-completed",
+              newUsagePercent: 0,
+            });
+          }
+
           this.onCompactionComplete?.();
         }
 
@@ -2246,6 +3739,7 @@ export class AgentSession {
         return;
       }
       const data = raw as StreamErrorPayload & { workspaceId: string };
+      this.activeStreamErrorEventReceived = true;
       void this.handleStreamError({
         messageId: data.messageId,
         error: data.error,
@@ -2331,9 +3825,13 @@ export class AgentSession {
     await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
   }
 
-  queueMessage(message: string, options?: SendMessageOptions & { fileParts?: FilePart[] }): void {
+  queueMessage(
+    message: string,
+    options?: SendMessageOptions & { fileParts?: FilePart[] },
+    internal?: { synthetic?: boolean }
+  ): void {
     this.assertNotDisposed("queueMessage");
-    this.messageQueue.add(message, options);
+    this.messageQueue.add(message, options, internal);
     this.emitQueuedMessageChanged();
     // Signal to bash_output that it should return early to process the queued message
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, true);
@@ -2396,7 +3894,7 @@ export class AgentSession {
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
 
     if (!this.messageQueue.isEmpty()) {
-      const { message, options } = this.messageQueue.produceMessage();
+      const { message, options, internal } = this.messageQueue.produceMessage();
       this.messageQueue.clear();
       this.emitQueuedMessageChanged();
 
@@ -2404,7 +3902,7 @@ export class AgentSession {
       // incoming messages from bypassing the queue during the await gap.
       this.setTurnPhase(TurnPhase.PREPARING);
 
-      void this.sendMessage(message, options)
+      void this.sendMessage(message, options, internal)
         .then((result) => {
           // If sendMessage fails before it can start streaming, ensure we don't
           // leave the session stuck in PREPARING.
@@ -2794,9 +4292,18 @@ export class AgentSession {
       return;
     }
 
-    // Read the last message from history — only need 1 message, avoid full-file read
+    // Read the last message from history — only need 1 message, avoid full-file read.
+    // Startup recovery must retry on transient read failures, so bubble errors.
     const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
-    if (!historyResult.success || historyResult.data.length === 0) {
+    if (!historyResult.success) {
+      const historyError =
+        typeof historyResult.error === "string"
+          ? historyResult.error
+          : getErrorMessage(historyResult.error);
+      throw new Error(`Failed to read history for startup follow-up recovery: ${historyError}`);
+    }
+
+    if (historyResult.data.length === 0) {
       return;
     }
 
@@ -2850,7 +4357,7 @@ export class AgentSession {
     // that were captured from the original user message in prepareCompactionMessage().
     const options: SendMessageOptions & {
       fileParts?: FilePart[];
-      muxMetadata?: MuxFrontendMetadata;
+      muxMetadata?: MuxMessageMetadata;
     } = {
       ...followUp,
       model: effectiveModel,
@@ -2868,7 +4375,13 @@ export class AgentSession {
     // Await sendMessage to ensure the follow-up is persisted before returning.
     // This guarantees ordering: the follow-up message is written to history
     // before sendQueuedMessages() runs, preventing race conditions.
-    await this.sendMessage(finalText, options);
+    // Mark as synthetic so recovery/background dispatches do not implicitly
+    // re-enable auto-retry after a user explicitly opted out.
+    const sendResult = await this.sendMessage(finalText, options, { synthetic: true });
+    if (!sendResult.success) {
+      const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
+      throw new Error(`Failed to dispatch pending follow-up: ${message}`);
+    }
   }
 
   /**
@@ -3091,7 +4604,7 @@ export class AgentSession {
   }
 
   private async materializeAgentSkillSnapshot(
-    muxMetadata: MuxFrontendMetadata | undefined,
+    muxMetadata: MuxMessageMetadata | undefined,
     disableWorkspaceAgents: boolean | undefined
   ): Promise<{ snapshotMessage: MuxMessage } | null> {
     if (!muxMetadata || muxMetadata.type !== "agent-skill") {

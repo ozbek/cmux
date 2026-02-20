@@ -3,6 +3,8 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
 import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
+import { getAutoCompactionThresholdKey, getAutoRetryKey } from "@/common/constants/storage";
 import { WorkspaceStore } from "./WorkspaceStore";
 
 interface LoadMoreResponse {
@@ -55,6 +57,11 @@ const mockActivitySubscribe = mock(async function* (
   });
 });
 
+const mockSetAutoCompactionThreshold = mock(() =>
+  Promise.resolve({ success: true, data: undefined })
+);
+const mockGetStartupAutoRetryModel = mock(() => Promise.resolve({ success: true, data: null }));
+
 const mockClient = {
   workspace: {
     onChat: mockOnChat,
@@ -66,10 +73,35 @@ const mockClient = {
       list: mockActivityList,
       subscribe: mockActivitySubscribe,
     },
+    setAutoCompactionThreshold: mockSetAutoCompactionThreshold,
+    getStartupAutoRetryModel: mockGetStartupAutoRetryModel,
+  },
+};
+
+const localStorageBacking = new Map<string, string>();
+const mockLocalStorage: Storage = {
+  get length() {
+    return localStorageBacking.size;
+  },
+  clear() {
+    localStorageBacking.clear();
+  },
+  getItem(key: string) {
+    return localStorageBacking.get(key) ?? null;
+  },
+  key(index: number) {
+    return Array.from(localStorageBacking.keys())[index] ?? null;
+  },
+  removeItem(key: string) {
+    localStorageBacking.delete(key);
+  },
+  setItem(key: string, value: string) {
+    localStorageBacking.set(key, value);
   },
 };
 
 const mockWindow = {
+  localStorage: mockLocalStorage,
   api: {
     workspace: {
       onChat: mock((_workspaceId, _callback) => {
@@ -140,6 +172,9 @@ describe("WorkspaceStore", () => {
     mockHistoryLoadMore.mockClear();
     mockActivityList.mockClear();
     mockActivitySubscribe.mockClear();
+    mockSetAutoCompactionThreshold.mockClear();
+    mockGetStartupAutoRetryModel.mockClear();
+    global.window.localStorage?.clear?.();
     mockHistoryLoadMore.mockResolvedValue({
       messages: [],
       nextCursor: null,
@@ -488,7 +523,7 @@ describe("WorkspaceStore", () => {
   });
 
   describe("syncWorkspaces", () => {
-    it("should add new workspaces", () => {
+    it("should add new workspaces", async () => {
       const metadata1: FrontendWorkspaceMetadata = {
         id: "workspace-1",
         name: "workspace-1",
@@ -503,10 +538,59 @@ describe("WorkspaceStore", () => {
       store.setActiveWorkspaceId(metadata1.id);
       store.syncWorkspaces(workspaceMap);
 
-      expect(mockOnChat).toHaveBeenCalledWith(
-        expect.objectContaining({ workspaceId: "workspace-1" }),
-        expect.anything()
+      // addWorkspace triggers async onChat subscription setup; wait until the
+      // subscription attempt runs so startup threshold sync RPCs do not race this assertion.
+      const deadline = Date.now() + 1_000;
+      while (mockOnChat.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(mockOnChat).toHaveBeenCalledWith({ workspaceId: "workspace-1" }, expect.anything());
+    });
+
+    it("sanitizes malformed startup threshold values before backend sync", async () => {
+      const workspaceId = "workspace-threshold-sanitize";
+      const thresholdKey = getAutoCompactionThresholdKey("default");
+      global.window.localStorage.setItem(thresholdKey, JSON.stringify("not-a-number"));
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const deadline = Date.now() + 1_000;
+      while (mockSetAutoCompactionThreshold.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(mockSetAutoCompactionThreshold).toHaveBeenCalledWith({
+        workspaceId,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT / 100,
+      });
+
+      expect(global.window.localStorage.getItem(thresholdKey)).toBe(
+        JSON.stringify(DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT)
       );
+    });
+
+    it("sanitizes malformed legacy auto-retry values before subscribing", async () => {
+      const workspaceId = "workspace-auto-retry-sanitize";
+      const autoRetryKey = getAutoRetryKey(workspaceId);
+      global.window.localStorage.setItem(autoRetryKey, JSON.stringify("invalid-legacy-value"));
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const deadline = Date.now() + 1_000;
+      while (mockOnChat.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(mockOnChat.mock.calls.length).toBeGreaterThan(0);
+      const onChatInput = mockOnChat.mock.calls[0]?.[0] as {
+        workspaceId?: string;
+        legacyAutoRetryEnabled?: unknown;
+      };
+
+      expect(onChatInput.workspaceId).toBe(workspaceId);
+      expect("legacyAutoRetryEnabled" in onChatInput).toBe(false);
+      expect(global.window.localStorage.getItem(autoRetryKey)).toBeNull();
     });
 
     it("should remove deleted workspaces", () => {
@@ -2252,6 +2336,67 @@ describe("WorkspaceStore", () => {
         );
       });
       expect(clearedAbortReason).toBe(true);
+    });
+
+    it("clears stale auto-retry status when full replay reconnect replaces history", async () => {
+      const workspaceId = "task-created-workspace-auto-retry-reset";
+      let subscriptionCount = 0;
+      let releaseFirstSubscription: (() => void) | undefined;
+      const holdFirstSubscription = new Promise<void>((resolve) => {
+        releaseFirstSubscription = resolve;
+      });
+
+      const waitUntil = async (condition: () => boolean, timeoutMs = 2000): Promise<boolean> => {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          if (condition()) {
+            return true;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        return false;
+      };
+
+      mockOnChat.mockImplementation(async function* (): AsyncGenerator<
+        WorkspaceChatMessage,
+        void,
+        unknown
+      > {
+        subscriptionCount += 1;
+
+        if (subscriptionCount === 1) {
+          yield { type: "caught-up" };
+          await Promise.resolve();
+          yield {
+            type: "auto-retry-starting",
+            attempt: 2,
+          };
+
+          await holdFirstSubscription;
+          return;
+        }
+
+        yield {
+          type: "caught-up",
+          replay: "full",
+        };
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const seededRetryStatus = await waitUntil(() => {
+        return store.getWorkspaceState(workspaceId).autoRetryStatus?.type === "auto-retry-starting";
+      });
+      expect(seededRetryStatus).toBe(true);
+
+      releaseFirstSubscription?.();
+
+      const clearedRetryStatus = await waitUntil(() => {
+        return (
+          subscriptionCount >= 2 && store.getWorkspaceState(workspaceId).autoRetryStatus === null
+        );
+      });
+      expect(clearedRetryStatus).toBe(true);
     });
 
     it("replays pre-caught-up task-created after full replay catches up", async () => {
