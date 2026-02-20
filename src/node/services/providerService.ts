@@ -60,7 +60,12 @@ export class ProviderService {
     return () => this.emitter.off("configChanged", callback);
   }
 
-  private emitConfigChanged(): void {
+  /**
+   * Notify subscribers that provider-relevant config has changed.
+   * Called internally on provider config edits, and externally when
+   * main config changes affect provider availability (e.g. muxGatewayEnabled).
+   */
+  notifyConfigChanged(): void {
     this.emitter.emit("configChanged");
   }
 
@@ -84,6 +89,7 @@ export class ProviderService {
    */
   public getConfig(): ProvidersConfigMap {
     const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
 
     for (const provider of this.list()) {
@@ -122,7 +128,10 @@ export class ProviderService {
 
       const codexOauthSet =
         provider === "openai" && parseCodexOauthAuth(config.codexOauth) !== null;
-      const isEnabled = !isProviderDisabledInConfig(config);
+      let isEnabled = !isProviderDisabledInConfig(config);
+      if (provider === "mux-gateway" && mainConfig.muxGatewayEnabled === false) {
+        isEnabled = false;
+      }
 
       const providerInfo: ProviderConfigInfo = {
         apiKeySet: !!config.apiKey,
@@ -230,7 +239,7 @@ export class ProviderService {
 
       providersConfig[provider].models = normalizedModels;
       this.config.saveProvidersConfig(providersConfig);
-      this.emitConfigChanged();
+      this.notifyConfigChanged();
 
       return { success: true, data: undefined };
     } catch (error) {
@@ -297,7 +306,7 @@ export class ProviderService {
 
       // Save updated config
       this.config.saveProvidersConfig(providersConfig);
-      this.emitConfigChanged();
+      this.notifyConfigChanged();
 
       return { success: true, data: undefined };
     } catch (error) {
@@ -381,7 +390,7 @@ export class ProviderService {
 
       // Save updated config
       this.config.saveProvidersConfig(providersConfig);
-      this.emitConfigChanged();
+      this.notifyConfigChanged();
 
       return { success: true, data: undefined };
     } catch (error) {
