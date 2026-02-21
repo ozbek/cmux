@@ -259,6 +259,7 @@ describe("WorkspaceStore", () => {
       // Recency should still be based on createdAt
       const stateAfterCaughtUp = store.getWorkspaceState(workspaceId);
       expect(stateAfterCaughtUp.recencyTimestamp).toBe(new Date(createdAt).getTime());
+      expect(stateAfterCaughtUp.isHydratingTranscript).toBe(false);
 
       // Verify recency map
       const recency = store.getWorkspaceRecency();
@@ -357,6 +358,52 @@ describe("WorkspaceStore", () => {
       );
     });
 
+    it("does not pin hydration while waiting for the chat client", async () => {
+      const workspaceId = "workspace-awaiting-client";
+
+      store.setClient(null);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+
+      store.setActiveWorkspaceId(workspaceId);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+      expect(mockOnChat).not.toHaveBeenCalled();
+    });
+
+    it("clears hydration after first pre-caught-up failure when client disconnects", async () => {
+      const workspaceId = "workspace-hydration-first-failure-offline";
+      let attempts = 0;
+      let resolveFirstFailure!: () => void;
+      const firstFailure = new Promise<void>((resolve) => {
+        resolveFirstFailure = resolve;
+      });
+
+      // eslint-disable-next-line require-yield
+      mockOnChat.mockImplementation(async function* (
+        _input?: { workspaceId: string; mode?: unknown },
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        attempts += 1;
+        if (attempts === 1) {
+          resolveFirstFailure();
+          throw new Error("first-retry-failure");
+        }
+
+        await waitForAbortSignal(options?.signal);
+      });
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.setActiveWorkspaceId(workspaceId);
+      await firstFailure;
+
+      // Simulate transport/client loss before a second retry can catch up.
+      store.setClient(null);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+    });
+
     it("switches onChat subscriptions when active workspace changes", async () => {
       // eslint-disable-next-line require-yield
       mockOnChat.mockImplementation(async function* (
@@ -410,6 +457,7 @@ describe("WorkspaceStore", () => {
             string,
             {
               caughtUp: boolean;
+              isHydratingTranscript: boolean;
               replayingHistory: boolean;
               historicalMessages: WorkspaceChatMessage[];
               pendingStreamEvents: WorkspaceChatMessage[];
@@ -420,6 +468,7 @@ describe("WorkspaceStore", () => {
       expect(transientState).toBeDefined();
 
       transientState!.caughtUp = false;
+      transientState!.isHydratingTranscript = true;
       transientState!.replayingHistory = true;
       transientState!.historicalMessages.push(
         createHistoryMessageEvent("stale-buffered-message", 9)
@@ -438,10 +487,95 @@ describe("WorkspaceStore", () => {
       store.setActiveWorkspaceId("workspace-2");
 
       expect(transientState!.caughtUp).toBe(false);
+      expect(transientState!.isHydratingTranscript).toBe(false);
       expect(transientState!.replayingHistory).toBe(false);
       expect(transientState!.historicalMessages).toHaveLength(0);
       expect(transientState!.pendingStreamEvents).toHaveLength(0);
+      expect(store.getWorkspaceState("workspace-2").isHydratingTranscript).toBe(true);
     });
+    it("keeps transcript hydration active across full replay resets", async () => {
+      const workspaceId = "workspace-full-replay-hydration";
+
+      mockOnChat.mockImplementation(async function* (
+        _input?: { workspaceId: string; mode?: unknown },
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        // Full replay path emits history rows before the caught-up marker.
+        yield createHistoryMessageEvent("history-before-caught-up", 11);
+        await waitForAbortSignal(options?.signal);
+      });
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.setActiveWorkspaceId(workspaceId);
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Hydration should stay active until an authoritative caught-up marker arrives,
+      // even if replay reset rebuilt transient state.
+      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(true);
+    });
+
+    it("clears transcript hydration after repeated catch-up retry failures", async () => {
+      const workspaceId = "workspace-hydration-retry-fallback";
+      let attempts = 0;
+
+      // eslint-disable-next-line require-yield
+      mockOnChat.mockImplementation(async function* (
+        _input?: { workspaceId: string; mode?: unknown },
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        attempts += 1;
+        if (attempts <= 2) {
+          throw new Error(`retry-failure-${attempts}`);
+        }
+
+        await waitForAbortSignal(options?.signal);
+      });
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.setActiveWorkspaceId(workspaceId);
+
+      const startedAt = Date.now();
+      while (mockOnChat.mock.calls.length < 3 && Date.now() - startedAt < 3_000) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      expect(mockOnChat.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+    });
+
+    it("clears transcript hydration when retries keep replaying partial history without caught-up", async () => {
+      const workspaceId = "workspace-hydration-partial-replay-fallback";
+      let attempts = 0;
+
+      mockOnChat.mockImplementation(async function* (
+        _input?: { workspaceId: string; mode?: unknown },
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        attempts += 1;
+
+        // Simulate flaky reconnects that emit some replay rows, then terminate
+        // before caught-up can arrive.
+        yield createHistoryMessageEvent(`partial-history-${attempts}`, attempts);
+        if (attempts <= 2) {
+          return;
+        }
+
+        await waitForAbortSignal(options?.signal);
+      });
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.setActiveWorkspaceId(workspaceId);
+
+      const startedAt = Date.now();
+      while (mockOnChat.mock.calls.length < 3 && Date.now() - startedAt < 3_000) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      expect(mockOnChat.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+    });
+
     it("drops queued chat events from an aborted subscription attempt", async () => {
       const queuedMicrotasks: Array<() => void> = [];
       const originalQueueMicrotask = global.queueMicrotask;
@@ -626,6 +760,7 @@ describe("WorkspaceStore", () => {
         canInterrupt: false,
         isCompacting: false,
         loading: true, // loading because not caught up
+        isHydratingTranscript: true,
         muxMessages: [],
         currentModel: null,
       });

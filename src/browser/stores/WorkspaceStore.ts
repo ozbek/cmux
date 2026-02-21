@@ -77,6 +77,7 @@ export interface WorkspaceState {
   isStreamStarting: boolean;
   awaitingUserQuestion: boolean;
   loading: boolean;
+  isHydratingTranscript: boolean;
   hasOlderHistory: boolean;
   loadingOlderHistory: boolean;
   muxMessages: MuxMessage[];
@@ -239,6 +240,7 @@ export interface WorkspaceConsumersState {
 
 interface WorkspaceChatTransientState {
   caughtUp: boolean;
+  isHydratingTranscript: boolean;
   historicalMessages: MuxMessage[];
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
@@ -288,6 +290,7 @@ function createInitialHistoryPaginationState(): WorkspaceHistoryPaginationState 
 function createInitialChatTransientState(): WorkspaceChatTransientState {
   return {
     caughtUp: false,
+    isHydratingTranscript: false,
     historicalMessages: [],
     pendingStreamEvents: [],
     replayingHistory: false,
@@ -1154,6 +1157,11 @@ export class WorkspaceStore {
 
     if (this.activeOnChatWorkspaceId) {
       const previousActiveWorkspaceId = this.activeOnChatWorkspaceId;
+      const previousTransient = this.chatTransientState.get(previousActiveWorkspaceId);
+      if (previousTransient) {
+        previousTransient.isHydratingTranscript = false;
+      }
+
       // Clear replay buffers before aborting so a fast workspace switch/reopen
       // cannot replay stale buffered rows from the previous subscription attempt.
       this.clearReplayBuffers(previousActiveWorkspaceId);
@@ -1167,6 +1175,14 @@ export class WorkspaceStore {
     }
 
     if (targetWorkspaceId) {
+      const transient = this.chatTransientState.get(targetWorkspaceId);
+      if (transient) {
+        transient.caughtUp = false;
+        // Only show transcript hydration once we can actually establish onChat.
+        // When the ORPC client is unavailable, avoid pinning the pane in loading.
+        transient.isHydratingTranscript = this.client !== null;
+      }
+
       const controller = new AbortController();
       this.ipcUnsubscribers.set(targetWorkspaceId, () => controller.abort());
       this.activeOnChatWorkspaceId = targetWorkspaceId;
@@ -1553,6 +1569,8 @@ export class WorkspaceStore {
           ? (activity?.recency ?? null)
           : Math.max(aggregatorRecency, activity?.recency ?? aggregatorRecency);
       const isStreamStarting = pendingStreamStartTime !== null && !canInterrupt;
+      const isHydratingTranscript =
+        isActiveWorkspace && transient.isHydratingTranscript && !transient.caughtUp;
 
       // Live streaming stats
       const activeStreamMessageId = aggregator.getActiveStreamMessageId();
@@ -1572,6 +1590,7 @@ export class WorkspaceStore {
         isStreamStarting,
         awaitingUserQuestion: aggregator.hasAwaitingUserQuestion(),
         loading: !hasMessages && !transient.caughtUp,
+        isHydratingTranscript,
         hasOlderHistory: historyPagination.hasOlder,
         loadingOlderHistory: historyPagination.loading,
         muxMessages: messages,
@@ -2499,7 +2518,16 @@ export class WorkspaceStore {
     aggregator.clear();
 
     // Reset per-workspace transient state so the next replay rebuilds from the backend source of truth.
-    this.chatTransientState.set(workspaceId, createInitialChatTransientState());
+    const previousTransient = this.chatTransientState.get(workspaceId);
+    const nextTransient = createInitialChatTransientState();
+
+    // Preserve active hydration across full replay resets so workspace-switch catch-up
+    // remains in loading state until we receive an authoritative caught-up marker.
+    if (previousTransient?.isHydratingTranscript) {
+      nextTransient.isHydratingTranscript = true;
+    }
+
+    this.chatTransientState.set(workspaceId, nextTransient);
 
     this.historyPagination.set(workspaceId, createInitialHistoryPaginationState());
 
@@ -2577,9 +2605,23 @@ export class WorkspaceStore {
     let attempt = 0;
 
     while (!signal.aborted) {
+      const hadClientAtLoopStart = this.client !== null;
       const client = this.client ?? (await this.waitForClient(signal));
       if (!client || signal.aborted) {
         return;
+      }
+
+      // If activation happened while the client was offline, begin hydration now
+      // that we can actually start the subscription loop.
+      const initialTransient = this.chatTransientState.get(workspaceId);
+      if (
+        !hadClientAtLoopStart &&
+        initialTransient &&
+        !initialTransient.caughtUp &&
+        !initialTransient.isHydratingTranscript
+      ) {
+        initialTransient.isHydratingTranscript = true;
+        this.states.bump(workspaceId);
       }
 
       // Allow us to abort only this subscription attempt (without unsubscribing the workspace).
@@ -2753,6 +2795,15 @@ export class WorkspaceStore {
         // Clear replay buffers before the next attempt so we don't append a
         // second replay copy and duplicate deltas/tool events on caught-up.
         this.clearReplayBuffers(workspaceId);
+
+        // If catch-up fails before the authoritative marker arrives, fall back to
+        // normal transcript/retry UI immediately so hydration cannot remain pinned
+        // while we wait for client reconnects.
+        const transient = this.chatTransientState.get(workspaceId);
+        if (transient?.isHydratingTranscript && !transient.caughtUp) {
+          transient.isHydratingTranscript = false;
+          this.states.bump(workspaceId);
+        }
 
         // Preserve pagination across transient reconnect retries. Incremental
         // caught-up payloads intentionally omit hasOlderHistory, so resetting
@@ -3227,6 +3278,7 @@ export class WorkspaceStore {
       }
       // Mark as caught up
       transient.caughtUp = true;
+      transient.isHydratingTranscript = false;
       this.states.bump(workspaceId);
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
 
