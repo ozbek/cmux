@@ -134,6 +134,7 @@ import {
   filePartsToChatAttachments,
   type SkillResolutionTarget,
 } from "./utils";
+import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 // localStorage quotas are environment-dependent and relatively small.
 // Be conservative here so we can warn the user before writes start failing.
@@ -2008,7 +2009,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           telemetry.messageSent(
             props.workspaceId,
             effectiveModel,
-            sendMessageOptions.agentId ?? agentId ?? "exec",
+            sendMessageOptions.agentId ?? agentId ?? WORKSPACE_DEFAULTS.agentId,
             finalMessageText.length,
             runtimeType,
             sendMessageOptions.thinkingLevel ?? "off"

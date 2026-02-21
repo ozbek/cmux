@@ -27,6 +27,7 @@ import {
   getDraftScopeId,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
+  GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
@@ -50,6 +51,7 @@ import {
 import { normalizeModelInput } from "@/browser/utils/models/normalizeModelInput";
 import { resolveDevcontainerSelection } from "@/browser/utils/devcontainerSelection";
 import { getErrorMessage } from "@/common/utils/errors";
+import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type CreationSendResult = { success: true } | { success: false; error?: SendMessageError };
 
@@ -80,9 +82,17 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
   }
 
   const projectAgentId = readPersistedState<string | null>(getAgentIdKey(projectScopeId), null);
-  if (projectAgentId) {
-    updatePersistedState(getAgentIdKey(workspaceId), projectAgentId);
-  }
+  const globalDefaultAgentId = readPersistedState<string>(
+    getAgentIdKey(GLOBAL_SCOPE_ID),
+    WORKSPACE_DEFAULTS.agentId
+  );
+  const effectiveAgentId =
+    typeof projectAgentId === "string" && projectAgentId.trim().length > 0
+      ? projectAgentId.trim().toLowerCase()
+      : typeof globalDefaultAgentId === "string" && globalDefaultAgentId.trim().length > 0
+        ? globalDefaultAgentId.trim().toLowerCase()
+        : WORKSPACE_DEFAULTS.agentId;
+  updatePersistedState(getAgentIdKey(workspaceId), effectiveAgentId);
 
   const projectThinkingLevel = readPersistedState<ThinkingLevel | null>(
     getThinkingLevelKey(projectScopeId),
@@ -93,10 +103,6 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
   }
 
   if (projectModel) {
-    const effectiveAgentId =
-      typeof projectAgentId === "string" && projectAgentId.trim().length > 0
-        ? projectAgentId.trim().toLowerCase()
-        : "exec";
     const effectiveThinking: ThinkingLevel = projectThinkingLevel ?? "off";
 
     updatePersistedState<Partial<Record<string, { model: string; thinkingLevel: ThinkingLevel }>>>(
@@ -384,8 +390,13 @@ export function useCreationWorkspace({
 
         // Read send options fresh from localStorage at send time to avoid
         // race conditions with React state updates (requestAnimationFrame batching
-        // in usePersistedState can delay state updates after model selection)
-        const sendMessageOptions = getSendOptionsFromStorage(projectScopeId);
+        // in usePersistedState can delay state updates after model selection).
+        // Override agentId from current draft settings so first-send uses the same
+        // project/global/default resolution chain as the creation UI.
+        const sendMessageOptions = {
+          ...getSendOptionsFromStorage(projectScopeId),
+          agentId: settings.agentId,
+        };
         // Use normalized override if provided, otherwise fall back to already-normalized storage model
         const normalizedOverride = optionsOverride?.model
           ? normalizeModelInput(optionsOverride.model)
