@@ -368,11 +368,11 @@ export const DEFAULT_TERMINAL_FONT_CONFIG: TerminalFontConfig = {
 
 /**
  * Tutorial state storage key (global)
- * Stores: { disabled: boolean, completed: { creation?: true, workspace?: true } }
+ * Stores: { disabled: boolean, completed: { creation?: true, workspace?: true, review?: true } }
  */
 export const TUTORIAL_STATE_KEY = "tutorialState";
 
-export type TutorialSequence = "creation" | "workspace";
+export type TutorialSequence = "creation" | "workspace" | "review";
 
 export interface TutorialState {
   disabled: boolean;
@@ -563,6 +563,15 @@ export function getReviewsKey(workspaceId: string): string {
 }
 
 /**
+ * Get the localStorage key for immersive review mode state per workspace
+ * Tracks whether immersive mode is active
+ * Format: "review-immersive:{workspaceId}"
+ */
+export function getReviewImmersiveKey(workspaceId: string): string {
+  return `review-immersive:${workspaceId}`;
+}
+
+/**
  * Get the localStorage key for auto-compaction enabled preference per workspace
  * Format: "autoCompaction:enabled:{workspaceId}"
  */
@@ -598,6 +607,7 @@ const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string>
   getFileTreeExpandStateKey,
   getReviewSearchStateKey,
   getReviewsKey,
+  getReviewImmersiveKey,
   getAutoCompactionEnabledKey,
   getWorkspaceLastReadKey,
   getStatusStateKey,
