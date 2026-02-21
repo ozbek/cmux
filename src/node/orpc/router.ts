@@ -613,11 +613,13 @@ export const router = (authToken?: string) => {
             return {
               ...config,
               muxGatewayEnabled: input.muxGatewayEnabled ? undefined : false,
-              muxGatewayModels: nextModels.length > 0 ? nextModels : undefined,
+              // Persist explicit empty selections so startup migration doesn't
+              // rehydrate stale legacy localStorage values.
+              muxGatewayModels: nextModels,
             };
           });
-          // Notify provider config subscribers so frontend updates
-          // voice input availability when gateway toggle changes.
+          // Notify subscribers (useProvidersConfig) so the frontend picks up the
+          // new gateway enabled/models state without needing localStorage.
           context.providerService.notifyConfigChanged();
         }),
       updateModelPreferences: t

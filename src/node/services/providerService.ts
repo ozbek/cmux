@@ -179,16 +179,24 @@ export class ProviderService {
         };
       }
 
-      // Mux Gateway-specific fields (check couponCode first, fallback to legacy voucher)
+      // Mux Gateway-specific fields (check couponCode first, fallback to legacy voucher).
+      // Gateway stores enabled/models in the global config (~/.mux/config.json), not
+      // in providers.jsonc, so override the generic isEnabled with the gateway-specific value.
       if (provider === "mux-gateway") {
         const muxConfig = config as { couponCode?: string; voucher?: string };
         providerInfo.couponCodeSet = !!(muxConfig.couponCode ?? muxConfig.voucher);
+        const globalConfig = this.config.loadConfigOrDefault();
+        providerInfo.isEnabled = globalConfig.muxGatewayEnabled !== false;
+        providerInfo.gatewayModels = globalConfig.muxGatewayModels ?? [];
       }
 
       // Compute isConfigured using shared utility (checks config + env vars).
       // Disabled providers intentionally surface as not configured in the UI.
+      // Use providerInfo.isEnabled (not the local `isEnabled`) because gateway
+      // overrides it from global config — using the providers.jsonc value would
+      // make a disabled gateway appear configured.
       providerInfo.isConfigured =
-        isEnabled && checkProviderConfigured(provider, config).isConfigured;
+        providerInfo.isEnabled && checkProviderConfigured(provider, config).isConfigured;
 
       if (provider === "openai" && isEnabled && codexOauthSet) {
         providerInfo.isConfigured = true;

@@ -30,8 +30,6 @@ import {
   migrateWorkspaceStorage,
   AGENT_AI_DEFAULTS_KEY,
   DEFAULT_MODEL_KEY,
-  GATEWAY_ENABLED_KEY,
-  GATEWAY_MODELS_KEY,
   HIDDEN_MODELS_KEY,
   PREFERRED_COMPACTION_MODEL_KEY,
   SELECTED_WORKSPACE_KEY,
@@ -113,6 +111,44 @@ function migrateLocalModelPrefsToBackend(
     api.config.updateModelPreferences(patch).catch(() => {
       // Best-effort only.
     });
+  }
+}
+
+/**
+ * One-time best-effort migration for gateway preferences.
+ * Users upgrading from builds that only stored gateway state in localStorage
+ * (keys: "gateway-enabled", "gateway-models") need their preferences migrated
+ * to config.json so they aren't lost when localStorage is no longer read.
+ */
+function migrateLocalGatewayPrefsToBackend(
+  api: APIClient,
+  cfg: { muxGatewayEnabled?: boolean; muxGatewayModels?: string[] }
+): void {
+  // Only migrate if the backend doesn't have these values yet
+  if (cfg.muxGatewayEnabled !== undefined && cfg.muxGatewayModels !== undefined) return;
+
+  // Read legacy localStorage keys (inline strings — these constants were removed from storage.ts)
+  const localEnabled = readPersistedState<boolean>("gateway-enabled", true);
+  const localModels = readPersistedState<string[]>("gateway-models", []);
+
+  const shouldMigrateEnabled = cfg.muxGatewayEnabled === undefined && localEnabled === false;
+  const shouldMigrateModels = cfg.muxGatewayModels === undefined && localModels.length > 0;
+
+  const clearLegacyGatewayPrefs = () => {
+    updatePersistedState<boolean | undefined>("gateway-enabled", undefined);
+    updatePersistedState<string[] | undefined>("gateway-models", undefined);
+  };
+
+  if (shouldMigrateEnabled || shouldMigrateModels) {
+    api.config
+      .updateMuxGatewayPrefs({
+        muxGatewayEnabled: cfg.muxGatewayEnabled ?? localEnabled,
+        muxGatewayModels: cfg.muxGatewayModels ?? localModels,
+      })
+      .then(clearLegacyGatewayPrefs)
+      .catch(() => {
+        // Best-effort only.
+      });
   }
 }
 
@@ -468,14 +504,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           normalizeAgentAiDefaults(cfg.agentAiDefaults ?? {})
         );
 
-        // Seed Mux Gateway prefs from backend so switching ports doesn't reset the UI.
-        if (cfg.muxGatewayEnabled !== undefined) {
-          updatePersistedState(GATEWAY_ENABLED_KEY, cfg.muxGatewayEnabled);
-        }
-        if (cfg.muxGatewayModels !== undefined) {
-          updatePersistedState(GATEWAY_MODELS_KEY, cfg.muxGatewayModels);
-        }
-
         // Seed global model preferences from backend so switching ports doesn't reset the UI.
         if (cfg.defaultModel !== undefined) {
           updatePersistedState(DEFAULT_MODEL_KEY, cfg.defaultModel);
@@ -487,31 +515,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           updatePersistedState(PREFERRED_COMPACTION_MODEL_KEY, cfg.preferredCompactionModel);
         }
 
-        // One-time best-effort migration: if the backend doesn't have gateway prefs yet,
-        // persist non-default localStorage values so future port changes keep them.
-        if (api.config.updateMuxGatewayPrefs) {
-          const localEnabled = readPersistedState<boolean>(GATEWAY_ENABLED_KEY, true);
-          const localModels = readPersistedState<string[]>(GATEWAY_MODELS_KEY, []);
-
-          const shouldMigrateEnabled =
-            cfg.muxGatewayEnabled === undefined && localEnabled === false;
-          const shouldMigrateModels = cfg.muxGatewayModels === undefined && localModels.length > 0;
-
-          if (shouldMigrateEnabled || shouldMigrateModels) {
-            api.config
-              .updateMuxGatewayPrefs({
-                muxGatewayEnabled: cfg.muxGatewayEnabled ?? localEnabled,
-                muxGatewayModels: cfg.muxGatewayModels ?? localModels,
-              })
-              .catch(() => {
-                // Best-effort only.
-              });
-          }
-        }
-
         // One-time best-effort migration: if the backend doesn't have model prefs yet,
         // persist non-default localStorage values so future port changes keep them.
         migrateLocalModelPrefsToBackend(api, cfg);
+
+        // One-time gateway pref migration: if the backend doesn't have gateway prefs yet,
+        // check if the user had non-default values in the old localStorage keys.
+        // This covers users upgrading from builds that only stored gateway state locally.
+        migrateLocalGatewayPrefsToBackend(api, cfg);
       })
       .catch(() => {
         // Best-effort only.

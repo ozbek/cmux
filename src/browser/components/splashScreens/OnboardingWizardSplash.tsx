@@ -30,6 +30,7 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getEligibleGatewayModels } from "@/browser/utils/gatewayModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { useGateway } from "@/browser/hooks/useGatewayModels";
 import {
   formatMuxGatewayBalance,
   useMuxGatewayAccountStatus,
@@ -55,7 +56,6 @@ function getServerAuthToken(): string | null {
   return urlToken?.length ? urlToken : getStoredAuthToken();
 }
 
-const GATEWAY_MODELS_KEY = "gateway-models";
 const KBD_CLASSNAME =
   "bg-background-secondary text-foreground border-border-medium rounded border px-2 py-0.5 font-mono text-xs";
 
@@ -235,6 +235,21 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   const [muxGatewayDesktopFlowId, setMuxGatewayDesktopFlowId] = useState<string | null>(null);
   const [muxGatewayServerState, setMuxGatewayServerState] = useState<string | null>(null);
 
+  const gateway = useGateway();
+
+  const applyDefaultGatewayModels = useCallback(
+    (configSnapshot: ProvidersConfigMap | null) => {
+      const existingModels =
+        configSnapshot?.["mux-gateway"]?.gatewayModels ??
+        providersConfig?.["mux-gateway"]?.gatewayModels ??
+        [];
+      const nextModels =
+        existingModels.length > 0 ? existingModels : getEligibleGatewayModels(configSnapshot);
+      gateway.setEnabledModels(nextModels);
+    },
+    [gateway, providersConfig]
+  );
+
   const cancelMuxGatewayLogin = useCallback(() => {
     muxGatewayApplyDefaultModelsOnSuccessRef.current = false;
     muxGatewayLoginAttemptRef.current++;
@@ -252,11 +267,23 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   const startMuxGatewayLogin = useCallback(async () => {
     const attempt = ++muxGatewayLoginAttemptRef.current;
 
-    // Enable Mux Gateway for all eligible models after the *first* successful login.
-    const isLoggedIn = providersConfig?.["mux-gateway"]?.couponCodeSet ?? false;
-    muxGatewayApplyDefaultModelsOnSuccessRef.current = !isLoggedIn;
-
     try {
+      // Apply default enrollment only for confirmed first-time setup. If config
+      // hydration is unknown, prefer preserving the current backend selection.
+      let gatewayConfig = providersConfig?.["mux-gateway"];
+      if (gatewayConfig?.couponCodeSet == null && api?.providers?.getConfig) {
+        try {
+          const latestConfig = await api.providers.getConfig();
+          if (attempt !== muxGatewayLoginAttemptRef.current) {
+            return;
+          }
+          gatewayConfig = latestConfig?.["mux-gateway"];
+        } catch {
+          // Ignore pre-login fetch failures; fall back to current snapshot.
+        }
+      }
+      muxGatewayApplyDefaultModelsOnSuccessRef.current = gatewayConfig?.couponCodeSet === false;
+
       setMuxGatewayLoginError(null);
       setMuxGatewayDesktopFlowId(null);
       setMuxGatewayServerState(null);
@@ -314,7 +341,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               return;
             }
 
-            updatePersistedState(GATEWAY_MODELS_KEY, getEligibleGatewayModels(latestConfig));
+            // Persist gateway models via backend config (no localStorage).
+            applyDefaultGatewayModels(latestConfig);
             muxGatewayApplyDefaultModelsOnSuccessRef.current = false;
           }
 
@@ -390,7 +418,14 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayLoginStatus("error");
       setMuxGatewayLoginError(message);
     }
-  }, [api, backendBaseUrl, isDesktop, providersConfig, refreshMuxGatewayAccountStatus]);
+  }, [
+    api,
+    backendBaseUrl,
+    isDesktop,
+    providersConfig,
+    applyDefaultGatewayModels,
+    refreshMuxGatewayAccountStatus,
+  ]);
 
   useEffect(() => {
     const attempt = muxGatewayLoginAttemptRef.current;
@@ -414,7 +449,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
           const applyLatest = (latestConfig: ProvidersConfigMap | null) => {
             if (muxGatewayLoginAttemptRef.current !== attempt) return;
-            updatePersistedState(GATEWAY_MODELS_KEY, getEligibleGatewayModels(latestConfig));
+            // Persist gateway models via backend config (no localStorage).
+            applyDefaultGatewayModels(latestConfig);
           };
 
           if (api) {
@@ -446,6 +482,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     muxGatewayLoginStatus,
     muxGatewayServerState,
     providersConfig,
+    applyDefaultGatewayModels,
     refreshMuxGatewayAccountStatus,
   ]);
 

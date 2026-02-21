@@ -21,7 +21,6 @@ import { ProviderWithIcon } from "@/browser/components/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal";
 import { useAPI } from "@/browser/contexts/API";
 import { useSettings } from "@/browser/contexts/SettingsContext";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import {
   formatMuxGatewayBalance,
@@ -69,7 +68,6 @@ function getServerAuthToken(): string | null {
   const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
   return urlToken?.length ? urlToken : getStoredAuthToken();
 }
-const GATEWAY_MODELS_KEY = "gateway-models";
 
 interface FieldConfig {
   key: string;
@@ -175,43 +173,13 @@ export function ProvidersSection() {
 
   const gateway = useGateway();
 
-  const [gatewayModels, setGatewayModels] = usePersistedState<string[]>(GATEWAY_MODELS_KEY, [], {
-    listener: true,
-  });
-
   const eligibleGatewayModels = useMemo(() => getEligibleGatewayModels(config), [config]);
 
   const canEnableGatewayForAllModels = useMemo(
     () =>
       eligibleGatewayModels.length > 0 &&
-      !eligibleGatewayModels.every((modelId) => gatewayModels.includes(modelId)),
-    [eligibleGatewayModels, gatewayModels]
-  );
-
-  const persistGatewayModels = useCallback(
-    (nextModels: string[]) => {
-      if (!api?.config?.updateMuxGatewayPrefs) {
-        return;
-      }
-
-      api.config
-        .updateMuxGatewayPrefs({
-          muxGatewayEnabled: gateway.isEnabled,
-          muxGatewayModels: nextModels,
-        })
-        .catch(() => {
-          // Best-effort only.
-        });
-    },
-    [api, gateway.isEnabled]
-  );
-
-  const applyGatewayModels = useCallback(
-    (nextModels: string[]) => {
-      setGatewayModels(nextModels);
-      persistGatewayModels(nextModels);
-    },
-    [persistGatewayModels, setGatewayModels]
+      !eligibleGatewayModels.every((modelId) => gateway.enabledModels.includes(modelId)),
+    [eligibleGatewayModels, gateway.enabledModels]
   );
 
   const enableGatewayForAllModels = useCallback(() => {
@@ -219,8 +187,10 @@ export function ProvidersSection() {
       return;
     }
 
-    applyGatewayModels(eligibleGatewayModels);
-  }, [applyGatewayModels, canEnableGatewayForAllModels, eligibleGatewayModels]);
+    // Keep gateway model writes centralized in useGateway so this action and the
+    // global gateway toggle persist from the same config snapshot.
+    gateway.setEnabledModels(eligibleGatewayModels);
+  }, [canEnableGatewayForAllModels, eligibleGatewayModels, gateway]);
 
   const backendBaseUrl = getBrowserBackendBaseUrl();
   const backendOrigin = (() => {
@@ -564,12 +534,24 @@ export function ProvidersSection() {
   const startMuxGatewayLogin = async () => {
     const attempt = ++muxGatewayLoginAttemptRef.current;
 
-    // Enable Mux Gateway for all eligible models after the *first* successful login.
-    // (If config isn't loaded yet, fall back to the persisted gateway-available state.)
-    const isLoggedIn = config?.["mux-gateway"]?.couponCodeSet ?? gateway.isConfigured;
-    muxGatewayApplyDefaultModelsOnSuccessRef.current = !isLoggedIn;
-
     try {
+      // Enable default gateway models only for confirmed first-time setup.
+      // If config hydration is unknown, prefer preserving current selections.
+      let gatewayConfig = config?.["mux-gateway"];
+      if (gatewayConfig?.couponCodeSet == null && api) {
+        try {
+          const latestConfig = await api.providers.getConfig();
+          if (attempt !== muxGatewayLoginAttemptRef.current) {
+            return;
+          }
+          gatewayConfig = latestConfig?.["mux-gateway"];
+        } catch {
+          // If pre-login config fetch fails, avoid defaulting so we don't
+          // overwrite an intentional empty model selection.
+        }
+      }
+      muxGatewayApplyDefaultModelsOnSuccessRef.current = gatewayConfig?.couponCodeSet === false;
+
       setMuxGatewayLoginError(null);
       setMuxGatewayDesktopFlowId(null);
       setMuxGatewayServerState(null);
@@ -626,7 +608,10 @@ export function ProvidersSection() {
               return;
             }
 
-            applyGatewayModels(getEligibleGatewayModels(latestConfig));
+            const latestGatewayModels = latestConfig?.["mux-gateway"]?.gatewayModels ?? [];
+            if (latestGatewayModels.length === 0) {
+              gateway.setEnabledModels(getEligibleGatewayModels(latestConfig));
+            }
             muxGatewayApplyDefaultModelsOnSuccessRef.current = false;
           }
 
@@ -718,7 +703,10 @@ export function ProvidersSection() {
 
           const applyLatest = (latestConfig: ProvidersConfigMap | null) => {
             if (muxGatewayLoginAttemptRef.current !== attempt) return;
-            applyGatewayModels(getEligibleGatewayModels(latestConfig));
+            const latestGatewayModels = latestConfig?.["mux-gateway"]?.gatewayModels ?? [];
+            if (latestGatewayModels.length === 0) {
+              gateway.setEnabledModels(getEligibleGatewayModels(latestConfig));
+            }
           };
 
           if (api) {
@@ -752,7 +740,7 @@ export function ProvidersSection() {
     backendOrigin,
     api,
     config,
-    applyGatewayModels,
+    gateway,
     refreshMuxGatewayAccountStatus,
   ]);
   const muxGatewayCouponCodeSet = config?.["mux-gateway"]?.couponCodeSet ?? false;
@@ -1084,8 +1072,8 @@ export function ProvidersSection() {
 
       {visibleProviders.map((provider) => {
         const isExpanded = expandedProvider === provider;
-        // mux-gateway stores its enabled state separately (gateway-enabled localStorage key),
-        // not in the standard provider config, so use the gateway hook's state directly.
+        // mux-gateway enabled/models are sourced from backend config.json via
+        // useGateway/useProvidersConfig, so read the gateway hook's state directly.
         const enabled = provider === "mux-gateway" ? gateway.isEnabled : isEnabled(provider);
         const configured = isConfigured(provider);
         const fields = getProviderFields(provider);
