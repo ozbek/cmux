@@ -7,7 +7,10 @@
 
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { supports1MContext } from "@/common/utils/ai/models";
-import { getModelContextWindowOverride } from "@/common/utils/providers/modelEntries";
+import {
+  getModelContextWindowOverride,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 
 /**
@@ -23,12 +26,16 @@ export function getEffectiveContextLimit(
   use1M: boolean,
   providersConfig: ProvidersConfigMap | null = null
 ): number | null {
+  const metadataModel = resolveModelForMetadata(model, providersConfig);
   const customOverride = getModelContextWindowOverride(model, providersConfig);
-  const stats = getModelStats(model);
+  const stats = getModelStats(metadataModel);
   const baseLimit = customOverride ?? stats?.max_input_tokens ?? null;
   if (!baseLimit) return null;
 
-  // Sonnet: 1M optional (toggle). Gemini: always 1M (native).
+  // 1M context is a provider-level capability (Anthropic header, Gemini native)
+  // so it must be gated on the runtime model, not the mapped metadata model.
+  // A custom model mapped to Sonnet should NOT inherit 1M context unless
+  // the runtime model itself supports it.
   if (supports1MContext(model) && use1M) return 1_000_000;
   return baseLimit;
 }

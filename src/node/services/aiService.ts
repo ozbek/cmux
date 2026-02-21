@@ -7,7 +7,7 @@ import { linkAbortSignal } from "@/node/utils/abort";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type { SendMessageOptions } from "@/common/orpc/types";
+import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
 
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
@@ -120,6 +120,7 @@ export class AIService extends EventEmitter {
   private mockAiStreamPlayer?: MockAiStreamPlayer;
   private readonly backgroundProcessManager?: BackgroundProcessManager;
   private readonly sessionUsageService?: SessionUsageService;
+  private readonly providerService: ProviderService;
   private readonly providerModelFactory: ProviderModelFactory;
 
   // Tracks in-flight stream startup (before StreamManager emits stream-start).
@@ -158,7 +159,10 @@ export class AIService extends EventEmitter {
     this.sessionUsageService = sessionUsageService;
     this.policyService = policyService;
     this.telemetryService = telemetryService;
-    this.streamManager = new StreamManager(historyService, sessionUsageService);
+    this.providerService = providerService;
+    this.streamManager = new StreamManager(historyService, sessionUsageService, () =>
+      this.providerService.getConfig()
+    );
     this.providerModelFactory = new ProviderModelFactory(config, providerService, policyService);
     void this.ensureSessionsDir();
     this.setupStreamEventForwarding();
@@ -180,6 +184,10 @@ export class AIService extends EventEmitter {
 
   setTaskService(taskService: TaskService): void {
     this.taskService = taskService;
+  }
+
+  getProvidersConfig(): ProvidersConfigMap | null {
+    return this.providerService.getConfig();
   }
 
   /**
@@ -642,6 +650,7 @@ export class AIService extends EventEmitter {
         effectiveAdditionalInstructions,
         modelString,
         cfg,
+        providersConfig: this.providerService.getConfig(),
         mcpServers,
       });
 

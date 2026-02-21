@@ -6,6 +6,7 @@ import type {
   WorkspaceChatMessage,
   WorkspaceStatsSnapshot,
   OnChatMode,
+  ProvidersConfigMap,
 } from "@/common/orpc/types";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
@@ -37,7 +38,10 @@ import type {
   RuntimeStatusEvent,
 } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
+import { getModelStats } from "@/common/utils/tokens/modelStats";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import { isDurableCompactionBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { WorkspaceConsumerManager } from "./WorkspaceConsumerManager";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
@@ -376,6 +380,94 @@ function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
 }
 
 /**
+ * Detect gateway-billed (costs-included) usage entries.
+ * `createDisplayUsage` sets `costsIncluded: true` when
+ * `providerMetadata.mux.costsIncluded` is true. These entries should
+ * not be repriced when model mappings change because the provider
+ * gateway already handles billing.
+ */
+function isCostsIncludedEntry(
+  usage: ChatUsageDisplay,
+  runtimeModelId: string,
+  providersConfig: ProvidersConfigMap
+): boolean {
+  if (usage.costsIncluded === true) {
+    return true;
+  }
+
+  // Unknown-cost rows are not gateway-billed by definition; they indicate
+  // missing pricing metadata and should be eligible for repricing when a
+  // mapping is later configured.
+  if (usage.hasUnknownCosts === true) {
+    return false;
+  }
+
+  // Backward-compatibility: older session-usage.json entries may have been
+  // gateway-billed with all costs explicitly zeroed before the costsIncluded
+  // marker was persisted. Treat those all-zero entries as costs-included so
+  // repricing doesn't inflate historical gateway-billed totals after upgrade.
+  //
+  // Guardrail: only apply this legacy heuristic for models that have non-zero
+  // billable pricing in model stats. Use the resolved metadata model so mapped
+  // custom IDs (e.g. ollama:custom -> anthropic:claude-*) are classified by the
+  // effective pricing model, not the raw runtime string.
+  const metadataModel = resolveModelForMetadata(runtimeModelId, providersConfig);
+  const stats = getModelStats(metadataModel);
+  const hasBillableRates =
+    (stats?.input_cost_per_token ?? 0) > 0 ||
+    (stats?.output_cost_per_token ?? 0) > 0 ||
+    (stats?.cache_creation_input_token_cost ?? 0) > 0 ||
+    (stats?.cache_read_input_token_cost ?? 0) > 0;
+  if (!hasBillableRates) {
+    return false;
+  }
+
+  const components = ["input", "cached", "cacheCreate", "output", "reasoning"] as const;
+  let hasTokens = false;
+  for (const key of components) {
+    const component = usage[key];
+    if (component.tokens > 0) {
+      hasTokens = true;
+    }
+    if (component.cost_usd !== 0) {
+      return false;
+    }
+  }
+
+  return hasTokens;
+}
+
+/**
+ * Recompute cost aggregates for a single session-usage entry so session totals
+ * and last-request costs reflect the current model mapping.
+ *
+ * Skips non-model aggregate buckets (e.g. "historical" from legacy compaction
+ * summaries) and costs-included entries (gateway-billed requests where cost_usd
+ * was explicitly zeroed).
+ */
+function repriceSessionUsage(
+  usage: z.infer<typeof SessionUsageFileSchema>,
+  config: ProvidersConfigMap,
+  providersConfigFingerprint: number
+): void {
+  if (usage.tokenStatsCache?.providersConfigVersion !== providersConfigFingerprint) {
+    usage.tokenStatsCache = undefined;
+  }
+  for (const [model, entry] of Object.entries(usage.byModel)) {
+    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
+    const resolved = resolveModelForMetadata(model, config);
+    usage.byModel[model] = recomputeUsageCosts(entry, resolved);
+  }
+  if (
+    usage.lastRequest &&
+    !isCostsIncludedEntry(usage.lastRequest.usage, usage.lastRequest.model, config)
+  ) {
+    const resolved = resolveModelForMetadata(usage.lastRequest.model, config);
+    usage.lastRequest.usage = recomputeUsageCosts(usage.lastRequest.usage, resolved);
+  }
+}
+
+/**
  * External store for workspace aggregators and streaming state.
  *
  * This store lives outside React's lifecycle and manages all workspace
@@ -394,6 +486,17 @@ export class WorkspaceStore {
   private usageStore = new MapStore<string, WorkspaceUsageState>();
   private client: RouterClient<AppRouter> | null = null;
   private clientChangeController = new AbortController();
+  private providersConfig: ProvidersConfigMap | null = null;
+  /** Stable fingerprint for cache freshness checks across reconnects/app restarts.
+   * `null` until the first successful config fetch — prevents hydrating stale caches
+   * and blocks tokenization until we know the real configuration. */
+  private providersConfigFingerprint: number | null = null;
+  /** Monotonic request counter for serializing provider config refreshes (latest wins). */
+  private providersConfigVersion = 0;
+  /** Version of the last successfully applied provider config (prevents stale overwrites). */
+  private providersConfigAppliedVersion = 0;
+  /** Consecutive provider-config subscription/refresh failures (used for exponential backoff). */
+  private providersConfigFailureStreak = 0;
   // Workspaces that need a clean history replay once a new iterator is established.
   // We keep the existing UI visible until the replay can actually start.
   private pendingReplayReset = new Set<string>();
@@ -525,7 +628,12 @@ export class WorkspaceStore {
       const rawUsage = streamEndData.metadata?.usage;
       const providerMetadata = streamEndData.metadata?.providerMetadata;
       if (model && rawUsage) {
-        const usage = createDisplayUsage(rawUsage, model, providerMetadata);
+        const usage = createDisplayUsage(
+          rawUsage,
+          model,
+          providerMetadata,
+          this.resolveMetadataModel(model)
+        );
         if (usage) {
           const normalizedModel = normalizeGatewayModel(model);
           const current = this.sessionUsage.get(workspaceId) ?? {
@@ -761,13 +869,127 @@ export class WorkspaceStore {
     this.onModelUsed = onModelUsed;
 
     // Initialize consumer calculation manager
-    this.consumerManager = new WorkspaceConsumerManager((workspaceId) => {
-      this.consumersStore.bump(workspaceId);
-    });
+    this.consumerManager = new WorkspaceConsumerManager(
+      (workspaceId) => {
+        this.consumersStore.bump(workspaceId);
+      },
+      () => this.providersConfigFingerprint
+    );
 
     // Note: We DON'T auto-check recency on every state bump.
     // Instead, checkAndBumpRecencyIfChanged() is called explicitly after
     // message completion events (not on deltas) to prevent App.tsx re-renders.
+  }
+
+  private resolveMetadataModel(model: string): string {
+    return resolveModelForMetadata(model, this.providersConfig);
+  }
+
+  private bumpAllUsageStoreEntries(): void {
+    for (const workspaceId of this.aggregators.keys()) {
+      this.usageStore.bump(workspaceId);
+    }
+  }
+
+  private async refreshProvidersConfig(client: RouterClient<AppRouter>): Promise<void> {
+    // Version counter prevents an older, slower response from overwriting a newer one.
+    // We bump eagerly so concurrent requests each get unique versions, then only apply
+    // if no newer response has already been written (version >= lastApplied).
+    const version = ++this.providersConfigVersion;
+    try {
+      const config = await client.providers.getConfig();
+      if (
+        this.client !== client ||
+        this.clientChangeController.signal.aborted ||
+        version < this.providersConfigAppliedVersion
+      ) {
+        return;
+      }
+
+      const previousFingerprint = this.providersConfigFingerprint;
+      const nextFingerprint = computeProvidersConfigFingerprint(config);
+
+      this.providersConfigAppliedVersion = version;
+      this.providersConfigFailureStreak = 0;
+      this.providersConfig = config;
+      this.providersConfigFingerprint = nextFingerprint;
+
+      if (previousFingerprint !== nextFingerprint) {
+        // Invalidate consumer token stats — both in-memory and persisted —
+        // so mapped-model changes take effect on next access.
+        this.consumerManager.invalidateAll();
+
+        for (const [, usage] of this.sessionUsage) {
+          repriceSessionUsage(usage, config, nextFingerprint);
+        }
+      }
+
+      // Bump usage-store subscribers AFTER repricing so observers see
+      // updated cost totals. Must happen on every successful apply (not
+      // just fingerprint changes) to unblock initial hydration.
+      this.bumpAllUsageStoreEntries();
+    } catch {
+      // Existing providersConfig is preserved so metadata resolution
+      // continues using the last successful snapshot. Retry with
+      // exponential backoff to recover from transient errors — both
+      // at startup (fingerprint still null, tokenization blocked) and
+      // after onConfigChanged notifications where the fetch failed.
+      if (this.client === client && !this.clientChangeController.signal.aborted) {
+        this.providersConfigFailureStreak++;
+        const retryDelay = Math.min(1000 * 2 ** (this.providersConfigFailureStreak - 1), 30_000);
+        setTimeout(() => {
+          if (this.client === client && !this.clientChangeController.signal.aborted) {
+            void this.refreshProvidersConfig(client);
+          }
+        }, retryDelay);
+      }
+    }
+  }
+
+  private subscribeToProvidersConfig(client: RouterClient<AppRouter>): void {
+    const { signal } = this.clientChangeController;
+
+    (async () => {
+      // Some oRPC iterators don't eagerly close on abort alone.
+      // Ensure we `return()` them so backend subscriptions clean up EventEmitter listeners.
+      let iterator: AsyncIterator<unknown> | null = null;
+
+      try {
+        const subscribedIterator = await client.providers.onConfigChanged(undefined, { signal });
+
+        if (signal.aborted || this.client !== client) {
+          void subscribedIterator.return?.();
+          return;
+        }
+
+        iterator = subscribedIterator;
+
+        for await (const _ of subscribedIterator) {
+          if (signal.aborted || this.client !== client) {
+            break;
+          }
+
+          this.providersConfigFailureStreak = 0;
+          void this.refreshProvidersConfig(client);
+        }
+      } catch {
+        // Subscription stream failed — fall through to retry below.
+      } finally {
+        void iterator?.return?.();
+      }
+
+      // Stream ended or errored. Re-subscribe after a delay unless the
+      // client changed or the controller was aborted (intentional teardown).
+      if (!signal.aborted && this.client === client) {
+        this.providersConfigFailureStreak++;
+        const resubDelay = Math.min(1000 * 2 ** (this.providersConfigFailureStreak - 1), 30_000);
+        setTimeout(() => {
+          if (!signal.aborted && this.client === client) {
+            this.subscribeToProvidersConfig(client);
+          }
+        }, resubDelay);
+      }
+    })();
   }
 
   setStatsEnabled(enabled: boolean): void {
@@ -813,6 +1035,8 @@ export class WorkspaceStore {
     this.clientChangeController.abort();
     this.clientChangeController = new AbortController();
 
+    this.bumpAllUsageStoreEntries();
+
     for (const workspaceId of this.workspaceMetadata.keys()) {
       this.pendingReplayReset.add(workspaceId);
     }
@@ -833,6 +1057,8 @@ export class WorkspaceStore {
     }
 
     this.ensureActiveOnChatSubscription();
+    void this.refreshProvidersConfig(client);
+    this.subscribeToProvidersConfig(client);
   }
 
   setActiveWorkspaceId(workspaceId: string | null): void {
@@ -1708,7 +1934,12 @@ export class WorkspaceStore {
               msg.metadata?.contextProviderMetadata ?? msg.metadata?.providerMetadata;
             if (rawUsage) {
               const msgModel = msg.metadata?.model ?? model ?? "unknown";
-              return createDisplayUsage(rawUsage, msgModel, providerMeta);
+              return createDisplayUsage(
+                rawUsage,
+                msgModel,
+                providerMeta,
+                this.resolveMetadataModel(msgModel)
+              );
             }
           }
         }
@@ -1725,7 +1956,12 @@ export class WorkspaceStore {
         : undefined;
       const liveUsage =
         rawContextUsage && model
-          ? createDisplayUsage(rawContextUsage, model, rawStepProviderMetadata)
+          ? createDisplayUsage(
+              rawContextUsage,
+              model,
+              rawStepProviderMetadata,
+              this.resolveMetadataModel(model)
+            )
           : undefined;
 
       const rawCumulativeUsage = activeStreamId
@@ -1736,7 +1972,12 @@ export class WorkspaceStore {
         : undefined;
       const liveCostUsage =
         rawCumulativeUsage && model
-          ? createDisplayUsage(rawCumulativeUsage, model, rawCumulativeProviderMetadata)
+          ? createDisplayUsage(
+              rawCumulativeUsage,
+              model,
+              rawCumulativeProviderMetadata,
+              this.resolveMetadataModel(model)
+            )
           : undefined;
 
       return { sessionTotal, lastRequest, lastContextUsage, totalTokens, liveUsage, liveCostUsage };
@@ -1760,6 +2001,16 @@ export class WorkspaceStore {
 
     const model = aggregator.getCurrentModel() ?? "unknown";
     if (tokenStatsCache.model !== model) {
+      return false;
+    }
+
+    // Reject hydration if provider config hasn't loaded yet (fingerprint is null)
+    // or if the cached fingerprint doesn't match the current config. This prevents
+    // stale caches from being served before we know the real configuration.
+    if (
+      this.providersConfigFingerprint == null ||
+      tokenStatsCache.providersConfigVersion !== this.providersConfigFingerprint
+    ) {
       return false;
     }
 
@@ -2584,6 +2835,18 @@ export class WorkspaceStore {
       .getSessionUsage({ workspaceId })
       .then((data) => {
         if (data) {
+          // If provider config is already loaded AND the config has changed
+          // since the cached data was written, reprice the hydrated usage so
+          // costs reflect the current model mapping. Skip when fingerprints
+          // match to avoid discarding a valid tokenStatsCache (which would
+          // force expensive re-tokenization for large histories).
+          if (
+            this.providersConfig &&
+            this.providersConfigFingerprint != null &&
+            data.tokenStatsCache?.providersConfigVersion !== this.providersConfigFingerprint
+          ) {
+            repriceSessionUsage(data, this.providersConfig, this.providersConfigFingerprint);
+          }
           this.sessionUsage.set(workspaceId, data);
           this.usageStore.bump(workspaceId);
         }
@@ -2710,6 +2973,10 @@ export class WorkspaceStore {
       this.activityAbortController.abort();
       this.activityAbortController = null;
     }
+
+    // Abort client-scoped subscriptions (providers.onConfigChanged, stats, etc.)
+    // so async iterators/timers cannot mutate cleared state after disposal.
+    this.clientChangeController.abort();
 
     this.activeWorkspaceId = null;
     this.activeOnChatWorkspaceId = null;
