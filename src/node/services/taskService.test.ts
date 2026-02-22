@@ -20,6 +20,10 @@ import { defaultModel } from "@/common/utils/ai/models";
 import type { PlanSubagentExecutorRouting } from "@/common/types/tasks";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { StreamEndEvent } from "@/common/types/stream";
+import {
+  PLAN_AUTO_ROUTING_STATUS_EMOJI,
+  PLAN_AUTO_ROUTING_STATUS_MESSAGE,
+} from "@/common/constants/planAutoRoutingStatus";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "@/node/services/aiService";
@@ -157,6 +161,7 @@ function createWorkspaceServiceMocks(
     emit: ReturnType<typeof mock>;
     getInfo: ReturnType<typeof mock>;
     replaceHistory: ReturnType<typeof mock>;
+    updateAgentStatus: ReturnType<typeof mock>;
   }>
 ): {
   workspaceService: WorkspaceService;
@@ -166,6 +171,7 @@ function createWorkspaceServiceMocks(
   emit: ReturnType<typeof mock>;
   getInfo: ReturnType<typeof mock>;
   replaceHistory: ReturnType<typeof mock>;
+  updateAgentStatus: ReturnType<typeof mock>;
 } {
   const sendMessage =
     overrides?.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
@@ -178,6 +184,8 @@ function createWorkspaceServiceMocks(
   const getInfo = overrides?.getInfo ?? mock(() => Promise.resolve(null));
   const replaceHistory =
     overrides?.replaceHistory ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+  const updateAgentStatus =
+    overrides?.updateAgentStatus ?? mock((): Promise<void> => Promise.resolve());
 
   return {
     workspaceService: {
@@ -187,6 +195,7 @@ function createWorkspaceServiceMocks(
       emit,
       getInfo,
       replaceHistory,
+      updateAgentStatus,
     } as unknown as WorkspaceService,
     sendMessage,
     resumeStream,
@@ -194,6 +203,7 @@ function createWorkspaceServiceMocks(
     emit,
     getInfo,
     replaceHistory,
+    updateAgentStatus,
   };
 }
 
@@ -3477,7 +3487,7 @@ describe("TaskService", () => {
       namedWorkspacePath: childWorkspacePath,
     }));
     const replaceHistory = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+    const { workspaceService, sendMessage, updateAgentStatus } = createWorkspaceServiceMocks({
       getInfo,
       replaceHistory,
       sendMessage: options?.sendMessageOverride,
@@ -3496,6 +3506,7 @@ describe("TaskService", () => {
       sendMessage,
       replaceHistory,
       createModel,
+      updateAgentStatus,
       internal,
     };
   }
@@ -3687,7 +3698,7 @@ describe("TaskService", () => {
   });
 
   test("stream-end with propose_plan success in auto routing falls back to exec when plan content is unavailable", async () => {
-    const { config, childId, sendMessage, createModel, internal } =
+    const { config, childId, sendMessage, createModel, updateAgentStatus, internal } =
       await setupPlanModeStreamEndHarness({
         planSubagentExecutorRouting: "auto",
       });
@@ -3702,6 +3713,16 @@ describe("TaskService", () => {
       expect.objectContaining({ agentId: "exec" }),
       expect.objectContaining({ synthetic: true })
     );
+    expect(updateAgentStatus).toHaveBeenNthCalledWith(
+      1,
+      childId,
+      expect.objectContaining({
+        emoji: PLAN_AUTO_ROUTING_STATUS_EMOJI,
+        message: PLAN_AUTO_ROUTING_STATUS_MESSAGE,
+        url: "",
+      })
+    );
+    expect(updateAgentStatus).toHaveBeenNthCalledWith(2, childId, null);
 
     const postCfg = config.loadConfigOrDefault();
     const updatedTask = Array.from(postCfg.projects.values())

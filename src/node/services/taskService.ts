@@ -56,6 +56,10 @@ import {
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import {
+  PLAN_AUTO_ROUTING_STATUS_EMOJI,
+  PLAN_AUTO_ROUTING_STATUS_MESSAGE,
+} from "@/common/constants/planAutoRoutingStatus";
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
 import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
 import {
@@ -2480,21 +2484,41 @@ export class TaskService {
         });
       }
 
-      const targetAgentId = await this.resolvePlanAutoHandoffTargetAgentId({
-        workspaceId: args.workspaceId,
-        entry: {
-          projectPath: args.entry.projectPath,
-          workspace: {
-            id: args.entry.workspace.id,
-            name: args.entry.workspace.name,
-            path: args.entry.workspace.path,
-            runtimeConfig: args.entry.workspace.runtimeConfig,
-            taskModelString: args.entry.workspace.taskModelString,
-          },
-        },
-        routing: args.planSubagentExecutorRouting,
-        planContent: planSummary?.content ?? null,
-      });
+      const targetAgentId = await (async () => {
+        const shouldShowRoutingStatus = args.planSubagentExecutorRouting === "auto";
+        if (shouldShowRoutingStatus) {
+          // Auto routing can pause for up to the LLM timeout; surface progress in the sidebar.
+          await this.workspaceService.updateAgentStatus(args.workspaceId, {
+            emoji: PLAN_AUTO_ROUTING_STATUS_EMOJI,
+            message: PLAN_AUTO_ROUTING_STATUS_MESSAGE,
+            // ExtensionMetadataService carries forward the previous status URL when url is omitted.
+            // Use an explicit empty string sentinel to clear stale links for this transient status.
+            url: "",
+          });
+        }
+
+        try {
+          return await this.resolvePlanAutoHandoffTargetAgentId({
+            workspaceId: args.workspaceId,
+            entry: {
+              projectPath: args.entry.projectPath,
+              workspace: {
+                id: args.entry.workspace.id,
+                name: args.entry.workspace.name,
+                path: args.entry.workspace.path,
+                runtimeConfig: args.entry.workspace.runtimeConfig,
+                taskModelString: args.entry.workspace.taskModelString,
+              },
+            },
+            routing: args.planSubagentExecutorRouting,
+            planContent: planSummary?.content ?? null,
+          });
+        } finally {
+          if (shouldShowRoutingStatus) {
+            await this.workspaceService.updateAgentStatus(args.workspaceId, null);
+          }
+        }
+      })();
 
       const summaryContent = planSummary
         ? `# Plan\n\n${planSummary.content}\n\nNote: This chat already contains the full plan; no need to re-open the plan file.\n\n---\n\n*Plan file preserved at:* \`${planSummary.path}\``

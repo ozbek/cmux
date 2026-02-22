@@ -40,6 +40,10 @@ import {
   TooltipTrigger,
 } from "@/browser/components/ui/tooltip";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import {
+  PLAN_AUTO_ROUTING_STATUS_EMOJI,
+  PLAN_AUTO_ROUTING_STATUS_MESSAGE,
+} from "@/common/constants/planAutoRoutingStatus";
 
 export default {
   ...appMeta,
@@ -1717,6 +1721,84 @@ graph TD
           "Shows the ProposePlanToolCall component with a completed plan. " +
           "The plan card displays with the title in the header and icon action buttons " +
           "(Copy, Start Here, Show Text) at the bottom, matching the AssistantMessage aesthetic.",
+      },
+    },
+  },
+};
+
+/**
+ * Captures the handoff pause after a plan is presented and before the executor stream starts.
+ *
+ * This reproduces the visual state where the sidebar shows "Deciding execution strategy…"
+ * while the proposed plan remains visible in the conversation.
+ */
+export const ProposePlanAutoRoutingDecisionGap: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-plan-auto-routing-gap",
+          workspaceName: "feature/plan-auto-routing",
+          messages: [
+            createUserMessage(
+              "msg-1",
+              "Plan and implement a safe migration rollout for auth tokens.",
+              {
+                historySequence: 1,
+                timestamp: STABLE_TIMESTAMP - 240000,
+              }
+            ),
+            createAssistantMessage("msg-2", "Here is the implementation plan.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 230000,
+              toolCalls: [
+                createProposePlanTool(
+                  "call-plan-1",
+                  `# Auth Token Migration Rollout
+
+## Goals
+
+- Migrate token validation to the new signing service.
+- Maintain compatibility during rollout.
+- Keep rollback simple and low risk.
+
+## Steps
+
+1. Add dual-read token validation behind a feature flag.
+2. Ship telemetry for token verification outcomes.
+3. Enable new validator for 10% of traffic.
+4. Ramp to 100% after stability checks.
+5. Remove legacy validator once metrics stay healthy.
+
+## Rollback
+
+- Disable the rollout flag to return to legacy validation immediately.
+- Keep telemetry running to confirm recovery.`
+                ),
+              ],
+            }),
+            createAssistantMessage("msg-3", "Selecting the right executor for this plan.", {
+              historySequence: 3,
+              timestamp: STABLE_TIMESTAMP - 220000,
+              toolCalls: [
+                createStatusTool(
+                  "call-status-1",
+                  PLAN_AUTO_ROUTING_STATUS_EMOJI,
+                  PLAN_AUTO_ROUTING_STATUS_MESSAGE
+                ),
+              ],
+            }),
+          ],
+        })
+      }
+    />
+  ),
+  parameters: {
+    docs: {
+      description: {
+        story:
+          "Chromatic regression story for the plan auto-routing gap: after `propose_plan` succeeds, " +
+          "the sidebar stays in a working state with a 'Deciding execution strategy…' status before executor kickoff.",
       },
     },
   },
