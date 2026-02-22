@@ -12,6 +12,7 @@ import type {
 import type { TaskSettings, SubagentAiDefaults } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
 import type { AgentAiDefaults } from "./agentAiDefaults";
+import type { RuntimeEnablementId } from "./runtime";
 
 export type Workspace = z.infer<typeof WorkspaceConfigSchema>;
 
@@ -125,6 +126,9 @@ export interface ProjectsConfig {
    */
   stopCoderWorkspaceOnArchive?: boolean;
 
+  /** Global default runtime for new workspaces. */
+  defaultRuntime?: RuntimeEnablementId;
+
   /**
    * Override the default shell for local integrated terminals.
    *
@@ -134,4 +138,10 @@ export interface ProjectsConfig {
    * Accepts an absolute path (e.g. "/usr/bin/fish") or a command name (e.g. "fish").
    */
   terminalDefaultShell?: string;
+
+  /**
+   * Runtime enablement overrides (shared via ~/.mux/config.json).
+   * Defaults to enabled; store `false` only to keep config.json minimal.
+   */
+  runtimeEnablement?: Partial<Record<RuntimeEnablementId, false>>;
 }

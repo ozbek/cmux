@@ -7,7 +7,11 @@ import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./mess
 import { ProjectConfigSchema, SectionConfigSchema } from "./project";
 import { ResultSchema } from "./result";
 import { HostKeyVerificationEventSchema } from "./ssh";
-import { RuntimeConfigSchema, RuntimeAvailabilitySchema } from "./runtime";
+import {
+  RuntimeConfigSchema,
+  RuntimeAvailabilitySchema,
+  RuntimeEnablementIdSchema,
+} from "./runtime";
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
@@ -1538,6 +1542,8 @@ export const config = {
       hiddenModels: z.array(z.string()).optional(),
       preferredCompactionModel: z.string().optional(),
       stopCoderWorkspaceOnArchive: z.boolean(),
+      runtimeEnablement: z.record(z.string(), z.boolean()),
+      defaultRuntime: z.string().nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
       // Legacy fields (downgrade compatibility)
       subagentAiDefaults: SubagentAiDefaultsSchema,
@@ -1591,6 +1597,17 @@ export const config = {
     input: z
       .object({
         stopCoderWorkspaceOnArchive: z.boolean(),
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateRuntimeEnablement: {
+    input: z
+      .object({
+        projectPath: z.string().nullish(),
+        runtimeEnablement: z.record(z.string(), z.boolean()).nullish(),
+        defaultRuntime: RuntimeEnablementIdSchema.nullish(),
+        runtimeOverridesEnabled: z.boolean().nullish(),
       })
       .strict(),
     output: z.void(),

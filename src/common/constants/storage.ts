@@ -80,6 +80,26 @@ export const EXPANDED_PROJECTS_KEY = "expandedProjects";
 export const WORKSPACE_DRAFTS_BY_PROJECT_KEY = "workspaceDraftsByProject";
 
 /**
+ * LocalStorage keys for Mux Gateway routing preferences (global).
+ *
+ * Note: localStorage is origin-scoped (includes port), so these values are also
+ * mirrored into ~/.mux/config.json for portability across server ports.
+ */
+export const GATEWAY_MODELS_KEY = "gateway-models"; // enabled model IDs (canonical)
+export const GATEWAY_CONFIGURED_KEY = "gateway-available"; // synced from provider config
+export const GATEWAY_ENABLED_KEY = "gateway-enabled"; // global on/off toggle
+
+/**
+ * Storage key for runtime enablement settings (shared via ~/.mux/config.json).
+ */
+export const RUNTIME_ENABLEMENT_KEY = "runtimeEnablement";
+
+/**
+ * Storage key for global default runtime selection (shared via ~/.mux/config.json).
+ */
+export const DEFAULT_RUNTIME_KEY = "defaultRuntime";
+
+/**
  * Get the localStorage key for cached MCP server test results (per project)
  * Format: "mcpTestResults:{projectPath}"
  * Stores: Record<serverName, CachedMCPTestResult>
