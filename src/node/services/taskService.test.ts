@@ -1652,6 +1652,75 @@ describe("TaskService", () => {
     );
   });
 
+  test("hard-interrupted parent skips tasks-completed auto-resume after child report", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-111";
+    const childTaskId = "task-222";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                path: path.join(projectPath, "parent"),
+                id: parentWorkspaceId,
+                name: "parent",
+                aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+              },
+              {
+                path: path.join(projectPath, "child-task"),
+                id: childTaskId,
+                name: "agent_explore_child",
+                parentWorkspaceId,
+                agentType: "explore",
+                taskStatus: "running",
+                taskModelString: "openai:gpt-5.2",
+                taskThinkingLevel: "medium",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+    });
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    taskService.markParentWorkspaceInterrupted(parentWorkspaceId);
+
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-5.2" },
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-call-1",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Hello from child", title: "Result" },
+          state: "output-available",
+          output: { success: true },
+        },
+      ],
+    });
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("terminateDescendantAgentTask stops stream, removes workspace, and rejects waiters", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -1759,6 +1828,95 @@ describe("TaskService", () => {
 
     expect(remove).toHaveBeenNthCalledWith(1, childTaskId, true);
     expect(remove).toHaveBeenNthCalledWith(2, parentTaskId, true);
+  });
+
+  test("terminateAllDescendantAgentTasks terminates entire subtree leaf-first", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "root-111";
+    const parentTaskId = "task-parent";
+    const childTaskId = "task-child";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { path: path.join(projectPath, "root"), id: rootWorkspaceId, name: "root" },
+              {
+                path: path.join(projectPath, "parent-task"),
+                id: parentTaskId,
+                name: "agent_exec_parent",
+                parentWorkspaceId: rootWorkspaceId,
+                agentType: "exec",
+                taskStatus: "running",
+              },
+              {
+                path: path.join(projectPath, "child-task"),
+                id: childTaskId,
+                name: "agent_explore_child",
+                parentWorkspaceId: parentTaskId,
+                agentType: "explore",
+                taskStatus: "running",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+    });
+
+    const { aiService, stopStream } = createAIServiceMocks(config);
+    const { workspaceService, remove } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    const terminatedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
+    expect(terminatedTaskIds).toEqual([childTaskId, parentTaskId]);
+
+    expect(stopStream).toHaveBeenNthCalledWith(
+      1,
+      childTaskId,
+      expect.objectContaining({ abandonPartial: true })
+    );
+    expect(stopStream).toHaveBeenNthCalledWith(
+      2,
+      parentTaskId,
+      expect.objectContaining({ abandonPartial: true })
+    );
+    expect(remove).toHaveBeenNthCalledWith(1, childTaskId, true);
+    expect(remove).toHaveBeenNthCalledWith(2, parentTaskId, true);
+  });
+
+  test("terminateAllDescendantAgentTasks is a no-op with no descendants", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "root-111";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { path: path.join(projectPath, "root"), id: rootWorkspaceId, name: "root" },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+    });
+
+    const { aiService, stopStream } = createAIServiceMocks(config);
+    const { workspaceService, remove } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    const terminatedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
+    expect(terminatedTaskIds).toEqual([]);
+    expect(stopStream).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
   });
 
   test("initialize resumes awaiting_report tasks after restart", async () => {
@@ -3999,6 +4157,21 @@ describe("TaskService", () => {
       // Now auto-resume should work again
       await internal.handleStreamEnd(makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(4);
+    });
+
+    test("markParentWorkspaceInterrupted suppresses parent auto-resume until reset", async () => {
+      const { internal, sendMessage, taskService, rootWorkspaceId, makeStreamEndEvent } =
+        await setupParentWithActiveChild(rootDir);
+
+      taskService.markParentWorkspaceInterrupted(rootWorkspaceId);
+
+      await internal.handleStreamEnd(makeStreamEndEvent());
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      taskService.resetAutoResumeCount(rootWorkspaceId);
+
+      await internal.handleStreamEnd(makeStreamEndEvent());
+      expect(sendMessage).toHaveBeenCalledTimes(1);
     });
 
     test("counter is per-workspace (different workspaces are independent)", async () => {

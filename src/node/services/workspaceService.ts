@@ -3503,9 +3503,19 @@ export class WorkspaceService extends EventEmitter {
   ): Promise<Result<void>> {
     try {
       this.taskService?.resetAutoResumeCount(workspaceId);
+      if (!options?.soft) {
+        // Mark before attempting the session interrupt to close races where a child
+        // could report between stop initiation and descendant cascade termination.
+        this.taskService?.markParentWorkspaceInterrupted(workspaceId);
+      }
+
       const session = this.getOrCreateSession(workspaceId);
       const stopResult = await session.interruptStream(options);
       if (!stopResult.success) {
+        // Interrupt failed, so clear hard-interrupt suppression we set above.
+        if (!options?.soft) {
+          this.taskService?.resetAutoResumeCount(workspaceId);
+        }
         log.error("Failed to stop stream:", stopResult.error);
         return Err(stopResult.error);
       }
@@ -3517,8 +3527,31 @@ export class WorkspaceService extends EventEmitter {
         await this.historyService.deletePartial(workspaceId);
       }
 
+      // Rationale: user-initiated hard interrupts should stop the entire task tree so
+      // descendant sub-agents cannot finish later and auto-resume this workspace.
+      if (!options?.soft) {
+        try {
+          const terminatedTaskIds =
+            await this.taskService?.terminateAllDescendantAgentTasks?.(workspaceId);
+          if (terminatedTaskIds && terminatedTaskIds.length > 0) {
+            log.debug("Cascade-terminated descendant tasks on interrupt", {
+              workspaceId,
+              terminatedTaskIds,
+            });
+          }
+        } catch (error: unknown) {
+          log.error("Failed to cascade-terminate descendant tasks on interrupt", {
+            workspaceId,
+            error,
+          });
+        }
+      }
+
       // Handle queued messages based on option
       if (options?.sendQueuedImmediately) {
+        // `sendQueuedMessages()` routes through AgentSession directly, so explicitly
+        // clear hard-interrupt suppression first (it won't flow through sendMessage()).
+        this.taskService?.resetAutoResumeCount(workspaceId);
         // Send queued messages immediately instead of restoring to input
         session.sendQueuedMessages();
       } else {
@@ -3528,6 +3561,10 @@ export class WorkspaceService extends EventEmitter {
 
       return Ok(undefined);
     } catch (error) {
+      if (!options?.soft) {
+        // Keep suppression state consistent if interrupt setup/stop throws.
+        this.taskService?.resetAutoResumeCount(workspaceId);
+      }
       const errorMessage = getErrorMessage(error);
       log.error("Unexpected error in interruptStream handler:", error);
       return Err(`Failed to interrupt stream: ${errorMessage}`);
