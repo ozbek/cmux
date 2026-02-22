@@ -3187,6 +3187,7 @@ export class WorkspaceService extends EventEmitter {
       options,
     });
 
+    let resumedInterruptedTask = false;
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -3296,6 +3297,14 @@ export class WorkspaceService extends EventEmitter {
       const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
 
       if (shouldQueue) {
+        const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+        if (taskStatus === "interrupted") {
+          return Err({
+            type: "unknown",
+            raw: "Interrupted task is still winding down. Wait until it is idle, then try again.",
+          });
+        }
+
         if (internal?.requireIdle) {
           return Err({
             type: "unknown",
@@ -3329,6 +3338,20 @@ export class WorkspaceService extends EventEmitter {
       if (!internal?.skipAutoResumeReset) {
         this.taskService?.resetAutoResumeCount(workspaceId);
       }
+
+      // Non-destructive interrupt cascades preserve descendant task workspaces with
+      // taskStatus=interrupted. Transition before starting a new stream so TaskService
+      // stream-end handling does not early-return on interrupted status.
+      try {
+        resumedInterruptedTask =
+          (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+      } catch (error: unknown) {
+        log.error("Failed to restore interrupted task status before sendMessage", {
+          workspaceId,
+          error,
+        });
+      }
+
       const result = await session.sendMessage(message, normalizedOptions, {
         synthetic: internal?.synthetic,
       });
@@ -3338,11 +3361,33 @@ export class WorkspaceService extends EventEmitter {
           error: result.error,
         });
 
+        if (resumedInterruptedTask) {
+          try {
+            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          } catch (error: unknown) {
+            log.error("Failed to restore interrupted task status after sendMessage failure", {
+              workspaceId,
+              error,
+            });
+          }
+        }
+
         return result;
       }
 
       return result;
     } catch (error) {
+      if (resumedInterruptedTask) {
+        try {
+          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+        } catch (restoreError: unknown) {
+          log.error("Failed to restore interrupted task status after sendMessage throw", {
+            workspaceId,
+            error: restoreError,
+          });
+        }
+      }
+
       const errorMessage = error instanceof Error ? error.message : JSON.stringify(error, null, 2);
       log.error("Unexpected error in sendMessage handler:", error);
 
@@ -3368,6 +3413,7 @@ export class WorkspaceService extends EventEmitter {
     options: SendMessageOptions,
     internal?: { allowQueuedAgentTask?: boolean }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
+    let resumedInterruptedTask = false;
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -3423,10 +3469,31 @@ export class WorkspaceService extends EventEmitter {
 
       const session = this.getOrCreateSession(workspaceId);
 
+      const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+      if (taskStatus === "interrupted" && session.isBusy()) {
+        return Err({
+          type: "unknown",
+          raw: "Interrupted task is still winding down. Wait until it is idle, then try again.",
+        });
+      }
+
       const normalizedOptions = this.normalizeSendMessageAgentId(options);
 
       // Persist last-used model + thinking level for cross-device consistency.
       await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "resume");
+
+      // Non-destructive interrupt cascades preserve descendant task workspaces with
+      // taskStatus=interrupted. Transition before stream start so TaskService stream-end
+      // handling does not early-return on interrupted status.
+      try {
+        resumedInterruptedTask =
+          (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+      } catch (error: unknown) {
+        log.error("Failed to restore interrupted task status before resumeStream", {
+          workspaceId,
+          error,
+        });
+      }
 
       const result = await session.resumeStream(normalizedOptions);
       if (!result.success) {
@@ -3434,9 +3501,48 @@ export class WorkspaceService extends EventEmitter {
           workspaceId,
           error: result.error,
         });
+        if (resumedInterruptedTask) {
+          try {
+            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          } catch (error: unknown) {
+            log.error("Failed to restore interrupted task status after resumeStream failure", {
+              workspaceId,
+              error,
+            });
+          }
+        }
+        return result;
       }
+
+      // resumeStream can succeed without starting a new stream when the session is
+      // still busy (started=false). Keep interrupted semantics in that case.
+      if (!result.data.started) {
+        if (resumedInterruptedTask) {
+          try {
+            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          } catch (error: unknown) {
+            log.error("Failed to restore interrupted task status after no-op resumeStream", {
+              workspaceId,
+              error,
+            });
+          }
+        }
+        return result;
+      }
+
       return result;
     } catch (error) {
+      if (resumedInterruptedTask) {
+        try {
+          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+        } catch (restoreError: unknown) {
+          log.error("Failed to restore interrupted task status after resumeStream throw", {
+            workspaceId,
+            error: restoreError,
+          });
+        }
+      }
+
       const errorMessage = getErrorMessage(error);
       log.error("Unexpected error in resumeStream handler:", error);
 
@@ -3531,16 +3637,16 @@ export class WorkspaceService extends EventEmitter {
       // descendant sub-agents cannot finish later and auto-resume this workspace.
       if (!options?.soft) {
         try {
-          const terminatedTaskIds =
+          const interruptedTaskIds =
             await this.taskService?.terminateAllDescendantAgentTasks?.(workspaceId);
-          if (terminatedTaskIds && terminatedTaskIds.length > 0) {
-            log.debug("Cascade-terminated descendant tasks on interrupt", {
+          if (interruptedTaskIds && interruptedTaskIds.length > 0) {
+            log.debug("Cascade-interrupted descendant tasks on interrupt", {
               workspaceId,
-              terminatedTaskIds,
+              interruptedTaskIds,
             });
           }
         } catch (error: unknown) {
-          log.error("Failed to cascade-terminate descendant tasks on interrupt", {
+          log.error("Failed to cascade-interrupt descendant tasks on interrupt", {
             workspaceId,
             error,
           });

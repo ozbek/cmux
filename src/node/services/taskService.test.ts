@@ -157,6 +157,7 @@ function createWorkspaceServiceMocks(
   overrides?: Partial<{
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
+    clearQueue: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
     emit: ReturnType<typeof mock>;
     getInfo: ReturnType<typeof mock>;
@@ -167,6 +168,7 @@ function createWorkspaceServiceMocks(
   workspaceService: WorkspaceService;
   sendMessage: ReturnType<typeof mock>;
   resumeStream: ReturnType<typeof mock>;
+  clearQueue: ReturnType<typeof mock>;
   remove: ReturnType<typeof mock>;
   emit: ReturnType<typeof mock>;
   getInfo: ReturnType<typeof mock>;
@@ -178,6 +180,7 @@ function createWorkspaceServiceMocks(
   const resumeStream =
     overrides?.resumeStream ??
     mock((): Promise<Result<{ started: boolean }>> => Promise.resolve(Ok({ started: true })));
+  const clearQueue = overrides?.clearQueue ?? mock((): Result<void> => Ok(undefined));
   const remove =
     overrides?.remove ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const emit = overrides?.emit ?? mock(() => true);
@@ -191,6 +194,7 @@ function createWorkspaceServiceMocks(
     workspaceService: {
       sendMessage,
       resumeStream,
+      clearQueue,
       remove,
       emit,
       getInfo,
@@ -199,6 +203,7 @@ function createWorkspaceServiceMocks(
     } as unknown as WorkspaceService,
     sendMessage,
     resumeStream,
+    clearQueue,
     remove,
     emit,
     getInfo,
@@ -1840,7 +1845,7 @@ describe("TaskService", () => {
     expect(remove).toHaveBeenNthCalledWith(2, parentTaskId, true);
   });
 
-  test("terminateAllDescendantAgentTasks terminates entire subtree leaf-first", async () => {
+  test("terminateAllDescendantAgentTasks interrupts entire subtree leaf-first", async () => {
     const config = await createTestConfig(rootDir);
 
     const projectPath = path.join(rootDir, "repo");
@@ -1878,13 +1883,25 @@ describe("TaskService", () => {
       taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
     });
 
-    const { aiService, stopStream } = createAIServiceMocks(config);
-    const { workspaceService, remove } = createWorkspaceServiceMocks();
+    const callOrder: string[] = [];
+    const clearQueue = mock((workspaceId: string): Result<void> => {
+      callOrder.push(`clear:${workspaceId}`);
+      return Ok(undefined);
+    });
+    const stopStream = mock((workspaceId: string): Promise<Result<void>> => {
+      callOrder.push(`stop:${workspaceId}`);
+      return Promise.resolve(Ok(undefined));
+    });
+
+    const { aiService } = createAIServiceMocks(config, { stopStream });
+    const { workspaceService, remove } = createWorkspaceServiceMocks({ clearQueue });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    const terminatedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
-    expect(terminatedTaskIds).toEqual([childTaskId, parentTaskId]);
+    const interruptedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
+    expect(interruptedTaskIds).toEqual([childTaskId, parentTaskId]);
 
+    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId);
+    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId);
     expect(stopStream).toHaveBeenNthCalledWith(
       1,
       childTaskId,
@@ -1895,8 +1912,20 @@ describe("TaskService", () => {
       parentTaskId,
       expect.objectContaining({ abandonPartial: true })
     );
-    expect(remove).toHaveBeenNthCalledWith(1, childTaskId, true);
-    expect(remove).toHaveBeenNthCalledWith(2, parentTaskId, true);
+    expect(callOrder).toEqual([
+      `clear:${childTaskId}`,
+      `stop:${childTaskId}`,
+      `clear:${parentTaskId}`,
+      `stop:${parentTaskId}`,
+    ]);
+    expect(remove).not.toHaveBeenCalled();
+
+    const saved = config.loadConfigOrDefault();
+    const tasks = saved.projects.get(projectPath)?.workspaces ?? [];
+    const parentTask = tasks.find((workspace) => workspace.id === parentTaskId);
+    const childTask = tasks.find((workspace) => workspace.id === childTaskId);
+    expect(parentTask?.taskStatus).toBe("interrupted");
+    expect(childTask?.taskStatus).toBe("interrupted");
   });
 
   test("terminateAllDescendantAgentTasks is a no-op with no descendants", async () => {
@@ -1927,6 +1956,172 @@ describe("TaskService", () => {
     expect(terminatedTaskIds).toEqual([]);
     expect(stopStream).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  test("terminateAllDescendantAgentTasks preserves queued task prompts across repeated interrupts", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "root-111";
+    const queuedTaskId = "task-queued";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { path: path.join(projectPath, "root"), id: rootWorkspaceId, name: "root" },
+              {
+                path: path.join(projectPath, "queued-task"),
+                id: queuedTaskId,
+                name: "agent_exec_queued",
+                parentWorkspaceId: rootWorkspaceId,
+                agentType: "exec",
+                taskStatus: "queued",
+                taskPrompt: "resume me later",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
+    });
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    const firstInterruptedTaskIds =
+      await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
+    expect(firstInterruptedTaskIds).toEqual([queuedTaskId]);
+
+    const secondInterruptedTaskIds =
+      await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
+    expect(secondInterruptedTaskIds).toEqual([queuedTaskId]);
+
+    const saved = config.loadConfigOrDefault();
+    const tasks = saved.projects.get(projectPath)?.workspaces ?? [];
+    const queuedTask = tasks.find((workspace) => workspace.id === queuedTaskId);
+    expect(queuedTask?.taskStatus).toBe("interrupted");
+    expect(queuedTask?.taskPrompt).toBe("resume me later");
+  });
+
+  test("markInterruptedTaskRunning restores interrupted descendant tasks to running without clearing prompt", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "root-111";
+    const childTaskId = "task-child";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { path: path.join(projectPath, "root"), id: rootWorkspaceId, name: "root" },
+              {
+                path: path.join(projectPath, "child-task"),
+                id: childTaskId,
+                name: "agent_explore_child",
+                parentWorkspaceId: rootWorkspaceId,
+                agentType: "explore",
+                taskStatus: "interrupted",
+                taskPrompt: "stale prompt",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
+    });
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    const transitioned = await taskService.markInterruptedTaskRunning(childTaskId);
+    expect(transitioned).toBe(true);
+
+    const saved = config.loadConfigOrDefault();
+    const tasks = saved.projects.get(projectPath)?.workspaces ?? [];
+    const childTask = tasks.find((workspace) => workspace.id === childTaskId);
+    expect(childTask?.taskStatus).toBe("running");
+    expect(childTask?.taskPrompt).toBe("stale prompt");
+  });
+
+  test("markInterruptedTaskRunning is a no-op for non-interrupted workspaces", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "root-111";
+    const childTaskId = "task-child";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { path: path.join(projectPath, "root"), id: rootWorkspaceId, name: "root" },
+              {
+                path: path.join(projectPath, "child-task"),
+                id: childTaskId,
+                name: "agent_explore_child",
+                parentWorkspaceId: rootWorkspaceId,
+                agentType: "explore",
+                taskStatus: "running",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
+    });
+
+    const editConfigSpy = spyOn(config, "editConfig");
+    const { taskService } = createTaskServiceHarness(config);
+
+    const transitioned = await taskService.markInterruptedTaskRunning(childTaskId);
+
+    expect(transitioned).toBe(false);
+    expect(editConfigSpy).not.toHaveBeenCalled();
+  });
+
+  test("restoreInterruptedTaskAfterResumeFailure reverts running descendant tasks", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "root-111";
+    const childTaskId = "task-child";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { path: path.join(projectPath, "root"), id: rootWorkspaceId, name: "root" },
+              {
+                path: path.join(projectPath, "child-task"),
+                id: childTaskId,
+                name: "agent_explore_child",
+                parentWorkspaceId: rootWorkspaceId,
+                agentType: "explore",
+                taskStatus: "running",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
+    });
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    await taskService.restoreInterruptedTaskAfterResumeFailure(childTaskId);
+
+    const saved = config.loadConfigOrDefault();
+    const tasks = saved.projects.get(projectPath)?.workspaces ?? [];
+    const childTask = tasks.find((workspace) => workspace.id === childTaskId);
+    expect(childTask?.taskStatus).toBe("interrupted");
   });
 
   test("initialize resumes awaiting_report tasks after restart", async () => {
@@ -2091,6 +2286,50 @@ describe("TaskService", () => {
 
     const report = await reportPromise;
     expect(report.reportMarkdown).toBe("ok");
+  });
+
+  test("waitForAgentReport rejects interrupted tasks without waiting", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    await config.saveConfig({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { path: path.join(projectPath, "parent"), id: parentId, name: "parent" },
+              {
+                path: path.join(projectPath, "child"),
+                id: childId,
+                name: "agent_explore_child",
+                parentWorkspaceId: parentId,
+                agentType: "explore",
+                taskStatus: "interrupted",
+              },
+            ],
+          },
+        ],
+      ]),
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
+    });
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    let caught: unknown = null;
+    try {
+      await taskService.waitForAgentReport(childId, { timeoutMs: 10_000 });
+    } catch (error: unknown) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    if (caught instanceof Error) {
+      expect(caught.message).toMatch(/Task interrupted/);
+    }
   });
 
   test("waitForAgentReport returns persisted report after workspace is removed", async () => {
