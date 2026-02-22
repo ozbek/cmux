@@ -74,7 +74,7 @@ import { isValidModelFormat, normalizeGatewayModel } from "@/common/utils/ai/mod
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import type { StreamEndEvent, StreamAbortEvent } from "@/common/types/stream";
+import type { StreamEndEvent, StreamAbortEvent, ToolCallEndEvent } from "@/common/types/stream";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { WorkspaceAISettingsSchema } from "@/common/orpc/schemas";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
@@ -126,6 +126,7 @@ const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
 
 // Shared type for workspace-scoped AI settings (model + thinking)
 type WorkspaceAISettings = z.infer<typeof WorkspaceAISettingsSchema>;
+type WorkspaceAgentStatus = NonNullable<WorkspaceActivitySnapshot["agentStatus"]>;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 interface FileCompletionsCacheEntry {
@@ -947,6 +948,11 @@ export class WorkspaceService extends EventEmitter {
   // cancel any fire-and-forget init work to avoid orphaned processes (e.g., SSH sync, .mux/init).
   private readonly initAbortControllers = new Map<string, AbortController>();
 
+  // Per-workspace queue to serialize extension metadata read-modify-write cycles.
+  // This prevents last-writer-wins races between recency/streaming/status_set updates
+  // that all persist through the same extensionMetadata.json file.
+  private readonly metadataWriteQueues = new Map<string, Promise<void>>();
+
   /** Check if a workspace is currently being removed. */
   isRemoving(workspaceId: string): boolean {
     return this.removingWorkspaces.has(workspaceId);
@@ -1036,6 +1042,34 @@ export class WorkspaceService extends EventEmitter {
       isWorkspaceEvent(v) &&
       (!("metadata" in (v as Record<string, unknown>)) || isObj((v as StreamEndEvent).metadata));
     const isStreamAbortEvent = (v: unknown): v is StreamAbortEvent => isWorkspaceEvent(v);
+    const isToolCallEndEvent = (v: unknown): v is ToolCallEndEvent =>
+      isWorkspaceEvent(v) &&
+      "toolName" in v &&
+      typeof (v as { toolName: unknown }).toolName === "string" &&
+      "result" in v;
+    const extractStatusSetResult = (result: unknown): WorkspaceAgentStatus | null => {
+      if (!isObj(result)) {
+        return null;
+      }
+
+      if (
+        result.success !== true ||
+        typeof result.emoji !== "string" ||
+        typeof result.message !== "string"
+      ) {
+        return null;
+      }
+
+      if (result.url !== undefined && typeof result.url !== "string") {
+        return null;
+      }
+
+      return {
+        emoji: result.emoji,
+        message: result.message,
+        ...(typeof result.url === "string" ? { url: result.url } : {}),
+      };
+    };
     const extractTimestamp = (event: StreamEndEvent | { metadata?: { timestamp?: number } }) => {
       const raw = event.metadata?.timestamp;
       return typeof raw === "number" && Number.isFinite(raw) ? raw : Date.now();
@@ -1058,6 +1092,19 @@ export class WorkspaceService extends EventEmitter {
       if (isStreamAbortEvent(data)) {
         void this.updateStreamingStatus(data.workspaceId, false);
       }
+    });
+
+    this.aiService.on("tool-call-end", (data: unknown) => {
+      if (!isToolCallEndEvent(data) || data.replay === true || data.toolName !== "status_set") {
+        return;
+      }
+
+      const agentStatus = extractStatusSetResult(data.result);
+      if (!agentStatus) {
+        return;
+      }
+
+      void this.updateAgentStatus(data.workspaceId, agentStatus);
     });
   }
 
@@ -1083,15 +1130,49 @@ export class WorkspaceService extends EventEmitter {
     this.emit("activity", { workspaceId, activity: snapshot });
   }
 
+  private async enqueueMetadataWrite(
+    workspaceId: string,
+    write: () => Promise<void>
+  ): Promise<void> {
+    const previous = this.metadataWriteQueues.get(workspaceId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(write);
+
+    this.metadataWriteQueues.set(workspaceId, next);
+
+    try {
+      await next;
+    } finally {
+      if (this.metadataWriteQueues.get(workspaceId) === next) {
+        this.metadataWriteQueues.delete(workspaceId);
+      }
+    }
+  }
+
   private async updateRecencyTimestamp(workspaceId: string, timestamp?: number): Promise<void> {
     try {
-      const snapshot = await this.extensionMetadata.updateRecency(
-        workspaceId,
-        timestamp ?? Date.now()
-      );
-      this.emitWorkspaceActivity(workspaceId, snapshot);
+      await this.enqueueMetadataWrite(workspaceId, async () => {
+        const snapshot = await this.extensionMetadata.updateRecency(
+          workspaceId,
+          timestamp ?? Date.now()
+        );
+        this.emitWorkspaceActivity(workspaceId, snapshot);
+      });
     } catch (error) {
       log.error("Failed to update workspace recency", { workspaceId, error });
+    }
+  }
+
+  private async updateAgentStatus(
+    workspaceId: string,
+    agentStatus: WorkspaceAgentStatus | null
+  ): Promise<void> {
+    try {
+      await this.enqueueMetadataWrite(workspaceId, async () => {
+        const snapshot = await this.extensionMetadata.setAgentStatus(workspaceId, agentStatus);
+        this.emitWorkspaceActivity(workspaceId, snapshot);
+      });
+    } catch (error) {
+      log.error("Failed to update workspace agent status", { workspaceId, error });
     }
   }
 
@@ -1120,13 +1201,15 @@ export class WorkspaceService extends EventEmitter {
           thinkingLevel = aiSettings?.thinkingLevel;
         }
       }
-      const snapshot = await this.extensionMetadata.setStreaming(
-        workspaceId,
-        streaming,
-        model,
-        thinkingLevel
-      );
-      this.emitWorkspaceActivity(workspaceId, snapshot);
+      await this.enqueueMetadataWrite(workspaceId, async () => {
+        const snapshot = await this.extensionMetadata.setStreaming(
+          workspaceId,
+          streaming,
+          model,
+          thinkingLevel
+        );
+        this.emitWorkspaceActivity(workspaceId, snapshot);
+      });
     } catch (error) {
       log.error("Failed to update workspace streaming status", { workspaceId, error });
     }
@@ -1218,6 +1301,15 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  // Clear persisted sidebar status only after the user turn is accepted and emitted.
+  // sendMessage can fail before acceptance (for example invalid_model_string), so
+  // clearing inside sendMessage would drop status for turns that never entered history.
+  private shouldClearAgentStatusFromChatMessage(message: WorkspaceChatMessage): boolean {
+    return (
+      message.type === "message" && message.role === "user" && message.metadata?.synthetic !== true
+    );
+  }
+
   public getOrCreateSession(workspaceId: string): AgentSession {
     assert(typeof workspaceId === "string", "workspaceId must be a string");
     const trimmed = workspaceId.trim();
@@ -1246,6 +1338,9 @@ export class WorkspaceService extends EventEmitter {
 
     const chatUnsubscribe = session.onChatEvent((event) => {
       this.emit("chat", { workspaceId: event.workspaceId, message: event.message });
+      if (this.shouldClearAgentStatusFromChatMessage(event.message)) {
+        void this.updateAgentStatus(event.workspaceId, null);
+      }
     });
 
     const metadataUnsubscribe = session.onMetadataEvent((event) => {
@@ -1279,6 +1374,9 @@ export class WorkspaceService extends EventEmitter {
 
     const chatUnsubscribe = session.onChatEvent((event) => {
       this.emit("chat", { workspaceId: event.workspaceId, message: event.message });
+      if (this.shouldClearAgentStatusFromChatMessage(event.message)) {
+        void this.updateAgentStatus(event.workspaceId, null);
+      }
     });
 
     const metadataUnsubscribe = session.onMetadataEvent((event) => {
@@ -3239,7 +3337,10 @@ export class WorkspaceService extends EventEmitter {
           workspaceId,
           error: result.error,
         });
+
+        return result;
       }
+
       return result;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : JSON.stringify(error, null, 2);

@@ -183,6 +183,271 @@ describe("WorkspaceService rename lock", () => {
   });
 });
 
+describe("WorkspaceService sendMessage status clearing", () => {
+  let workspaceService: WorkspaceService;
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+  let fakeSession: {
+    isBusy: ReturnType<typeof mock>;
+    queueMessage: ReturnType<typeof mock>;
+    sendMessage: ReturnType<typeof mock>;
+  };
+
+  beforeEach(async () => {
+    const aiService: AIService = {
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() =>
+        Promise.resolve({ success: false as const, error: "not found" })
+      ),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/test",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      generateStableId: mock(() => "test-id"),
+      findWorkspace: mock(() => ({
+        workspacePath: "/tmp/test/workspace",
+        projectPath: "/tmp/test/project",
+      })),
+      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+    };
+
+    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
+      updateRecency: mock(() =>
+        Promise.resolve({
+          recency: Date.now(),
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+          agentStatus: null,
+        })
+      ),
+      setStreaming: mock(() =>
+        Promise.resolve({
+          recency: Date.now(),
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+          agentStatus: null,
+        })
+      ),
+      setAgentStatus: mock(() =>
+        Promise.resolve({
+          recency: Date.now(),
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+          agentStatus: null,
+        })
+      ),
+    };
+
+    workspaceService = new WorkspaceService(
+      mockConfig as Config,
+      historyService,
+      aiService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadata as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+
+    fakeSession = {
+      isBusy: mock(() => true),
+      queueMessage: mock(() => undefined),
+      sendMessage: mock(() => Promise.resolve(Ok(undefined))),
+    };
+
+    (
+      workspaceService as unknown as {
+        getOrCreateSession: (workspaceId: string) => AgentSession;
+      }
+    ).getOrCreateSession = mock(() => fakeSession as unknown as AgentSession);
+
+    (
+      workspaceService as unknown as {
+        maybePersistAISettingsFromOptions: (
+          workspaceId: string,
+          options: unknown,
+          source: "send" | "resume"
+        ) => Promise<void>;
+      }
+    ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("does not clear persisted agent status directly for non-synthetic sends", async () => {
+    const updateAgentStatus = spyOn(
+      workspaceService as unknown as {
+        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
+      },
+      "updateAgentStatus"
+    ).mockResolvedValue(undefined);
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+
+    expect(result.success).toBe(true);
+    expect(updateAgentStatus).not.toHaveBeenCalled();
+  });
+
+  test("does not clear persisted agent status directly for synthetic sends", async () => {
+    const updateAgentStatus = spyOn(
+      workspaceService as unknown as {
+        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
+      },
+      "updateAgentStatus"
+    ).mockResolvedValue(undefined);
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "hello",
+      {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      },
+      {
+        synthetic: true,
+      }
+    );
+
+    expect(result.success).toBe(true);
+    expect(updateAgentStatus).not.toHaveBeenCalled();
+  });
+
+  test("does not clear persisted agent status directly when direct send fails after turn acceptance", async () => {
+    fakeSession.isBusy.mockReturnValue(false);
+    fakeSession.sendMessage.mockResolvedValue(
+      Err({
+        type: "unknown" as const,
+        raw: "runtime startup failed after user turn persisted",
+      })
+    );
+
+    const updateAgentStatus = spyOn(
+      workspaceService as unknown as {
+        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
+      },
+      "updateAgentStatus"
+    ).mockResolvedValue(undefined);
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+
+    expect(result.success).toBe(false);
+    expect(updateAgentStatus).not.toHaveBeenCalled();
+  });
+
+  test("does not clear persisted agent status directly when direct send is rejected pre-acceptance", async () => {
+    fakeSession.isBusy.mockReturnValue(false);
+    fakeSession.sendMessage.mockResolvedValue(
+      Err({
+        type: "invalid_model_string" as const,
+        message: "invalid model",
+      })
+    );
+
+    const updateAgentStatus = spyOn(
+      workspaceService as unknown as {
+        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
+      },
+      "updateAgentStatus"
+    ).mockResolvedValue(undefined);
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+
+    expect(result.success).toBe(false);
+    expect(updateAgentStatus).not.toHaveBeenCalled();
+  });
+
+  test("registerSession clears persisted agent status for accepted user chat events", () => {
+    const updateAgentStatus = spyOn(
+      workspaceService as unknown as {
+        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
+      },
+      "updateAgentStatus"
+    ).mockResolvedValue(undefined);
+
+    const workspaceId = "listener-workspace";
+    const sessionEmitter = new EventEmitter();
+    const listenerSession = {
+      onChatEvent: (listener: (event: unknown) => void) => {
+        sessionEmitter.on("chat-event", listener);
+        return () => sessionEmitter.off("chat-event", listener);
+      },
+      onMetadataEvent: (listener: (event: unknown) => void) => {
+        sessionEmitter.on("metadata-event", listener);
+        return () => sessionEmitter.off("metadata-event", listener);
+      },
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      dispose: () => {},
+    } as unknown as AgentSession;
+
+    workspaceService.registerSession(workspaceId, listenerSession);
+
+    sessionEmitter.emit("chat-event", {
+      workspaceId,
+      message: {
+        type: "message",
+        ...createMuxMessage("user-accepted", "user", "hello"),
+      },
+    });
+
+    expect(updateAgentStatus).toHaveBeenCalledWith(workspaceId, null);
+  });
+
+  test("registerSession does not clear persisted agent status for synthetic user chat events", () => {
+    const updateAgentStatus = spyOn(
+      workspaceService as unknown as {
+        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
+      },
+      "updateAgentStatus"
+    ).mockResolvedValue(undefined);
+
+    const workspaceId = "synthetic-listener-workspace";
+    const sessionEmitter = new EventEmitter();
+    const listenerSession = {
+      onChatEvent: (listener: (event: unknown) => void) => {
+        sessionEmitter.on("chat-event", listener);
+        return () => sessionEmitter.off("chat-event", listener);
+      },
+      onMetadataEvent: (listener: (event: unknown) => void) => {
+        sessionEmitter.on("metadata-event", listener);
+        return () => sessionEmitter.off("metadata-event", listener);
+      },
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      dispose: () => {},
+    } as unknown as AgentSession;
+
+    workspaceService.registerSession(workspaceId, listenerSession);
+
+    sessionEmitter.emit("chat-event", {
+      workspaceId,
+      message: {
+        type: "message",
+        ...createMuxMessage("user-synthetic", "user", "hello", { synthetic: true }),
+      },
+    });
+
+    expect(updateAgentStatus).not.toHaveBeenCalled();
+  });
+});
+
 describe("WorkspaceService idle compaction dispatch", () => {
   let workspaceService: WorkspaceService;
   let historyService: HistoryService;
