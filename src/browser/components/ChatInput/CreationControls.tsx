@@ -25,6 +25,7 @@ import { PlatformPaths } from "@/common/utils/paths";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput";
 import { cn } from "@/common/lib/utils";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../ui/tooltip";
@@ -32,6 +33,7 @@ import { Skeleton } from "../ui/skeleton";
 import { DocsLink } from "../DocsLink";
 import {
   RUNTIME_CHOICE_UI,
+  RUNTIME_OPTION_FIELDS,
   type RuntimeChoice,
   type RuntimeIconProps,
 } from "@/browser/utils/runtimeUi";
@@ -54,36 +56,6 @@ import {
  */
 const INLINE_CONTROL_CLASSES =
   "h-7 w-[140px] rounded border border-border-medium bg-separator px-2 text-xs text-foreground focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50";
-
-/** Shared runtime config text input - used for SSH host, Docker image, etc. */
-function RuntimeConfigInput(props: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  placeholder: string;
-  disabled?: boolean;
-  hasError?: boolean;
-  id?: string;
-  ariaLabel?: string;
-}) {
-  return (
-    <div className="flex items-center gap-2">
-      <label htmlFor={props.id} className="text-muted-foreground text-xs">
-        {props.label}
-      </label>
-      <input
-        id={props.id}
-        aria-label={props.ariaLabel}
-        type="text"
-        value={props.value}
-        onChange={(e) => props.onChange(e.target.value)}
-        placeholder={props.placeholder}
-        disabled={props.disabled}
-        className={cn(INLINE_CONTROL_CLASSES, props.hasError && "border-red-500")}
-      />
-    </div>
-  );
-}
 
 /** Credential sharing checkbox - used by Docker and Devcontainer runtimes */
 function CredentialSharingCheckbox(props: {
@@ -871,16 +843,20 @@ export function CreationControls(props: CreationControlsProps) {
 
       {/* Runtime type - button group */}
       <div className="flex flex-col gap-1.5" data-component="RuntimeTypeGroup">
-        {/* User request: keep the configure shortcut but render it in muted gray. */}
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-2">
           <label className="text-muted-foreground text-xs font-medium">Workspace Type</label>
-          <span className="text-muted-foreground text-xs">-</span>
+          {/* Keep this subtle so it reads like a secondary action, while still signaling
+              unsaved differences when the current runtime differs from the project default. */}
           <button
             type="button"
-            onClick={() => settings.open("runtimes")}
-            className="text-muted-foreground hover:text-foreground cursor-pointer text-xs font-medium hover:underline"
+            onClick={() => settings.open("runtimes", { runtimesProjectPath: props.projectPath })}
+            className={cn(
+              "border-border-medium bg-background-secondary text-muted-foreground hover:bg-hover hover:text-foreground inline-flex h-6 cursor-pointer items-center rounded border px-2 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent",
+              runtimeChoice !== props.defaultRuntimeMode &&
+                "border-warning/40 bg-warning/10 text-warning hover:bg-warning/20"
+            )}
           >
-            configure
+            set defaults
           </button>
         </div>
         <div className="flex flex-col gap-2">
@@ -998,12 +974,14 @@ export function CreationControls(props: CreationControlsProps) {
             // Also hide when Coder is still checking but has saved config (will enable after check)
             !(props.coderProps?.coderInfo === null && props.coderProps?.coderConfig) && (
               <RuntimeConfigInput
-                label="host"
+                id="ssh-host"
+                label={RUNTIME_OPTION_FIELDS.ssh.label}
                 value={selectedRuntime.host}
                 onChange={(value) => onSelectedRuntimeChange({ mode: "ssh", host: value })}
-                placeholder="user@host"
+                placeholder={RUNTIME_OPTION_FIELDS.ssh.placeholder}
                 disabled={props.disabled}
                 hasError={props.runtimeFieldError === "ssh"}
+                inputClassName={INLINE_CONTROL_CLASSES}
               />
             )}
 
@@ -1011,7 +989,7 @@ export function CreationControls(props: CreationControlsProps) {
 
           {selectedRuntime.mode === "docker" && (
             <RuntimeConfigInput
-              label="image"
+              label={RUNTIME_OPTION_FIELDS.docker.label}
               value={selectedRuntime.image}
               onChange={(value) =>
                 onSelectedRuntimeChange({
@@ -1020,11 +998,12 @@ export function CreationControls(props: CreationControlsProps) {
                   shareCredentials: selectedRuntime.shareCredentials,
                 })
               }
-              placeholder="node:20"
+              placeholder={RUNTIME_OPTION_FIELDS.docker.placeholder}
               disabled={props.disabled}
               hasError={props.runtimeFieldError === "docker"}
               id="docker-image"
               ariaLabel="Docker image"
+              inputClassName={INLINE_CONTROL_CLASSES}
             />
           )}
         </div>
@@ -1038,7 +1017,9 @@ export function CreationControls(props: CreationControlsProps) {
         {selectedRuntime.mode === "devcontainer" && devcontainerSelection.uiMode !== "hidden" && (
           <div className="border-border-medium flex w-fit flex-col gap-1.5 rounded-md border p-2">
             <div className="flex flex-col gap-1">
-              <label className="text-muted-foreground text-xs">Config</label>
+              <label className="text-muted-foreground text-xs">
+                {RUNTIME_OPTION_FIELDS.devcontainer.label}
+              </label>
               {devcontainerSelection.uiMode === "loading" ? (
                 // Skeleton placeholder while loading - matches dropdown dimensions
                 <Skeleton className="h-6 w-[280px] rounded-md" />
