@@ -948,10 +948,8 @@ export class WorkspaceService extends EventEmitter {
   // cancel any fire-and-forget init work to avoid orphaned processes (e.g., SSH sync, .mux/init).
   private readonly initAbortControllers = new Map<string, AbortController>();
 
-  // Per-workspace queue to serialize extension metadata read-modify-write cycles.
-  // This prevents last-writer-wins races between recency/streaming/status_set updates
-  // that all persist through the same extensionMetadata.json file.
-  private readonly metadataWriteQueues = new Map<string, Promise<void>>();
+  // ExtensionMetadataService now serializes all mutations globally because every
+  // workspace shares the same extensionMetadata.json file.
 
   /** Check if a workspace is currently being removed. */
   isRemoving(workspaceId: string): boolean {
@@ -1042,6 +1040,8 @@ export class WorkspaceService extends EventEmitter {
       isWorkspaceEvent(v) &&
       (!("metadata" in (v as Record<string, unknown>)) || isObj((v as StreamEndEvent).metadata));
     const isStreamAbortEvent = (v: unknown): v is StreamAbortEvent => isWorkspaceEvent(v);
+    const isErrorEvent = (v: unknown): v is { workspaceId: string; error: string } =>
+      isWorkspaceEvent(v) && "error" in v && typeof (v as { error: unknown }).error === "string";
     const isToolCallEndEvent = (v: unknown): v is ToolCallEndEvent =>
       isWorkspaceEvent(v) &&
       "toolName" in v &&
@@ -1094,6 +1094,12 @@ export class WorkspaceService extends EventEmitter {
       }
     });
 
+    this.aiService.on("error", (data: unknown) => {
+      if (isErrorEvent(data)) {
+        void this.updateStreamingStatus(data.workspaceId, false);
+      }
+    });
+
     this.aiService.on("tool-call-end", (data: unknown) => {
       if (!isToolCallEndEvent(data) || data.replay === true || data.toolName !== "status_set") {
         return;
@@ -1130,33 +1136,13 @@ export class WorkspaceService extends EventEmitter {
     this.emit("activity", { workspaceId, activity: snapshot });
   }
 
-  private async enqueueMetadataWrite(
-    workspaceId: string,
-    write: () => Promise<void>
-  ): Promise<void> {
-    const previous = this.metadataWriteQueues.get(workspaceId) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(write);
-
-    this.metadataWriteQueues.set(workspaceId, next);
-
-    try {
-      await next;
-    } finally {
-      if (this.metadataWriteQueues.get(workspaceId) === next) {
-        this.metadataWriteQueues.delete(workspaceId);
-      }
-    }
-  }
-
   private async updateRecencyTimestamp(workspaceId: string, timestamp?: number): Promise<void> {
     try {
-      await this.enqueueMetadataWrite(workspaceId, async () => {
-        const snapshot = await this.extensionMetadata.updateRecency(
-          workspaceId,
-          timestamp ?? Date.now()
-        );
-        this.emitWorkspaceActivity(workspaceId, snapshot);
-      });
+      const snapshot = await this.extensionMetadata.updateRecency(
+        workspaceId,
+        timestamp ?? Date.now()
+      );
+      this.emitWorkspaceActivity(workspaceId, snapshot);
     } catch (error) {
       log.error("Failed to update workspace recency", { workspaceId, error });
     }
@@ -1167,10 +1153,8 @@ export class WorkspaceService extends EventEmitter {
     agentStatus: WorkspaceAgentStatus | null
   ): Promise<void> {
     try {
-      await this.enqueueMetadataWrite(workspaceId, async () => {
-        const snapshot = await this.extensionMetadata.setAgentStatus(workspaceId, agentStatus);
-        this.emitWorkspaceActivity(workspaceId, snapshot);
-      });
+      const snapshot = await this.extensionMetadata.setAgentStatus(workspaceId, agentStatus);
+      this.emitWorkspaceActivity(workspaceId, snapshot);
     } catch (error) {
       log.error("Failed to update workspace agent status", { workspaceId, error });
     }
@@ -1201,15 +1185,13 @@ export class WorkspaceService extends EventEmitter {
           thinkingLevel = aiSettings?.thinkingLevel;
         }
       }
-      await this.enqueueMetadataWrite(workspaceId, async () => {
-        const snapshot = await this.extensionMetadata.setStreaming(
-          workspaceId,
-          streaming,
-          model,
-          thinkingLevel
-        );
-        this.emitWorkspaceActivity(workspaceId, snapshot);
-      });
+      const snapshot = await this.extensionMetadata.setStreaming(
+        workspaceId,
+        streaming,
+        model,
+        thinkingLevel
+      );
+      this.emitWorkspaceActivity(workspaceId, snapshot);
     } catch (error) {
       log.error("Failed to update workspace streaming status", { workspaceId, error });
     }
