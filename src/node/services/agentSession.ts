@@ -144,6 +144,8 @@ const SWITCH_AGENT_TARGET_UNAVAILABLE_ERROR =
   "Agent handoff failed because the requested target is unavailable. Please retry or choose a different mode.";
 
 const PDF_MEDIA_TYPE = "application/pdf";
+const ACP_PROMPT_ID_METADATA_KEY = "acpPromptId";
+const ACP_DELEGATED_TOOLS_METADATA_KEY = "acpDelegatedTools";
 
 function normalizeMediaType(mediaType: string): string {
   return mediaType.toLowerCase().trim().split(";")[0];
@@ -161,6 +163,50 @@ function estimateBase64DataUrlBytes(dataUrl: string): number | null {
   const base64 = dataUrl.slice(commaIndex + 1);
   const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
   return Math.floor((base64.length * 3) / 4) - padding;
+}
+
+function normalizeAcpPromptId(candidate: unknown): string | undefined {
+  if (typeof candidate !== "string") {
+    return undefined;
+  }
+
+  const trimmed = candidate.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeDelegatedToolNames(candidate: unknown): string[] | undefined {
+  if (!Array.isArray(candidate)) {
+    return undefined;
+  }
+
+  const normalizedTools = candidate
+    .filter((toolName): toolName is string => typeof toolName === "string")
+    .map((toolName) => toolName.trim())
+    .filter((toolName) => toolName.length > 0);
+
+  if (normalizedTools.length === 0) {
+    return undefined;
+  }
+
+  return [...new Set(normalizedTools)];
+}
+
+function extractAcpPromptId(muxMetadata: unknown): string | undefined {
+  if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
+    return undefined;
+  }
+
+  return normalizeAcpPromptId((muxMetadata as Record<string, unknown>)[ACP_PROMPT_ID_METADATA_KEY]);
+}
+
+function extractAcpDelegatedTools(muxMetadata: unknown): string[] | undefined {
+  if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
+    return undefined;
+  }
+
+  return normalizeDelegatedToolNames(
+    (muxMetadata as Record<string, unknown>)[ACP_DELEGATED_TOOLS_METADATA_KEY]
+  );
 }
 function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMetadata {
   if (typeof meta !== "object" || meta === null) return false;
@@ -1848,6 +1894,11 @@ export class AgentSession {
     const typedToolPolicy = options?.toolPolicy;
     // muxMetadata is z.any() in schema - cast to proper type
     const typedMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+    const acpPromptId =
+      normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(typedMuxMetadata);
+    const delegatedToolNames =
+      normalizeDelegatedToolNames(options?.delegatedToolNames) ??
+      extractAcpDelegatedTools(typedMuxMetadata);
     const isCompactionRequest = isCompactionRequestMetadata(typedMuxMetadata);
 
     // Validate model BEFORE persisting message to prevent orphaned messages on invalid model
@@ -1865,9 +1916,14 @@ export class AgentSession {
     // Preserve explicit mux-gateway prefixes from legacy clients so backend routing can
     // honor the opt-in even before muxGatewayModels has synchronized.
     let modelForStream = rawModelString.startsWith("mux-gateway:") ? rawModelString : options.model;
-    let optionsForStream = rawSystem1Model?.startsWith("mux-gateway:")
+    const baseOptionsForStream = rawSystem1Model?.startsWith("mux-gateway:")
       ? { ...options, system1Model: rawSystem1Model }
       : options;
+    let optionsForStream: SendMessageOptions = {
+      ...baseOptionsForStream,
+      ...(acpPromptId != null ? { acpPromptId } : {}),
+      ...(delegatedToolNames != null ? { delegatedToolNames } : {}),
+    };
 
     // Defense-in-depth: reject PDFs for models we know don't support them.
     // (Frontend should also block this, but it's easy to bypass via IPC / older clients.)
@@ -1932,6 +1988,7 @@ export class AgentSession {
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(optionsForStream),
         muxMetadata: typedMuxMetadata, // Pass through frontend metadata as black-box
+        ...(acpPromptId != null ? { acpPromptId } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && { synthetic: true, uiVisible: true }),
       },
@@ -2752,6 +2809,12 @@ export class AgentSession {
     // Bind recordFileState to this session for the propose_plan tool
     const recordFileState = this.fileChangeTracker.record.bind(this.fileChangeTracker);
 
+    const acpPromptId =
+      normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(options?.muxMetadata);
+    const delegatedToolNames =
+      normalizeDelegatedToolNames(options?.delegatedToolNames) ??
+      extractAcpDelegatedTools(options?.muxMetadata);
+
     const streamResult = await this.aiService.streamMessage({
       messages: historyResult.data,
       workspaceId: this.workspaceId,
@@ -2762,6 +2825,8 @@ export class AgentSession {
       maxOutputTokens: options?.maxOutputTokens,
       muxProviderOptions: options?.providerOptions,
       agentId: options?.agentId,
+      acpPromptId,
+      delegatedToolNames,
       recordFileState,
       changedFileAttachments:
         changedFileAttachments.length > 0 ? changedFileAttachments : undefined,
@@ -2799,7 +2864,9 @@ export class AgentSession {
         await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
       } else {
         this.activeStreamFailureHandled = true;
-        const streamError = buildStreamErrorEventData(streamResult.error);
+        const streamError = buildStreamErrorEventData(streamResult.error, {
+          acpPromptId,
+        });
         await this.handleStreamError(streamError);
       }
     }

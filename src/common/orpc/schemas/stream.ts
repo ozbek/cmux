@@ -126,6 +126,10 @@ export const StreamErrorMessageSchema = z.object({
   messageId: z.string(),
   error: z.string(),
   errorType: StreamErrorTypeSchema,
+  acpPromptId: z
+    .string()
+    .optional()
+    .meta({ description: "ACP prompt correlation id for matching terminal events" }),
 });
 
 export const DeleteMessageSchema = z.object({
@@ -160,6 +164,10 @@ export const StreamStartEventSchema = z.object({
   thinkingLevel: ThinkingLevelSchema.optional().meta({
     description: "Effective thinking level after model policy clamping",
   }),
+  acpPromptId: z
+    .string()
+    .optional()
+    .meta({ description: "ACP prompt correlation id for matching stream events" }),
 });
 
 export const StreamDeltaEventSchema = z.object({
@@ -213,6 +221,10 @@ export const StreamEndEventSchema = z.object({
   type: z.literal("stream-end"),
   workspaceId: z.string(),
   messageId: z.string(),
+  acpPromptId: z
+    .string()
+    .optional()
+    .meta({ description: "ACP prompt correlation id for matching terminal events" }),
   metadata: z
     .object({
       model: z.string(),
@@ -268,6 +280,10 @@ export const StreamAbortEventSchema = z.object({
       description: "Metadata may contain usage if abort occurred after stream completed processing",
     }),
   abandonPartial: z.boolean().optional(),
+  acpPromptId: z
+    .string()
+    .optional()
+    .meta({ description: "ACP prompt correlation id for matching terminal events" }),
 });
 
 export const ToolCallStartEventSchema = z.object({
@@ -383,6 +399,10 @@ export const ErrorEventSchema = z.object({
   messageId: z.string(),
   error: z.string(),
   errorType: StreamErrorTypeSchema.optional(),
+  acpPromptId: z
+    .string()
+    .optional()
+    .meta({ description: "ACP prompt correlation id for matching terminal events" }),
 });
 
 /**
@@ -581,6 +601,14 @@ export const SendMessageOptionsSchema = z.object({
     description: "Legacy base mode (plan/exec/compact) for backend fallback",
   }),
   providerOptions: MuxProviderOptionsSchema.optional(),
+  acpPromptId: z
+    .string()
+    .optional()
+    .meta({ description: "ACP prompt correlation id for terminal stream matching" }),
+  delegatedToolNames: z
+    .array(z.string())
+    .optional()
+    .meta({ description: "Tool names delegated back to ACP clients for this request" }),
   muxMetadata: z.any().optional(), // Black box
   /**
    * When true, skip persisting AI settings (e.g., for one-shot or compaction sends).
