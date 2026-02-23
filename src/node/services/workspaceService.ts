@@ -943,6 +943,10 @@ export class WorkspaceService extends EventEmitter {
   // from waking a dedicated workspace during archive().
   private readonly archivingWorkspaces = new Set<string>();
 
+  // Tracks workspaces undergoing idle (background) compaction so the activity snapshot
+  // can tag the stream, letting the frontend suppress notifications for maintenance work.
+  private readonly idleCompactingWorkspaces = new Set<string>();
+
   // AbortControllers for in-progress workspace initialization (postCreateSetup + initWorkspace).
   //
   // Why this lives here: archive/remove are the user-facing lifecycle operations that should
@@ -1192,9 +1196,21 @@ export class WorkspaceService extends EventEmitter {
         model,
         thinkingLevel
       );
-      this.emitWorkspaceActivity(workspaceId, snapshot);
+      // Idle compaction tagging is stop-snapshot only. Never tag streaming=true updates,
+      // otherwise fast follow-up turns can inherit stale idle metadata before cleanup runs.
+      const shouldTagIdleCompaction = !streaming && this.idleCompactingWorkspaces.has(workspaceId);
+      this.emitWorkspaceActivity(
+        workspaceId,
+        shouldTagIdleCompaction ? { ...snapshot, isIdleCompaction: true } : snapshot
+      );
     } catch (error) {
       log.error("Failed to update workspace streaming status", { workspaceId, error });
+    } finally {
+      // Idle compaction marker is turn-scoped. Always clear on streaming=false transitions,
+      // even when metadata writes fail, so stale state cannot leak into future user streams.
+      if (!streaming) {
+        this.idleCompactingWorkspaces.delete(workspaceId);
+      }
     }
   }
 
@@ -4623,8 +4639,20 @@ export class WorkspaceService extends EventEmitter {
       throw new Error(`Failed to execute idle compaction: ${formattedError}`);
     }
 
-    // Notify listeners only after dispatch succeeds so UI state reflects real work.
-    this.emitIdleCompactionStarted(workspaceId);
+    // Mark idle compaction only while a stream is actually active.
+    // sendMessage can succeed on startup-abort paths where no stream is running,
+    // and leaking this marker into the next user stream would suppress real notifications.
+    if (session.isBusy()) {
+      // Marker is added after dispatch to avoid races with concurrent user sends.
+      // The streaming=true snapshot was already emitted without the flag, but the
+      // streaming=false snapshot (on stream end) picks up the marker.
+      this.idleCompactingWorkspaces.add(workspaceId);
+      return;
+    }
+
+    // Defensive cleanup for startup-abort paths or extremely fast completions that
+    // finish before executeIdleCompaction regains control.
+    this.idleCompactingWorkspaces.delete(workspaceId);
   }
 
   private async buildIdleCompactionSendOptions(workspaceId: string): Promise<SendMessageOptions> {
@@ -4692,16 +4720,5 @@ export class WorkspaceService extends EventEmitter {
       // Compaction should not mutate persisted workspace AI defaults.
       skipAiSettingsPersistence: true,
     };
-  }
-
-  /**
-   * Emit an idle-compaction-started event to a workspace's stream.
-   * This is a transient UI hint while backend-initiated compaction is running.
-   */
-  emitIdleCompactionStarted(workspaceId: string): void {
-    const session = this.sessions.get(workspaceId);
-    if (session) {
-      session.emitChatEvent({ type: "idle-compaction-started" });
-    }
   }
 }

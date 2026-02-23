@@ -569,9 +569,6 @@ export class WorkspaceStore {
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
 
-  // Idle compaction notification callbacks (called when backend signals idle compaction started)
-  private idleCompactionCallbacks = new Set<(workspaceId: string) => void>();
-
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
 
@@ -585,7 +582,7 @@ export class WorkspaceStore {
         messageId: string,
         isFinal: boolean,
         finalText: string,
-        compaction?: { hasContinueMessage: boolean },
+        compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
         completedAt?: number | null
       ) => void)
     | null = null;
@@ -1290,15 +1287,84 @@ export class WorkspaceStore {
       messageId: string,
       isFinal: boolean,
       finalText: string,
-      compaction?: { hasContinueMessage: boolean },
+      compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
       completedAt?: number | null
     ) => void
   ): void {
     this.responseCompleteCallback = callback;
     // Update existing aggregators with the callback
     for (const aggregator of this.aggregators.values()) {
-      aggregator.onResponseComplete = callback;
+      this.bindAggregatorResponseCompleteCallback(aggregator);
     }
+  }
+
+  private maybeMarkCompactionContinueFromQueuedFollowUp(
+    workspaceId: string,
+    compaction: { hasContinueMessage: boolean; isIdle?: boolean } | undefined,
+    includeQueuedFollowUpSignal: boolean
+  ): { hasContinueMessage: boolean; isIdle?: boolean } | undefined {
+    if (!compaction || compaction.hasContinueMessage || !includeQueuedFollowUpSignal) {
+      return compaction;
+    }
+
+    const queuedMessage = this.chatTransientState.get(workspaceId)?.queuedMessage;
+    if (!queuedMessage) {
+      return compaction;
+    }
+
+    // A queued message will be auto-sent after stream-end. Suppress the intermediate
+    // "Compaction complete" notification and only notify for the follow-up response.
+    return {
+      ...compaction,
+      hasContinueMessage: true,
+    };
+  }
+
+  private emitResponseComplete(
+    workspaceId: string,
+    messageId: string,
+    isFinal: boolean,
+    finalText: string,
+    compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
+    completedAt?: number | null,
+    includeQueuedFollowUpSignal = true
+  ): void {
+    if (!this.responseCompleteCallback) {
+      return;
+    }
+
+    this.responseCompleteCallback(
+      workspaceId,
+      messageId,
+      isFinal,
+      finalText,
+      this.maybeMarkCompactionContinueFromQueuedFollowUp(
+        workspaceId,
+        compaction,
+        includeQueuedFollowUpSignal
+      ),
+      completedAt
+    );
+  }
+
+  private bindAggregatorResponseCompleteCallback(aggregator: StreamingMessageAggregator): void {
+    aggregator.onResponseComplete = (
+      workspaceId: string,
+      messageId: string,
+      isFinal: boolean,
+      finalText: string,
+      compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
+      completedAt?: number | null
+    ) => {
+      this.emitResponseComplete(
+        workspaceId,
+        messageId,
+        isFinal,
+        finalText,
+        compaction,
+        completedAt
+      );
+    };
   }
 
   /**
@@ -2369,25 +2435,35 @@ export class WorkspaceStore {
     const backgroundCompaction = isBackgroundStreamingStop
       ? this.getBackgroundCompletionCompaction(workspaceId)
       : undefined;
+    // The backend tags the streaming=false (stop) snapshot with isIdleCompaction.
+    // The idle marker is added after sendMessage returns (to avoid races with
+    // concurrent user streams), so only the stop snapshot carries the flag.
+    // Check both previous and current as defense-in-depth.
+    const wasIdleCompaction =
+      previous?.isIdleCompaction === true || snapshot?.isIdleCompaction === true;
 
     // Trigger response completion notifications for background workspaces only when
     // activity indicates a true completion (streaming true -> false WITH recency advance).
     // stream-abort/error transitions also flip streaming to false, but recency stays
     // unchanged there, so suppress completion notifications in those cases.
     if (stoppedStreamingSnapshot && recencyAdvancedSinceStreamStart && isBackgroundStreamingStop) {
-      if (this.responseCompleteCallback) {
-        // Activity snapshots don't include message/content metadata. Reuse any
-        // still-active stream context captured before this workspace was backgrounded
-        // so compaction continue turns remain suppressible in App notifications.
-        this.responseCompleteCallback(
-          workspaceId,
-          "",
-          true,
-          "",
-          backgroundCompaction,
-          stoppedStreamingSnapshot.recency
-        );
-      }
+      // Activity snapshots don't include message/content metadata. Reuse any
+      // still-active stream context captured before this workspace was backgrounded
+      // so compaction continue turns remain suppressible in App notifications.
+      this.emitResponseComplete(
+        workspaceId,
+        "",
+        true,
+        "",
+        wasIdleCompaction
+          ? {
+              hasContinueMessage: backgroundCompaction?.hasContinueMessage ?? false,
+              isIdle: true,
+            }
+          : backgroundCompaction,
+        stoppedStreamingSnapshot.recency,
+        false
+      );
     }
 
     if (isBackgroundStreamingStop) {
@@ -3119,29 +3195,6 @@ export class WorkspaceStore {
   }
 
   /**
-   * Subscribe to idle compaction events.
-   * Callback is called when backend signals a workspace started idle compaction.
-   * Returns unsubscribe function.
-   */
-  onIdleCompactionStarted(callback: (workspaceId: string) => void): () => void {
-    this.idleCompactionCallbacks.add(callback);
-    return () => this.idleCompactionCallbacks.delete(callback);
-  }
-
-  /**
-   * Notify all listeners that a workspace started idle compaction.
-   */
-  private notifyIdleCompactionStarted(workspaceId: string): void {
-    for (const callback of this.idleCompactionCallbacks) {
-      try {
-        callback(workspaceId);
-      } catch (error) {
-        console.error("Error in idle compaction callback:", error);
-      }
-    }
-  }
-
-  /**
    * Subscribe to file-modifying tool completions.
    * @param listener Called with workspaceId when a file-modifying tool completes
    * @param workspaceId If provided, only notify for this workspace
@@ -3211,7 +3264,7 @@ export class WorkspaceStore {
       }
       // Wire up response complete callback for "notify on response" feature
       if (this.responseCompleteCallback) {
-        aggregator.onResponseComplete = this.responseCompleteCallback;
+        this.bindAggregatorResponseCompleteCallback(aggregator);
       }
       this.aggregators.set(workspaceId, aggregator);
       this.workspaceCreatedAt.set(workspaceId, createdAt);
@@ -3359,12 +3412,6 @@ export class WorkspaceStore {
         this.ensureConsumersCached(workspaceId, aggregator);
       }
 
-      return;
-    }
-
-    // Handle idle-compaction-started event from backend execution.
-    if ("type" in data && data.type === "idle-compaction-started") {
-      this.notifyIdleCompactionStarted(workspaceId);
       return;
     }
 
@@ -3535,8 +3582,6 @@ function getStoreInstance(): WorkspaceStore {
  * Use this for non-hook subscriptions (e.g., in useEffect callbacks).
  */
 export const workspaceStore = {
-  onIdleCompactionStarted: (callback: (workspaceId: string) => void) =>
-    getStoreInstance().onIdleCompactionStarted(callback),
   subscribeFileModifyingTool: (listener: (workspaceId: string) => void, workspaceId?: string) =>
     getStoreInstance().subscribeFileModifyingTool(listener, workspaceId),
   getFileModifyingToolMs: (workspaceId: string) =>

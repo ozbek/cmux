@@ -672,35 +672,42 @@ describe("WorkspaceService idle compaction dispatch", () => {
     await cleanupHistory();
   });
 
-  test("marks idle compaction send as synthetic and emits started after dispatch", async () => {
+  test("marks idle compaction send as synthetic when stream stays active", async () => {
     const workspaceId = "idle-ws";
     const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
     const buildIdleCompactionSendOptions = mock(() =>
       Promise.resolve({ model: "openai:gpt-4o", agentId: "compact" })
     );
-    const emitIdleCompactionStarted = mock((_id: string) => undefined);
+
+    let busyChecks = 0;
+    const session = {
+      isBusy: mock(() => {
+        busyChecks += 1;
+        return busyChecks >= 2;
+      }),
+    } as unknown as AgentSession;
 
     (
       workspaceService as unknown as {
         sendMessage: typeof sendMessage;
         buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        emitIdleCompactionStarted: typeof emitIdleCompactionStarted;
+        getOrCreateSession: (workspaceId: string) => AgentSession;
       }
     ).sendMessage = sendMessage;
     (
       workspaceService as unknown as {
         sendMessage: typeof sendMessage;
         buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        emitIdleCompactionStarted: typeof emitIdleCompactionStarted;
+        getOrCreateSession: (workspaceId: string) => AgentSession;
       }
     ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
     (
       workspaceService as unknown as {
         sendMessage: typeof sendMessage;
         buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        emitIdleCompactionStarted: typeof emitIdleCompactionStarted;
+        getOrCreateSession: (workspaceId: string) => AgentSession;
       }
-    ).emitIdleCompactionStarted = emitIdleCompactionStarted;
+    ).getOrCreateSession = (_workspaceId: string) => session;
 
     await workspaceService.executeIdleCompaction(workspaceId);
 
@@ -715,10 +722,55 @@ describe("WorkspaceService idle compaction dispatch", () => {
         requireIdle: true,
       })
     );
-    expect(emitIdleCompactionStarted).toHaveBeenCalledTimes(1);
+
+    const idleCompactingWorkspaces = (
+      workspaceService as unknown as { idleCompactingWorkspaces: Set<string> }
+    ).idleCompactingWorkspaces;
+    expect(idleCompactingWorkspaces.has(workspaceId)).toBe(true);
   });
 
-  test("does not emit idle-compaction-started when busy-skip result is returned", async () => {
+  test("does not mark idle compaction when send succeeds without active stream", async () => {
+    const workspaceId = "idle-no-stream-ws";
+    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const buildIdleCompactionSendOptions = mock(() =>
+      Promise.resolve({ model: "openai:gpt-4o", agentId: "compact" })
+    );
+
+    const session = {
+      isBusy: mock(() => false),
+    } as unknown as AgentSession;
+
+    (
+      workspaceService as unknown as {
+        sendMessage: typeof sendMessage;
+        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
+        getOrCreateSession: (workspaceId: string) => AgentSession;
+      }
+    ).sendMessage = sendMessage;
+    (
+      workspaceService as unknown as {
+        sendMessage: typeof sendMessage;
+        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
+        getOrCreateSession: (workspaceId: string) => AgentSession;
+      }
+    ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
+    (
+      workspaceService as unknown as {
+        sendMessage: typeof sendMessage;
+        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
+        getOrCreateSession: (workspaceId: string) => AgentSession;
+      }
+    ).getOrCreateSession = (_workspaceId: string) => session;
+
+    await workspaceService.executeIdleCompaction(workspaceId);
+
+    const idleCompactingWorkspaces = (
+      workspaceService as unknown as { idleCompactingWorkspaces: Set<string> }
+    ).idleCompactingWorkspaces;
+    expect(idleCompactingWorkspaces.has(workspaceId)).toBe(false);
+  });
+
+  test("propagates busy-skip errors", async () => {
     const workspaceId = "idle-busy-ws";
     const sendMessage = mock(() =>
       Promise.resolve(
@@ -731,29 +783,19 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const buildIdleCompactionSendOptions = mock(() =>
       Promise.resolve({ model: "openai:gpt-4o", agentId: "compact" })
     );
-    const emitIdleCompactionStarted = mock((_id: string) => undefined);
 
     (
       workspaceService as unknown as {
         sendMessage: typeof sendMessage;
         buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        emitIdleCompactionStarted: typeof emitIdleCompactionStarted;
       }
     ).sendMessage = sendMessage;
     (
       workspaceService as unknown as {
         sendMessage: typeof sendMessage;
         buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        emitIdleCompactionStarted: typeof emitIdleCompactionStarted;
       }
     ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        emitIdleCompactionStarted: typeof emitIdleCompactionStarted;
-      }
-    ).emitIdleCompactionStarted = emitIdleCompactionStarted;
 
     let executionError: unknown;
     try {
@@ -767,8 +809,86 @@ describe("WorkspaceService idle compaction dispatch", () => {
       throw new Error("Expected idle compaction to throw when workspace is busy");
     }
     expect(executionError.message).toContain("idle-only send was skipped");
+  });
+  test("does not tag streaming=true snapshots as idle compaction", async () => {
+    const workspaceId = "idle-streaming-true-no-tag";
+    const snapshot = {
+      recency: Date.now(),
+      streaming: true,
+      lastModel: "claude-sonnet-4",
+      lastThinkingLevel: null,
+    };
 
-    expect(emitIdleCompactionStarted).toHaveBeenCalledTimes(0);
+    const setStreaming = mock(() => Promise.resolve(snapshot));
+    const emitWorkspaceActivity = mock(
+      (_workspaceId: string, _snapshot: typeof snapshot) => undefined
+    );
+
+    (
+      workspaceService as unknown as {
+        extensionMetadata: ExtensionMetadataService;
+        emitWorkspaceActivity: typeof emitWorkspaceActivity;
+      }
+    ).extensionMetadata = {
+      setStreaming,
+    } as unknown as ExtensionMetadataService;
+    (
+      workspaceService as unknown as {
+        extensionMetadata: ExtensionMetadataService;
+        emitWorkspaceActivity: typeof emitWorkspaceActivity;
+      }
+    ).emitWorkspaceActivity = emitWorkspaceActivity;
+
+    const internals = workspaceService as unknown as {
+      idleCompactingWorkspaces: Set<string>;
+      updateStreamingStatus: (
+        workspaceId: string,
+        streaming: boolean,
+        model?: string,
+        agentId?: string
+      ) => Promise<void>;
+    };
+
+    internals.idleCompactingWorkspaces.add(workspaceId);
+
+    await internals.updateStreamingStatus(workspaceId, true);
+
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, undefined, undefined);
+    expect(emitWorkspaceActivity).toHaveBeenCalledTimes(1);
+    expect(emitWorkspaceActivity).toHaveBeenCalledWith(workspaceId, snapshot);
+    expect(internals.idleCompactingWorkspaces.has(workspaceId)).toBe(true);
+  });
+
+  test("clears idle marker when streaming=false metadata update fails", async () => {
+    const workspaceId = "idle-streaming-false-failure";
+
+    const setStreaming = mock(() => Promise.reject(new Error("setStreaming failed")));
+    const extensionMetadata = {
+      setStreaming,
+    } as unknown as ExtensionMetadataService;
+
+    (
+      workspaceService as unknown as {
+        extensionMetadata: ExtensionMetadataService;
+      }
+    ).extensionMetadata = extensionMetadata;
+
+    const internals = workspaceService as unknown as {
+      idleCompactingWorkspaces: Set<string>;
+      updateStreamingStatus: (
+        workspaceId: string,
+        streaming: boolean,
+        model?: string,
+        agentId?: string
+      ) => Promise<void>;
+    };
+
+    internals.idleCompactingWorkspaces.add(workspaceId);
+
+    await internals.updateStreamingStatus(workspaceId, false);
+
+    expect(internals.idleCompactingWorkspaces.has(workspaceId)).toBe(false);
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, undefined, undefined);
   });
 });
 
