@@ -31,6 +31,7 @@ import type { PolicyService } from "@/node/services/policyService";
 import type { CoderService } from "@/node/services/coderService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
+import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 
 export interface ORPCContext {
   config: Config;
@@ -65,5 +66,6 @@ export interface ORPCContext {
   coderService: CoderService;
   serverAuthService: ServerAuthService;
   sshPromptService: SshPromptService;
+  analyticsService: AnalyticsService;
   headers?: IncomingHttpHeaders;
 }

@@ -4082,6 +4082,77 @@ export const router = (authToken?: string) => {
           return { success: true };
         }),
     },
+    analytics: {
+      getSummary: t
+        .input(schemas.analytics.getSummary.input)
+        .output(schemas.analytics.getSummary.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getSummary(
+            input.projectPath ?? null,
+            input.from ?? null,
+            input.to ?? null
+          );
+        }),
+      getSpendOverTime: t
+        .input(schemas.analytics.getSpendOverTime.input)
+        .output(schemas.analytics.getSpendOverTime.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getSpendOverTime(input);
+        }),
+      getSpendByProject: t
+        .input(schemas.analytics.getSpendByProject.input)
+        .output(schemas.analytics.getSpendByProject.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getSpendByProject(input.from ?? null, input.to ?? null);
+        }),
+      getSpendByModel: t
+        .input(schemas.analytics.getSpendByModel.input)
+        .output(schemas.analytics.getSpendByModel.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getSpendByModel(
+            input.projectPath ?? null,
+            input.from ?? null,
+            input.to ?? null
+          );
+        }),
+      getTimingDistribution: t
+        .input(schemas.analytics.getTimingDistribution.input)
+        .output(schemas.analytics.getTimingDistribution.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getTimingDistribution(
+            input.metric,
+            input.projectPath ?? null,
+            input.from ?? null,
+            input.to ?? null
+          );
+        }),
+      getAgentCostBreakdown: t
+        .input(schemas.analytics.getAgentCostBreakdown.input)
+        .output(schemas.analytics.getAgentCostBreakdown.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getAgentCostBreakdown(
+            input.projectPath ?? null,
+            input.from ?? null,
+            input.to ?? null
+          );
+        }),
+      getCacheHitRatioByProvider: t
+        .input(schemas.analytics.getCacheHitRatioByProvider.input)
+        .output(schemas.analytics.getCacheHitRatioByProvider.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getCacheHitRatioByProvider(
+            input.projectPath ?? null,
+            input.from ?? null,
+            input.to ?? null
+          );
+        }),
+      rebuildDatabase: t
+        .input(schemas.analytics.rebuildDatabase.input)
+        .output(schemas.analytics.rebuildDatabase.output)
+        .handler(async ({ context }) => {
+          return context.analyticsService.rebuildAll();
+        }),
+    },
     ssh: {
       prompt: {
         subscribe: t

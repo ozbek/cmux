@@ -20,6 +20,8 @@ export interface RouterContext {
   navigateToHome: () => void;
   navigateToSettings: (section?: string) => void;
   navigateFromSettings: () => void;
+  navigateToAnalytics: () => void;
+  navigateFromAnalytics: () => void;
   currentWorkspaceId: string | null;
 
   /** Settings section from URL (null when not on settings page). */
@@ -36,6 +38,9 @@ export interface RouterContext {
 
   /** Draft ID for UI-only workspace creation drafts (from URL) */
   pendingDraftId: string | null;
+
+  /** True when the analytics dashboard route is active. */
+  isAnalyticsOpen: boolean;
 }
 
 const RouterContext = createContext<RouterContext | undefined>(undefined);
@@ -114,6 +119,7 @@ function RouterContextInner(props: { children: ReactNode }) {
     location.pathname === "/project" ? getProjectPathFromLocationState(location.state) : null;
   const settingsMatch = /^\/settings\/([^/]+)$/.exec(location.pathname);
   const currentSettingsSection = settingsMatch ? decodeURIComponent(settingsMatch[1]) : null;
+  const isAnalyticsOpen = location.pathname === "/analytics";
 
   interface NonSettingsLocationSnapshot {
     url: string;
@@ -123,16 +129,27 @@ function RouterContextInner(props: { children: ReactNode }) {
   // When leaving settings, we need to restore the *full* previous location including
   // any in-memory navigation state (e.g. /project relies on { projectPath } state, and
   // the legacy ?path= deep link rewrite stores that path in location.state).
+  // Include /analytics so Settings opened from Analytics can close back to Analytics.
   const lastNonSettingsLocationRef = useRef<NonSettingsLocationSnapshot>({
+    url: getInitialRoute(),
+    state: null,
+  });
+  // Keep a separate "close analytics" snapshot that intentionally excludes /analytics so
+  // closing analytics still returns to the last non-analytics route.
+  const lastNonAnalyticsLocationRef = useRef<NonSettingsLocationSnapshot>({
     url: getInitialRoute(),
     state: null,
   });
   useEffect(() => {
     if (!location.pathname.startsWith("/settings")) {
-      lastNonSettingsLocationRef.current = {
+      const locationSnapshot: NonSettingsLocationSnapshot = {
         url: location.pathname + location.search,
         state: location.state,
       };
+      lastNonSettingsLocationRef.current = locationSnapshot;
+      if (location.pathname !== "/analytics") {
+        lastNonAnalyticsLocationRef.current = locationSnapshot;
+      }
     }
   }, [location.pathname, location.search, location.state]);
 
@@ -201,6 +218,23 @@ function RouterContextInner(props: { children: ReactNode }) {
     void navigateRef.current(lastLocation.url, { state: lastLocation.state });
   }, []);
 
+  const navigateToAnalytics = useCallback(() => {
+    void navigateRef.current("/analytics");
+  }, []);
+
+  const navigateFromAnalytics = useCallback(() => {
+    const lastLocation = lastNonAnalyticsLocationRef.current;
+    if (
+      !lastLocation.url ||
+      lastLocation.url.startsWith("/settings") ||
+      lastLocation.url === "/analytics"
+    ) {
+      void navigateRef.current("/");
+      return;
+    }
+    void navigateRef.current(lastLocation.url, { state: lastLocation.state });
+  }, []);
+
   const value = useMemo<RouterContext>(
     () => ({
       navigateToWorkspace,
@@ -208,18 +242,23 @@ function RouterContextInner(props: { children: ReactNode }) {
       navigateToHome,
       navigateToSettings,
       navigateFromSettings,
+      navigateToAnalytics,
+      navigateFromAnalytics,
       currentWorkspaceId,
       currentSettingsSection,
       currentProjectId,
       currentProjectPathFromState,
       pendingSectionId,
       pendingDraftId,
+      isAnalyticsOpen,
     }),
     [
       navigateToHome,
       navigateToProject,
       navigateToSettings,
       navigateFromSettings,
+      navigateToAnalytics,
+      navigateFromAnalytics,
       navigateToWorkspace,
       currentWorkspaceId,
       currentSettingsSection,
@@ -227,6 +266,7 @@ function RouterContextInner(props: { children: ReactNode }) {
       currentProjectPathFromState,
       pendingSectionId,
       pendingDraftId,
+      isAnalyticsOpen,
     ]
   );
 
