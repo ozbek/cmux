@@ -1,16 +1,31 @@
 import { EventEmitter } from "events";
 import * as crypto from "crypto";
 import { HOST_KEY_APPROVAL_TIMEOUT_MS } from "@/common/constants/ssh";
-import type { HostKeyVerificationRequest } from "@/common/orpc/schemas/ssh";
+import type {
+  SshCredentialPromptRequest,
+  SshHostKeyPromptRequest,
+  SshPromptRequest,
+} from "@/common/orpc/schemas/ssh";
 
-interface PendingEntry {
-  request: HostKeyVerificationRequest;
-  dedupeKey: string;
-  timer: ReturnType<typeof setTimeout>;
-  waiters: Array<(accept: boolean) => void>;
+type SshPromptRequestParams =
+  | (Omit<SshHostKeyPromptRequest, "requestId"> & { dedupeKey?: string })
+  | (Omit<SshCredentialPromptRequest, "requestId"> & { dedupeKey?: string });
+
+export type SshPromptResolutionReason = "responded" | "timeout" | "no_responder";
+
+export interface SshPromptResolution {
+  response: string;
+  reason: SshPromptResolutionReason;
 }
 
-export class HostKeyVerificationService extends EventEmitter {
+interface PendingEntry {
+  request: SshPromptRequest;
+  dedupeKey: string | null;
+  timer: ReturnType<typeof setTimeout>;
+  waiters: Array<(resolution: SshPromptResolution) => void>;
+}
+
+export class SshPromptService extends EventEmitter {
   private pending = new Map<string, PendingEntry>();
   /**
    * Dedup: endpoint identity -> inflight requestId.
@@ -55,10 +70,10 @@ export class HostKeyVerificationService extends EventEmitter {
    * (the frontend already does via requestId check in setPendingQueue).
    */
   subscribeRequests(
-    onRequest: (req: HostKeyVerificationRequest) => void,
+    onRequest: (req: SshPromptRequest) => void,
     onRemoved?: (requestId: string) => void
   ): {
-    snapshot: HostKeyVerificationRequest[];
+    snapshot: SshPromptRequest[];
     unsubscribe: () => void;
   } {
     this.on("request", onRequest);
@@ -72,7 +87,8 @@ export class HostKeyVerificationService extends EventEmitter {
     };
   }
 
-  private finalizeRequest(requestId: string, accept: boolean): void {
+  // NOTE: `resolution.response` may contain credentials. Never log response values.
+  private finalizeRequest(requestId: string, resolution: SshPromptResolution): void {
     const entry = this.pending.get(requestId);
     if (!entry) {
       return;
@@ -80,15 +96,17 @@ export class HostKeyVerificationService extends EventEmitter {
 
     clearTimeout(entry.timer);
     this.pending.delete(requestId);
-    this.inflightByDedupeKey.delete(entry.dedupeKey);
+    if (entry.dedupeKey) {
+      this.inflightByDedupeKey.delete(entry.dedupeKey);
+    }
     this.emit("removed", requestId);
 
     for (const resolve of entry.waiters) {
-      resolve(accept);
+      resolve(resolution);
     }
   }
 
-  private joinPendingByDedupeKey(dedupeKey: string): Promise<boolean> | undefined {
+  private joinPendingByDedupeKey(dedupeKey: string): Promise<SshPromptResolution> | undefined {
     const existingId = this.inflightByDedupeKey.get(dedupeKey);
     if (!existingId) {
       return undefined;
@@ -100,42 +118,58 @@ export class HostKeyVerificationService extends EventEmitter {
       return undefined;
     }
 
-    return new Promise<boolean>((resolve) => {
+    return new Promise<SshPromptResolution>((resolve) => {
       entry.waiters.push(resolve);
     });
   }
 
   /**
-   * Called from SSH pool when a host-key prompt is detected.
+   * Called from SSH pool when a prompt is detected.
    * Blocks until the user responds or timeout fires.
    * Responder admission only applies to new prompts; deduped callers can still
    * join an existing pending prompt even during transient responder gaps.
    */
-  async requestVerification(
-    params: Omit<HostKeyVerificationRequest, "requestId"> & { dedupeKey?: string }
-  ): Promise<boolean> {
-    const { dedupeKey: dedupeKeyOverride, ...requestParams } = params;
-    const dedupeKey = dedupeKeyOverride ?? requestParams.host;
+  async requestPromptDetailed(params: SshPromptRequestParams): Promise<SshPromptResolution> {
+    const dedupeKey = params.kind === "host-key" ? (params.dedupeKey ?? params.host) : null;
 
-    const joinedPending = this.joinPendingByDedupeKey(dedupeKey);
-    if (joinedPending) {
-      return joinedPending;
+    if (dedupeKey) {
+      const joinedPending = this.joinPendingByDedupeKey(dedupeKey);
+      if (joinedPending) {
+        return joinedPending;
+      }
     }
 
     if (!this.hasInteractiveResponder()) {
-      return false;
+      return { response: "", reason: "no_responder" };
     }
 
     const requestId = crypto.randomUUID();
-    this.inflightByDedupeKey.set(dedupeKey, requestId);
+    if (dedupeKey) {
+      this.inflightByDedupeKey.set(dedupeKey, requestId);
+    }
 
-    return new Promise<boolean>((resolve) => {
-      const request: HostKeyVerificationRequest = { requestId, ...requestParams };
+    const requestWithoutId =
+      params.kind === "host-key"
+        ? {
+            kind: "host-key" as const,
+            host: params.host,
+            keyType: params.keyType,
+            fingerprint: params.fingerprint,
+            prompt: params.prompt,
+          }
+        : {
+            kind: "credential" as const,
+            prompt: params.prompt,
+            secret: params.secret,
+          };
+
+    return new Promise<SshPromptResolution>((resolve) => {
+      const request: SshPromptRequest = { requestId, ...requestWithoutId };
       const entry: PendingEntry = {
         request,
         dedupeKey,
         timer: setTimeout(() => {
-          this.finalizeRequest(requestId, false);
+          this.finalizeRequest(requestId, { response: "", reason: "timeout" });
         }, this.timeoutMs),
         waiters: [resolve],
       };
@@ -145,7 +179,12 @@ export class HostKeyVerificationService extends EventEmitter {
     });
   }
 
-  respond(requestId: string, accept: boolean): void {
-    this.finalizeRequest(requestId, accept);
+  async requestPrompt(params: SshPromptRequestParams): Promise<string> {
+    const resolution = await this.requestPromptDetailed(params);
+    return resolution.response;
+  }
+
+  respond(requestId: string, response: string): void {
+    this.finalizeRequest(requestId, { response, reason: "responded" });
   }
 }

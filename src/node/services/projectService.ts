@@ -2,6 +2,7 @@ import type { Config, ProjectConfig } from "@/node/config";
 import type { SectionConfig } from "@/common/types/project";
 import { DEFAULT_SECTION_COLOR } from "@/common/constants/ui";
 import { sortSectionsByLinkedList } from "@/common/utils/sections";
+import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { validateProjectPath, isGitRepository } from "@/node/utils/pathUtils";
@@ -19,6 +20,13 @@ import {
   type FileCompletionsIndex,
 } from "@/node/services/fileCompletionsIndex";
 import { log } from "@/node/services/log";
+import type { SshPromptService } from "@/node/services/sshPromptService";
+import { createMediatedAskpassSession } from "@/node/runtime/openSshPromptMediation";
+import {
+  classifySshCloneFailure,
+  summarizeCloneStderr,
+  type CloneErrorCode,
+} from "./sshCloneFailure";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
@@ -66,10 +74,12 @@ interface CloneProjectParams {
   cloneParentDir?: string | null;
 }
 
+export type { CloneErrorCode } from "./sshCloneFailure";
+
 export type CloneEvent =
   | { type: "progress"; line: string }
   | { type: "success"; projectConfig: ProjectConfig; normalizedPath: string }
-  | { type: "error"; error: string };
+  | { type: "error"; code: CloneErrorCode; error: string };
 
 function isTildePrefixedPath(value: string): boolean {
   return value === "~" || value.startsWith("~/") || value.startsWith("~\\");
@@ -185,6 +195,79 @@ function normalizeRepoUrlForClone(repoUrl: string): string {
   return trimmedRepoUrl;
 }
 
+function parseScpStyleSshUrl(url: string): { host: string } | undefined {
+  const trimmedUrl = url.trim();
+
+  // Keep Windows drive-letter paths (e.g. C:\repo) out of SCP-style SSH matching.
+  if (/^[a-zA-Z]:[\\/]/.test(trimmedUrl)) {
+    return undefined;
+  }
+
+  // Protocol URLs (https://, ssh://, etc.) are handled separately.
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmedUrl)) {
+    return undefined;
+  }
+
+  // SCP-style clone URL: [user@]host:path
+  const scpLikeMatch = /^(?:[a-zA-Z0-9._-]+@)?(\[[^\]]+\]|[^:/\s][^:/\s]*):(.+)$/.exec(trimmedUrl);
+  if (!scpLikeMatch) {
+    return undefined;
+  }
+
+  return { host: scpLikeMatch[1] };
+}
+
+/** Protocol schemes that Git routes through SSH transport. */
+const SSH_PROTOCOL_SCHEMES = new Set(["ssh:", "git+ssh:", "ssh+git:"]);
+
+type CloneTransport =
+  | { kind: "ssh"; hostname: string; port: number }
+  | { kind: "ssh-scp"; hostname: string; port: number }
+  | { kind: "non-ssh" };
+
+/**
+ * Canonical clone-URL transport classifier.
+ * Every SSH-related decision in the clone flow (askpass enablement, prompt
+ * deduplication) should consume this parser so protocol support cannot drift.
+ */
+function parseCloneTransport(rawUrl: string): CloneTransport {
+  const trimmedUrl = rawUrl.trim();
+
+  // SCP-style: [user@]host:path (always SSH, port 22)
+  const parsedScpLikeUrl = parseScpStyleSshUrl(trimmedUrl);
+  if (parsedScpLikeUrl) {
+    return { kind: "ssh-scp", hostname: parsedScpLikeUrl.host, port: 22 };
+  }
+
+  // Protocol URLs: ssh://, git+ssh://, ssh+git://
+  try {
+    const parsed = new URL(trimmedUrl);
+    if (SSH_PROTOCOL_SCHEMES.has(parsed.protocol.toLowerCase()) && parsed.hostname) {
+      const parsedPort = Number.parseInt(parsed.port, 10);
+      const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 22;
+      return { kind: "ssh", hostname: parsed.hostname, port };
+    }
+  } catch {
+    // Not a valid protocol URL; treat as non-SSH.
+  }
+
+  return { kind: "non-ssh" };
+}
+
+/** Detect whether a clone URL will use SSH transport. */
+function isSshCloneUrl(url: string): boolean {
+  return parseCloneTransport(url).kind !== "non-ssh";
+}
+
+function deriveSshClonePromptDedupeKey(cloneUrl: string): string | undefined {
+  const transport = parseCloneTransport(cloneUrl);
+  if (transport.kind === "non-ssh") {
+    return undefined;
+  }
+
+  return formatSshEndpoint(transport.hostname, transport.port);
+}
+
 const FILE_COMPLETIONS_CACHE_TTL_MS = 10_000;
 
 interface FileCompletionsCacheEntry {
@@ -196,8 +279,14 @@ interface FileCompletionsCacheEntry {
 export class ProjectService {
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
   private directoryPicker?: () => Promise<string | null>;
+  private readonly sshPromptService: SshPromptService | undefined;
 
-  constructor(private readonly config: Config) {}
+  constructor(
+    private readonly config: Config,
+    sshPromptService?: SshPromptService
+  ) {
+    this.sshPromptService = sshPromptService;
+  }
 
   setDirectoryPicker(picker: () => Promise<string | null>) {
     this.directoryPicker = picker;
@@ -327,13 +416,16 @@ export class ProjectService {
   ): AsyncGenerator<CloneEvent> {
     const prepared = this.validateAndPrepareClone(input);
     if (!prepared.success) {
-      yield { type: "error", error: prepared.error };
+      yield { type: "error", code: "clone_failed", error: prepared.error };
       return;
     }
 
     const { cloneUrl, normalizedPath, cloneParentDir } = prepared.data;
     const cloneWorkPath = `${normalizedPath}.mux-clone-${randomBytes(6).toString("hex")}`;
     let cloneSucceeded = false;
+    // Preserve full stderr so failed clones can surface git's fatal message instead of only exit code 128.
+    let collectedStderr = "";
+    let askpass: Awaited<ReturnType<typeof createMediatedAskpassSession>> | undefined;
 
     const cleanupPartialClone = async () => {
       if (cloneSucceeded) {
@@ -351,7 +443,7 @@ export class ProjectService {
 
     try {
       if (signal?.aborted) {
-        yield { type: "error", error: "Clone cancelled" };
+        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
         return;
       }
 
@@ -366,7 +458,11 @@ export class ProjectService {
       }
 
       if (cloneParentStat && !cloneParentStat.isDirectory()) {
-        yield { type: "error", error: "Clone destination parent directory is not a directory" };
+        yield {
+          type: "error",
+          code: "clone_failed",
+          error: "Clone destination parent directory is not a directory",
+        };
         return;
       }
 
@@ -381,23 +477,40 @@ export class ProjectService {
       }
 
       if (destinationStat) {
-        yield { type: "error", error: `Destination already exists: ${normalizedPath}` };
+        yield {
+          type: "error",
+          code: "clone_failed",
+          error: `Destination already exists: ${normalizedPath}`,
+        };
         return;
       }
 
       await fsPromises.mkdir(cloneParentDir, { recursive: true });
 
+      // Set up SSH askpass mediation for SSH clone URLs.
+      // This allows clone to surface host-key and credential prompts through the
+      // same in-app dialog used by SSH runtime probes.
+      askpass =
+        isSshCloneUrl(cloneUrl) && this.sshPromptService
+          ? await createMediatedAskpassSession({
+              sshPromptService: this.sshPromptService,
+              promptPolicy: { allowHostKey: true, allowCredential: true },
+              // Deduplicate host-key prompts by SSH endpoint identity (host:port),
+              // not by full repo path, so concurrent clones to the same host coalesce.
+              dedupeKey: deriveSshClonePromptDedupeKey(cloneUrl),
+              getStderrContext: () => collectedStderr,
+            })
+          : undefined;
+
       const child = spawn("git", ["clone", "--progress", "--", cloneUrl, cloneWorkPath], {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(askpass?.env ?? {}) },
         // Detached children become process-group leaders on Unix so we can
         // reliably terminate clone helpers (ssh, shells) as a full tree.
         detached: process.platform !== "win32",
       });
 
       const stderrChunks: string[] = [];
-      // Preserve full stderr so failed clones can surface git's fatal message instead of only exit code 128.
-      let collectedStderr = "";
       let resolveChunk: (() => void) | null = null;
       let processEnded = false;
       let resolveProcessExit: (() => void) | null = null;
@@ -406,14 +519,7 @@ export class ProjectService {
       });
       let spawnErrorMessage: string | null = null;
 
-      const getLastMeaningfulStderrLine = (): string | null => {
-        const stderrLines = collectedStderr
-          .trim()
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0);
-        return stderrLines[stderrLines.length - 1] ?? null;
-      };
+      const summarizeStderr = (): string | null => summarizeCloneStderr(collectedStderr);
 
       const notifyChunk = () => {
         if (!resolveChunk) {
@@ -518,14 +624,14 @@ export class ProjectService {
 
       if (spawnErrorMessage != null) {
         await cleanupPartialClone();
-        const errorMessage = getLastMeaningfulStderrLine() ?? spawnErrorMessage;
-        yield { type: "error", error: errorMessage };
+        const errorMessage = summarizeStderr() ?? spawnErrorMessage;
+        yield { type: "error", code: "clone_failed", error: errorMessage };
         return;
       }
 
       if (signal?.aborted) {
         await cleanupPartialClone();
-        yield { type: "error", error: "Clone cancelled" };
+        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
         return;
       }
 
@@ -535,17 +641,24 @@ export class ProjectService {
       if (exitCode !== 0 || exitSignal != null) {
         await cleanupPartialClone();
         const errorMessage =
-          getLastMeaningfulStderrLine() ??
+          summarizeStderr() ??
           (exitSignal != null
             ? `Clone failed: process terminated by signal ${String(exitSignal)}`
             : `Clone failed with exit code ${exitCode ?? "unknown"}`);
-        yield { type: "error", error: errorMessage };
+        yield {
+          type: "error",
+          code: classifySshCloneFailure({
+            stderr: collectedStderr,
+            promptOutcome: askpass?.getLastPromptOutcome() ?? null,
+          }),
+          error: errorMessage,
+        };
         return;
       }
 
       if (signal?.aborted) {
         await cleanupPartialClone();
-        yield { type: "error", error: "Clone cancelled" };
+        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
         return;
       }
 
@@ -555,7 +668,11 @@ export class ProjectService {
         const err = error as NodeJS.ErrnoException;
         if (err.code === "EEXIST" || err.code === "ENOTEMPTY") {
           await cleanupPartialClone();
-          yield { type: "error", error: `Destination already exists: ${normalizedPath}` };
+          yield {
+            type: "error",
+            code: "clone_failed",
+            error: `Destination already exists: ${normalizedPath}`,
+          };
           return;
         }
         throw error;
@@ -569,7 +686,7 @@ export class ProjectService {
         } catch {
           // Best-effort cleanup only.
         }
-        yield { type: "error", error: "Clone cancelled" };
+        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
         return;
       }
 
@@ -591,7 +708,11 @@ export class ProjectService {
         } catch {
           // Best-effort rollback only.
         }
-        yield { type: "error", error: "Failed to persist cloned project configuration" };
+        yield {
+          type: "error",
+          code: "clone_failed",
+          error: "Failed to persist cloned project configuration",
+        };
         return;
       }
 
@@ -599,8 +720,13 @@ export class ProjectService {
       yield { type: "success", projectConfig, normalizedPath };
     } catch (error) {
       const message = getErrorMessage(error);
-      yield { type: "error", error: `Failed to clone repository: ${message}` };
+      yield {
+        type: "error",
+        code: "clone_failed",
+        error: `Failed to clone repository: ${message}`,
+      };
     } finally {
+      askpass?.cleanup();
       await cleanupPartialClone();
     }
   }

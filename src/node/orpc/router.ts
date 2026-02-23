@@ -16,10 +16,7 @@ import type {
   FrontendWorkspaceMetadataSchemaType,
 } from "@/common/orpc/types";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type {
-  HostKeyVerificationEvent,
-  HostKeyVerificationRequest,
-} from "@/common/orpc/schemas/ssh";
+import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import {
   createAuthMiddleware,
   extractClientIpAddress,
@@ -4070,18 +4067,18 @@ export const router = (authToken?: string) => {
         }),
     },
     ssh: {
-      hostKeyVerification: {
+      prompt: {
         subscribe: t
-          .input(schemas.ssh.hostKeyVerification.subscribe.input)
-          .output(schemas.ssh.hostKeyVerification.subscribe.output)
+          .input(schemas.ssh.prompt.subscribe.input)
+          .output(schemas.ssh.prompt.subscribe.output)
           .handler(async function* ({ context, signal }) {
             if (signal?.aborted) return;
 
-            const service = context.hostKeyVerificationService;
+            const service = context.sshPromptService;
             const releaseResponder = service.registerInteractiveResponder();
-            const queue = createAsyncEventQueue<HostKeyVerificationEvent>();
+            const queue = createAsyncEventQueue<SshPromptEvent>();
 
-            const onRequest = (req: HostKeyVerificationRequest) =>
+            const onRequest = (req: SshPromptRequest) =>
               queue.push({ type: "request" as const, ...req });
             const onRemoved = (requestId: string) =>
               queue.push({ type: "removed" as const, requestId });
@@ -4089,7 +4086,9 @@ export const router = (authToken?: string) => {
             // Atomic handshake: register listener + snapshot in one step.
             // No requests can be lost between snapshot and subscription.
             const { snapshot, unsubscribe } = service.subscribeRequests(onRequest, onRemoved);
-            for (const req of snapshot) queue.push({ type: "request" as const, ...req });
+            for (const req of snapshot) {
+              queue.push({ type: "request" as const, ...req });
+            }
 
             const onAbort = () => queue.end();
             signal?.addEventListener("abort", onAbort, { once: true });
@@ -4104,10 +4103,10 @@ export const router = (authToken?: string) => {
             }
           }),
         respond: t
-          .input(schemas.ssh.hostKeyVerification.respond.input)
-          .output(schemas.ssh.hostKeyVerification.respond.output)
+          .input(schemas.ssh.prompt.respond.input)
+          .output(schemas.ssh.prompt.respond.output)
           .handler(({ context, input }) => {
-            context.hostKeyVerificationService.respond(input.requestId, input.accept);
+            context.sshPromptService.respond(input.requestId, input.response);
             return Ok(undefined);
           }),
       },

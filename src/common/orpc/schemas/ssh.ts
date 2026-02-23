@@ -1,18 +1,59 @@
 import { z } from "zod";
 
-export const HostKeyVerificationRequestSchema = z.object({
-  requestId: z.string(),
-  host: z.string(),
-  keyType: z.string(),
-  fingerprint: z.string(),
-  prompt: z.string(),
-});
+const HostKeyPromptRequestSchemaBase = z
+  .object({
+    requestId: z.string(),
+    host: z.string(),
+    keyType: z.string(),
+    fingerprint: z.string(),
+    prompt: z.string(),
+  })
+  .strict();
 
-export type HostKeyVerificationRequest = z.infer<typeof HostKeyVerificationRequestSchema>;
+const SshHostKeyPromptRequestSchema = HostKeyPromptRequestSchemaBase.extend({
+  kind: z.literal("host-key"),
+}).strict();
 
-export const HostKeyVerificationEventSchema = z.discriminatedUnion("type", [
-  HostKeyVerificationRequestSchema.extend({ type: z.literal("request") }),
-  z.object({ type: z.literal("removed"), requestId: z.string() }),
+const SshCredentialPromptRequestSchema = z
+  .object({
+    requestId: z.string(),
+    kind: z.literal("credential"),
+    prompt: z.string(),
+    secret: z.boolean(),
+  })
+  .strict();
+
+export const SshPromptRequestSchema = z.discriminatedUnion("kind", [
+  SshHostKeyPromptRequestSchema,
+  SshCredentialPromptRequestSchema,
 ]);
 
-export type HostKeyVerificationEvent = z.infer<typeof HostKeyVerificationEventSchema>;
+export type SshPromptRequest = z.infer<typeof SshPromptRequestSchema>;
+export type SshHostKeyPromptRequest = z.infer<typeof SshHostKeyPromptRequestSchema>;
+export type SshCredentialPromptRequest = z.infer<typeof SshCredentialPromptRequestSchema>;
+
+const SshPromptRequestEventSchema = z.discriminatedUnion("kind", [
+  SshHostKeyPromptRequestSchema.extend({ type: z.literal("request") }).strict(),
+  SshCredentialPromptRequestSchema.extend({ type: z.literal("request") }).strict(),
+]);
+
+export const SshPromptEventSchema = z.union([
+  SshPromptRequestEventSchema,
+  z
+    .object({
+      type: z.literal("removed"),
+      requestId: z.string(),
+    })
+    .strict(),
+]);
+
+export type SshPromptEvent = z.infer<typeof SshPromptEventSchema>;
+
+export const SshPromptResponseInputSchema = z
+  .object({
+    requestId: z.string(),
+    response: z.string(),
+  })
+  .strict();
+
+export type SshPromptResponseInput = z.infer<typeof SshPromptResponseInputSchema>;

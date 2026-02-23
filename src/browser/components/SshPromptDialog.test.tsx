@@ -2,10 +2,7 @@ import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import type {
-  HostKeyVerificationEvent,
-  HostKeyVerificationRequest,
-} from "@/common/orpc/schemas/ssh";
+import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import type { ReactNode } from "react";
 
 // Self-contained dialog stub — bun's mock.module is process-global and
@@ -25,7 +22,7 @@ void mock.module("@/browser/components/ui/dialog", () => ({
   WarningText: (props: { children: ReactNode }) => <div>{props.children}</div>,
 }));
 
-import { HostKeyVerificationDialog } from "./HostKeyVerificationDialog";
+import { SshPromptDialog } from "./SshPromptDialog";
 
 interface ControlledSubscription<T> {
   iterable: AsyncIterable<T>;
@@ -103,34 +100,42 @@ function createMockIterableSubscription<T>(): ControlledSubscription<T> {
   };
 }
 
-interface HostKeyVerificationApi {
+interface SshPromptApi {
   ssh: {
-    hostKeyVerification: {
+    prompt: {
       subscribe: (
         _input?: undefined,
         _options?: { signal?: AbortSignal }
-      ) => Promise<AsyncIterable<HostKeyVerificationEvent>>;
-      respond: (input: { requestId: string; accept: boolean }) => Promise<void>;
+      ) => Promise<AsyncIterable<SshPromptEvent>>;
+      respond: (input: { requestId: string; response: string }) => Promise<void>;
     };
   };
 }
 
-let api: HostKeyVerificationApi | null = null;
+let api: SshPromptApi | null = null;
 let respondMock: ReturnType<typeof mock>;
 let subscribeMock: ReturnType<typeof mock>;
-let mockSubscription: ControlledSubscription<HostKeyVerificationEvent>;
+let mockSubscription: ControlledSubscription<SshPromptEvent>;
 
 // mock.module is hoisted by bun — the mock is active before static imports resolve.
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({ api }),
 }));
 
-const MOCK_REQUEST: HostKeyVerificationRequest = {
+const MOCK_REQUEST: SshPromptRequest = {
   requestId: "req-1",
+  kind: "host-key",
   host: "example.com",
   keyType: "ssh-ed25519",
   fingerprint: "SHA256:abcdef",
   prompt: "Trust host key?",
+};
+
+const MOCK_CREDENTIAL_REQUEST: SshPromptRequest = {
+  requestId: "cred-1",
+  kind: "credential",
+  prompt: "Enter passphrase for key '/home/user/.ssh/id_ed25519':",
+  secret: true,
 };
 
 async function flushReactWork(): Promise<void> {
@@ -138,24 +143,24 @@ async function flushReactWork(): Promise<void> {
   await Promise.resolve();
 }
 
-async function enqueueRequest(request: HostKeyVerificationRequest): Promise<void> {
+async function enqueueRequest(request: SshPromptRequest): Promise<void> {
   await act(async () => {
     mockSubscription.push({ type: "request", ...request });
     await flushReactWork();
   });
 }
 
-describe("HostKeyVerificationDialog", () => {
+describe("SshPromptDialog", () => {
   beforeEach(() => {
     cleanup();
 
-    mockSubscription = createMockIterableSubscription<HostKeyVerificationEvent>();
+    mockSubscription = createMockIterableSubscription<SshPromptEvent>();
     respondMock = mock(() => Promise.resolve());
     subscribeMock = mock(() => Promise.resolve(mockSubscription.iterable));
 
     api = {
       ssh: {
-        hostKeyVerification: {
+        prompt: {
           subscribe: subscribeMock,
           respond: respondMock,
         },
@@ -170,7 +175,7 @@ describe("HostKeyVerificationDialog", () => {
   });
 
   it("dequeues request on successful respond", async () => {
-    const { getByRole, queryByRole } = render(<HostKeyVerificationDialog />);
+    const { getByRole, queryByRole } = render(<SshPromptDialog />);
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
@@ -181,7 +186,7 @@ describe("HostKeyVerificationDialog", () => {
     });
 
     await waitFor(() => {
-      expect(respondMock).toHaveBeenCalledWith({ requestId: "req-1", accept: false });
+      expect(respondMock).toHaveBeenCalledWith({ requestId: "req-1", response: "no" });
     });
     expect(respondMock).toHaveBeenCalledTimes(1);
 
@@ -189,19 +194,106 @@ describe("HostKeyVerificationDialog", () => {
     expect(queryByRole("button", { name: "Reject" })).toBeNull();
   });
 
+  it("renders credential prompt with input field", async () => {
+    const { container, getByRole, getByText } = render(<SshPromptDialog />);
+
+    await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
+    await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
+
+    expect(getByText("Enter passphrase for key '/home/user/.ssh/id_ed25519':")).not.toBeNull();
+
+    const credentialInput = container.querySelector("input[type='password']");
+    expect(credentialInput).not.toBeNull();
+
+    expect(getByRole("button", { name: "Submit" })).not.toBeNull();
+    expect(getByRole("button", { name: "Cancel" })).not.toBeNull();
+  });
+
+  it("credential submit sends typed response", async () => {
+    const { container, getByRole, queryByRole } = render(<SshPromptDialog />);
+
+    await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
+    await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
+
+    const credentialInput = container.querySelector<HTMLInputElement>("input[type='password']");
+    expect(credentialInput).not.toBeNull();
+    if (!credentialInput) {
+      throw new Error("Expected credential input to be present");
+    }
+
+    const reactPropsKey = Object.keys(credentialInput).find((key) =>
+      key.startsWith("__reactProps")
+    );
+    expect(reactPropsKey).not.toBeUndefined();
+    if (!reactPropsKey) {
+      throw new Error("Expected credential input to expose React props");
+    }
+
+    const reactPropsRecord = credentialInput as unknown as Record<string, unknown>;
+    const reactProps = reactPropsRecord[reactPropsKey];
+    if (!reactProps || typeof reactProps !== "object") {
+      throw new Error("Expected credential input to expose React prop object");
+    }
+
+    const onChange = (reactProps as { onChange?: (event: { target: { value: string } }) => void })
+      .onChange;
+    expect(onChange).toBeDefined();
+    if (!onChange) {
+      throw new Error("Expected credential input to expose onChange handler");
+    }
+
+    await act(async () => {
+      // fireEvent.change alone does not always update controlled input state in happy-dom.
+      fireEvent.change(credentialInput, { target: { value: "my-passphrase" } });
+      onChange({ target: { value: "my-passphrase" } });
+      await flushReactWork();
+    });
+
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Submit" }));
+      await flushReactWork();
+    });
+
+    await waitFor(() => {
+      expect(respondMock).toHaveBeenCalledWith({
+        requestId: "cred-1",
+        response: "my-passphrase",
+      });
+    });
+
+    // Successful credential submit dequeues the request and closes the dialog.
+    expect(queryByRole("button", { name: "Submit" })).toBeNull();
+  });
+
+  it("credential cancel sends empty response", async () => {
+    const { getByRole } = render(<SshPromptDialog />);
+
+    await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
+    await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
+
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Cancel" }));
+      await flushReactWork();
+    });
+
+    await waitFor(() => {
+      expect(respondMock).toHaveBeenCalledWith({ requestId: "cred-1", response: "" });
+    });
+  });
+
   it("keeps request visible when respond fails", async () => {
     respondMock = mock(() => Promise.reject(new Error("RPC transport error")));
     subscribeMock = mock(() => Promise.resolve(mockSubscription.iterable));
     api = {
       ssh: {
-        hostKeyVerification: {
+        prompt: {
           subscribe: subscribeMock,
           respond: respondMock,
         },
       },
     };
 
-    const { getByRole, queryByRole } = render(<HostKeyVerificationDialog />);
+    const { getByRole, queryByRole } = render(<SshPromptDialog />);
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
@@ -222,29 +314,28 @@ describe("HostKeyVerificationDialog", () => {
     });
     await waitFor(() => expect(respondMock).toHaveBeenCalledTimes(2));
 
-    expect(respondMock).toHaveBeenNthCalledWith(1, { requestId: "req-1", accept: false });
-    expect(respondMock).toHaveBeenNthCalledWith(2, { requestId: "req-1", accept: false });
+    expect(respondMock).toHaveBeenNthCalledWith(1, { requestId: "req-1", response: "no" });
+    expect(respondMock).toHaveBeenNthCalledWith(2, { requestId: "req-1", response: "no" });
   });
 
   it("closes late iterator when cleanup runs before subscribe resolves", async () => {
-    let resolveSubscribe: ((iterable: AsyncIterable<HostKeyVerificationEvent>) => void) | null =
-      null;
+    let resolveSubscribe: ((iterable: AsyncIterable<SshPromptEvent>) => void) | null = null;
     subscribeMock = mock(
       () =>
-        new Promise<AsyncIterable<HostKeyVerificationEvent>>((resolve) => {
+        new Promise<AsyncIterable<SshPromptEvent>>((resolve) => {
           resolveSubscribe = resolve;
         })
     );
     api = {
       ssh: {
-        hostKeyVerification: {
+        prompt: {
           subscribe: subscribeMock,
           respond: respondMock,
         },
       },
     };
 
-    const { unmount } = render(<HostKeyVerificationDialog />);
+    const { unmount } = render(<SshPromptDialog />);
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
 
     // Cleanup fires while subscribe() is still pending — iteratorRef is undefined.
@@ -261,7 +352,7 @@ describe("HostKeyVerificationDialog", () => {
   });
 
   it("does not double-close iterator on normal cleanup", async () => {
-    const { unmount } = render(<HostKeyVerificationDialog />);
+    const { unmount } = render(<SshPromptDialog />);
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
 
@@ -277,7 +368,7 @@ describe("HostKeyVerificationDialog", () => {
   });
 
   it("clears pending queue when api becomes null", async () => {
-    const { queryByRole, rerender } = render(<HostKeyVerificationDialog />);
+    const { queryByRole, rerender } = render(<SshPromptDialog />);
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
@@ -288,7 +379,7 @@ describe("HostKeyVerificationDialog", () => {
     // Simulate disconnect — api becomes null
     api = null;
     await act(async () => {
-      rerender(<HostKeyVerificationDialog />);
+      rerender(<SshPromptDialog />);
       await flushReactWork();
     });
 

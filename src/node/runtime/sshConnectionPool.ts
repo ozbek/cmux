@@ -21,31 +21,16 @@ import { spawn } from "child_process";
 import { HOST_KEY_APPROVAL_TIMEOUT_MS } from "@/common/constants/ssh";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { log } from "@/node/services/log";
-import type { HostKeyVerificationService } from "@/node/services/hostKeyVerificationService";
-import { createAskpassSession, parseHostKeyPrompt } from "./sshAskpass";
-
-/**
- * Classify an SSH_ASKPASS prompt to route it through the correct handler.
- *
- * OpenSSH askpass receives the bare prompt question (e.g., "Are you sure you
- * want to continue connecting (yes/no/[fingerprint])?" for host-key, or
- * "Enter passphrase for key '...':" for encrypted keys). We classify based
- * on the prompt text so host-key prompts go through verification UI and
- * everything else fails fast.
- */
-function classifyAskpassPrompt(promptText: string): "host-key" | "credential" {
-  // OpenSSH host-key confirmation prompt always contains "continue connecting"
-  if (/continue connecting/i.test(promptText)) return "host-key";
-  return "credential";
-}
+import type { SshPromptService } from "@/node/services/sshPromptService";
+import { createMediatedAskpassSession } from "./openSshPromptMediation";
 
 export type OpenSSHHostKeyPolicyMode = "strict" | "headless-fallback";
 
-let hostKeyService: HostKeyVerificationService | undefined;
+let sshPromptService: SshPromptService | undefined;
 let hostKeyPolicyMode: OpenSSHHostKeyPolicyMode = "headless-fallback";
 
-export function setHostKeyVerificationService(svc: HostKeyVerificationService | undefined): void {
-  hostKeyService = svc;
+export function setSshPromptService(svc: SshPromptService | undefined): void {
+  sshPromptService = svc;
 }
 
 export function setOpenSSHHostKeyPolicyMode(mode: OpenSSHHostKeyPolicyMode): void {
@@ -53,7 +38,7 @@ export function setOpenSSHHostKeyPolicyMode(mode: OpenSSHHostKeyPolicyMode): voi
 }
 
 export function isInteractiveHostKeyApprovalAvailable(): boolean {
-  return hostKeyService?.hasInteractiveResponder() === true;
+  return sshPromptService?.hasInteractiveResponder() === true;
 }
 
 export function appendOpenSSHHostKeyPolicyArgs(args: string[]): void {
@@ -414,7 +399,7 @@ export class SSHConnectionPool {
     key: string
   ): Promise<void> {
     const controlPath = getControlPath(config);
-    const verificationService = hostKeyService;
+    const promptService = sshPromptService;
     const canPromptInteractively = isInteractiveHostKeyApprovalAvailable();
 
     const args: string[] = ["-T"]; // No PTY needed for probe
@@ -464,25 +449,18 @@ export class SSHConnectionPool {
     // Non-host-key prompts (passphrase, password) return empty to fail fast —
     // passphrase-protected keys must be agent-unlocked before Mux can use them.
     const askpass =
-      canPromptInteractively && verificationService
-        ? await createAskpassSession(async (promptText) => {
-            if (classifyAskpassPrompt(promptText) !== "host-key") {
-              // Credential prompts (passphrase/password) are not supported during
-              // probe — keys must be unlocked via ssh-agent. Return empty string
-              // so SSH treats this as auth failure and moves on.
-              log.warn("SSH askpass: unsupported credential prompt during probe, failing fast");
-              return "";
-            }
-
-            extendDeadline?.(HOST_KEY_APPROVAL_TIMEOUT_MS);
-
-            const fullContext = stderr + "\n" + promptText;
-            const parsed = parseHostKeyPrompt(fullContext);
-            const accepted = await verificationService.requestVerification({
-              ...parsed,
-              dedupeKey: formatSshEndpoint(config.host, config.port ?? 22),
-            });
-            return accepted ? "yes" : "no";
+      canPromptInteractively && promptService
+        ? await createMediatedAskpassSession({
+            sshPromptService: promptService,
+            promptPolicy: {
+              allowHostKey: true,
+              allowCredential: false,
+            },
+            dedupeKey: formatSshEndpoint(config.host, config.port ?? 22),
+            getStderrContext: () => stderr,
+            onHostKeyPromptStarted: () => {
+              extendDeadline?.(HOST_KEY_APPROVAL_TIMEOUT_MS);
+            },
           })
         : undefined;
 

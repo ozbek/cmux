@@ -6,7 +6,7 @@ import { NameGenerationErrorSchema, SendMessageErrorSchema } from "./errors";
 import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./message";
 import { ProjectConfigSchema, SectionConfigSchema } from "./project";
 import { ResultSchema } from "./result";
-import { HostKeyVerificationEventSchema } from "./ssh";
+import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
 import {
   RuntimeConfigSchema,
   RuntimeAvailabilitySchema,
@@ -486,6 +486,12 @@ export const projects = {
         }),
         z.object({
           type: z.literal("error"),
+          code: z.enum([
+            "ssh_host_key_rejected",
+            "ssh_credential_cancelled",
+            "ssh_prompt_timeout",
+            "clone_failed",
+          ]),
           error: z.string(),
         }),
       ])
@@ -1832,18 +1838,13 @@ export const debug = {
 };
 
 export const ssh = {
-  hostKeyVerification: {
+  prompt: {
     subscribe: {
       input: z.void(),
-      output: eventIterator(HostKeyVerificationEventSchema),
+      output: eventIterator(SshPromptEventSchema),
     },
     respond: {
-      input: z
-        .object({
-          requestId: z.string(),
-          accept: z.boolean(),
-        })
-        .strict(),
+      input: SshPromptResponseInputSchema,
       output: ResultSchema(z.void(), z.string()),
     },
   },
