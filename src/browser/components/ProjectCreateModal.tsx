@@ -330,6 +330,8 @@ function formatCloneError(event: { code: string; error: string }): string {
       return "SSH authentication was cancelled.";
     case "ssh_prompt_timeout":
       return "SSH authentication timed out.";
+    case "destination_exists":
+      return event.error || "Destination already exists";
     default:
       return event.error || "Failed to clone project";
   }
@@ -361,10 +363,13 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
     const [cloneParentDir, setCloneParentDir] = useState(props.defaultProjectDir);
     const [hasEditedCloneParentDir, setHasEditedCloneParentDir] = useState(false);
     const [error, setError] = useState("");
+    const [destinationExistsPath, setDestinationExistsPath] = useState<string | null>(null);
     const [isCreating, setIsCreating] = useState(false);
     const [cloneOutput, setCloneOutput] = useState("");
     const rawOutputRef = useRef("");
+    const [isAddingProject, setIsAddingProject] = useState(false);
     const abortControllerRef = useRef<AbortController | null>(null);
+    const addProjectAbortControllerRef = useRef<AbortController | null>(null);
     const progressEndRef = useRef<HTMLDivElement | null>(null);
 
     const setCreating = useCallback(
@@ -382,6 +387,8 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
       setError("");
       setCloneOutput("");
       rawOutputRef.current = "";
+      setDestinationExistsPath(null);
+      setIsAddingProject(false);
     }, [props.defaultProjectDir]);
 
     const abortInFlightClone = useCallback(() => {
@@ -392,14 +399,29 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
       abortControllerRef.current.abort();
     }, []);
 
+    const abortInFlightAddProject = useCallback(() => {
+      if (!addProjectAbortControllerRef.current) {
+        return;
+      }
+
+      addProjectAbortControllerRef.current.abort();
+    }, []);
+
     useEffect(() => {
       if (!props.isOpen) {
         abortInFlightClone();
+        abortInFlightAddProject();
         reset();
       }
-    }, [abortInFlightClone, props.isOpen, reset]);
+    }, [abortInFlightAddProject, abortInFlightClone, props.isOpen, reset]);
 
-    useEffect(() => abortInFlightClone, [abortInFlightClone]);
+    useEffect(
+      () => () => {
+        abortInFlightClone();
+        abortInFlightAddProject();
+      },
+      [abortInFlightAddProject, abortInFlightClone]
+    );
 
     useEffect(() => {
       if (!props.isOpen || hasEditedCloneParentDir) {
@@ -417,9 +439,10 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
 
     const handleCancel = useCallback(() => {
       abortInFlightClone();
+      abortInFlightAddProject();
       reset();
       props.onClose?.();
-    }, [abortInFlightClone, props, reset]);
+    }, [abortInFlightAddProject, abortInFlightClone, props, reset]);
 
     const { canBrowse, browse, directoryPickerModal } = useDirectoryPicker({
       api,
@@ -433,6 +456,9 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
     });
 
     const handleClone = useCallback(async (): Promise<boolean> => {
+      setError("");
+      setDestinationExistsPath(null);
+
       const trimmedRepoUrl = repoUrl.trim();
       if (!trimmedRepoUrl) {
         setError("Please enter a repository URL");
@@ -451,6 +477,7 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
       setError("");
       setCloneOutput("");
       rawOutputRef.current = "";
+      setDestinationExistsPath(null);
       setCreating(true);
 
       const controller = new AbortController();
@@ -483,6 +510,9 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
             return true;
           }
 
+          if (event.code === "destination_exists" && event.normalizedPath) {
+            setDestinationExistsPath(event.normalizedPath);
+          }
           setError(formatCloneError(event));
           return false;
         }
@@ -510,6 +540,47 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
         }
       }
     }, [api, isCreating, props, repoUrl, reset, setCreating, trimmedCloneParentDir]);
+
+    const handleAddExistingProject = useCallback(async () => {
+      if (!api || !destinationExistsPath) {
+        return;
+      }
+
+      setIsAddingProject(true);
+      const controller = new AbortController();
+      addProjectAbortControllerRef.current = controller;
+
+      try {
+        const result = await api.projects.create(
+          { projectPath: destinationExistsPath },
+          { signal: controller.signal }
+        );
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        if (!result.success) {
+          const errorMessage =
+            typeof result.error === "string" ? result.error : "Failed to add existing project";
+          setError(errorMessage);
+          return;
+        }
+
+        props.onSuccess(result.data.normalizedPath, result.data.projectConfig);
+        reset();
+        props.onClose?.();
+      } catch {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setError("Failed to add existing project");
+      } finally {
+        if (addProjectAbortControllerRef.current === controller) {
+          addProjectAbortControllerRef.current = null;
+          setIsAddingProject(false);
+        }
+      }
+    }, [api, destinationExistsPath, props, reset]);
 
     const handleRetry = useCallback(() => {
       setError("");
@@ -622,7 +693,21 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
           </div>
         )}
 
-        {error && <p className="text-error text-xs">{error}</p>}
+        {error && (
+          <div className="space-y-1">
+            <p className="text-error text-xs">{error}</p>
+            {destinationExistsPath && (
+              <button
+                type="button"
+                className="text-accent text-xs underline disabled:opacity-50"
+                onClick={() => void handleAddExistingProject()}
+                disabled={isAddingProject}
+              >
+                {isAddingProject ? "Adding project…" : "Add this project instead"}
+              </button>
+            )}
+          </div>
+        )}
 
         {!props.hideFooter && (
           <DialogFooter>
