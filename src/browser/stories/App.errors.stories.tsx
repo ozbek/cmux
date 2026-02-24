@@ -483,12 +483,12 @@ export const LargeDiff: AppStory = {
 };
 
 /**
- * Project removal error popover.
+ * Project removal disabled state.
  *
- * Shows the error popup when attempting to remove a project that has active workspaces.
- * The play function hovers the project and clicks the remove button to trigger the error.
+ * Verifies that the "Remove project" button is disabled when workspaces exist.
+ * The button is aria-disabled and styled as not-allowed, preventing the backend call.
  */
-export const ProjectRemovalError: AppStory = {
+export const ProjectRemovalDisabled: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -498,40 +498,75 @@ export const ProjectRemovalError: AppStory = {
         ];
 
         // Expand the project so workspaces are visible
-        expandProjects(["/mock/my-app"]);
+        expandProjects(["/home/user/projects/my-app"]);
 
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
           workspaces,
-          onProjectRemove: () => ({
-            success: false,
-            error:
-              "Cannot remove project with active workspaces. Please remove all 2 workspace(s) first.",
-          }),
         });
       }}
     />
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    // Wait for the remove button to exist in DOM
-    await waitFor(() => {
-      const removeButton = canvasElement.querySelector(
+    const removeButton = await waitFor(() => {
+      const button = canvasElement.querySelector<HTMLButtonElement>(
         'button[aria-label="Remove project my-app"]'
       );
-      if (!removeButton) throw new Error("Remove button not found");
+      if (!button) throw new Error("Remove button not found");
+      return button;
     });
 
-    // Trigger removal directly so this interaction remains stable across Chromatic snapshot modes,
-    // where hover-driven opacity transitions can be flaky.
-    const removeButton = canvasElement.querySelector<HTMLButtonElement>(
-      'button[aria-label="Remove project my-app"]'
-    )!;
-    removeButton.click();
+    // Hover the project row (the element that owns hover:[&_button]:opacity-100)
+    // so action icons become visible. Avoid [data-project-path] here because the
+    // remove button itself also has that attribute.
+    const projectRow =
+      removeButton.closest<HTMLElement>("[aria-controls]") ??
+      canvasElement.querySelector<HTMLElement>(
+        '[role="button"][aria-label="Create workspace in my-app"]'
+      );
+    if (!projectRow) throw new Error("Project row not found");
 
-    // Wait for the error popover to appear
+    // Make project action affordances deterministic in this story capture.
+    // Synthetic hover can be flaky for pure CSS :hover opacity transitions,
+    // so force key/remove visibility while still exercising hover behavior.
+    const secretsButton = canvasElement.querySelector<HTMLButtonElement>(
+      'button[aria-label="Manage secrets for my-app"]'
+    );
+    if (secretsButton) {
+      secretsButton.style.opacity = "1";
+    }
+    removeButton.style.opacity = "1";
+
+    await userEvent.hover(projectRow);
+
+    // Hover the remove trigger after row hover so tooltip content appears.
+    await userEvent.hover(removeButton);
+
+    await waitFor(
+      () => {
+        const tooltip = document.querySelector('[role="tooltip"]');
+        if (!tooltip) throw new Error("Tooltip not visible");
+        if (!tooltip.textContent?.includes("Delete all 2 workspaces first")) {
+          throw new Error("Expected remove-tooltip blocker text");
+        }
+      },
+      { interval: 50 }
+    );
+
+    // Verify the button is disabled (aria-disabled="true")
+    await waitFor(
+      () => {
+        if (removeButton.getAttribute("aria-disabled") !== "true") {
+          throw new Error("Remove button should be aria-disabled when workspaces exist");
+        }
+      },
+      { timeout: 2000 }
+    );
+
     await waitFor(() => {
-      const errorPopover = document.querySelector('[role="alert"]');
-      if (!errorPopover) throw new Error("Error popover not found");
+      if (removeButton.className.includes("!opacity-40")) {
+        throw new Error("Disabled remove button should not force !opacity-40 visibility");
+      }
     });
   },
 };

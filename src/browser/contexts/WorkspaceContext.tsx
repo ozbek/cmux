@@ -1106,10 +1106,24 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
               updated.set(event.workspaceId, meta);
             }
 
-            // Reload projects when:
-            // 1. New workspace appears (e.g., from fork)
-            // 2. Workspace transitions from initializing to ready (init completed)
-            if (isNewWorkspace || (wasInitializing && isNowReady)) {
+            // Reload projects when archive state changes so that
+            // getProjectWorkspaceCounts (used for removal eligibility) sees
+            // up-to-date archivedAt timestamps in the project config.
+            const wasInActiveMap = prev.has(event.workspaceId);
+            const archiveStateChanged = isNowArchived
+              ? wasInActiveMap // was active, now archived
+              : !wasInActiveMap && meta !== null; // was absent (archived), now active (unarchived)
+
+            // Also reload when:
+            // 1. Workspace is deleted in another session
+            // 2. New workspace appears (e.g., from fork)
+            // 3. Workspace transitions from initializing to ready (init completed)
+            if (
+              meta === null ||
+              isNewWorkspace ||
+              (wasInitializing && isNowReady) ||
+              archiveStateChanged
+            ) {
               void refreshProjects();
             }
 
