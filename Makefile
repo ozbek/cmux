@@ -63,7 +63,7 @@ include fmt.mk
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck typecheck-react-native static-check
 .PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
-.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64
+.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 check-appimage-icons
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-build test-storybook chromatic
@@ -299,15 +299,19 @@ version: ## Generate version file
 
 src/version.ts: version
 
+build/icons/512x512.png: docs/img/logo-white.svg scripts/generate-icons.ts
+	@echo "Generating Linux icon set..."
+	@bun scripts/generate-icons.ts linux-icons
+
 # Platform-specific icon targets
 ifeq ($(shell uname), Darwin)
-build-icons: build/icon.icns build/icon.png ## Generate Electron app icons from logo (macOS builds both)
+build-icons: build/icon.icns build/icon.png build/icons/512x512.png ## Generate Electron app icons from logo (macOS builds both)
 
 build/icon.icns: docs/img/logo-white.svg scripts/generate-icons.ts
 	@echo "Generating macOS ICNS icon..."
 	@bun scripts/generate-icons.ts icns
 else
-build-icons: build/icon.png ## Generate Electron app icons from logo (Linux builds PNG only)
+build-icons: build/icon.png build/icons/512x512.png ## Generate Electron app icons from logo (Linux builds PNG only)
 endif
 
 build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
@@ -449,6 +453,9 @@ dist-linux: build ## Build Linux distributable
 
 dist-linux-arm64: build ## Build Linux arm64 distributable
 	@bun x electron-builder --linux --arm64 --publish never
+
+check-appimage-icons: ## Validate AppImage icon structure (requires prior dist-linux build)
+	@./scripts/check-appimage-icons.sh
 
 ## VS Code Extension (delegates to vscode/Makefile)
 
