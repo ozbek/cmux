@@ -231,9 +231,19 @@ function AgentProviderWithState(props: {
     const activeAgentId = coerceAgentId(
       isProjectScope ? (scopedAgentId ?? globalDefaultAgentId) : scopedAgentId
     );
-    const currentIndex = selectableAgents.findIndex((a) => a.id === activeAgentId);
-    const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % selectableAgents.length;
-    const nextAgent = selectableAgents[nextIndex];
+
+    // Auto mode: ignore the cycle shortcut when auto is a live agent
+    // (stale persisted "auto" not in list → allow cycling to recover)
+    const autoAvailable = selectableAgents.some((a) => a.id === "auto");
+    if (activeAgentId === "auto" && autoAvailable) return;
+
+    // Never cycle into "auto" — it's toggled explicitly via the picker switch
+    const cyclableAgents = selectableAgents.filter((a) => a.id !== "auto");
+    if (cyclableAgents.length < 2) return;
+
+    const currentIndex = cyclableAgents.findIndex((a) => a.id === activeAgentId);
+    const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % cyclableAgents.length;
+    const nextAgent = cyclableAgents[nextIndex];
     if (nextAgent) {
       setAgentId(nextAgent.id);
     }
