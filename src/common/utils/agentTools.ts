@@ -6,12 +6,6 @@ export interface ToolsConfig {
   require?: readonly string[];
 }
 
-export interface AgentToolsLike {
-  id: AgentId;
-  base?: AgentId;
-  tools?: ToolsConfig;
-}
-
 export interface ToolsConfigCarrier {
   tools?: ToolsConfig;
 }
@@ -95,49 +89,6 @@ export function collectToolConfigsFromResolvedChain(
     .reverse()
     .filter((agent): agent is ToolsConfigCarrier & { tools: ToolsConfig } => agent.tools != null)
     .map((agent) => agent.tools);
-}
-
-/**
- * Extract tool configs by walking `base` pointers in a graph of unique agent IDs.
- *
- * This is intended for UI usage where the caller has a flat list from discovery.
- */
-export function collectToolConfigsFromDefinitionGraph(
-  agentId: AgentId,
-  agents: readonly AgentToolsLike[],
-  maxDepth = 10
-): ToolsConfig[] {
-  const byId = new Map<AgentId, AgentToolsLike>();
-  for (const agent of agents) {
-    byId.set(agent.id, agent);
-  }
-
-  const configsChildToBase: ToolsConfig[] = [];
-  const visited = new Set<AgentId>();
-
-  let currentId: AgentId | undefined = agentId;
-  let depth = 0;
-
-  while (currentId && depth < maxDepth) {
-    if (visited.has(currentId)) {
-      break;
-    }
-    visited.add(currentId);
-
-    const agent = byId.get(currentId);
-    if (!agent) {
-      break;
-    }
-
-    if (agent.tools) {
-      configsChildToBase.push(agent.tools);
-    }
-
-    currentId = agent.base;
-    depth++;
-  }
-
-  return configsChildToBase.reverse();
 }
 
 export function isToolEnabledInResolvedChain(
