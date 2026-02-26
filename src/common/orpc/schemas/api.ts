@@ -156,8 +156,10 @@ export const ProviderConfigInfoSchema = z.object({
   /** OpenAI-specific fields */
   serviceTier: z.enum(["auto", "default", "flex", "priority"]).optional(),
   wireFormat: z.enum(["responses", "chatCompletions"]).optional(),
+  store: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: z.enum(["5m", "1h"]).optional(),
+  disableBetaFeatures: z.boolean().optional(),
   /** OpenAI-only: whether Codex OAuth tokens are present in providers.jsonc */
   codexOauthSet: z.boolean().optional(),
   /**
@@ -180,7 +182,7 @@ export const providers = {
     input: z.object({
       provider: z.string(),
       keyPath: z.array(z.string()),
-      value: z.string(),
+      value: z.union([z.string(), z.boolean()]),
     }),
     output: ResultSchema(z.void(), z.string()),
   },
