@@ -706,29 +706,58 @@ const ReviewNoteInput: React.FC<ReviewNoteInputProps> = React.memo(
     initialNoteText,
   }) => {
     const { showOld, showNew } = getLineNumberModeFlags(lineNumberMode);
-    const [noteText, setNoteText] = React.useState(initialNoteText ?? "");
     const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+    const resizeFrameRef = React.useRef<number | null>(null);
 
-    // Auto-focus on mount
-    React.useEffect(() => {
-      textareaRef.current?.focus();
-    }, []);
-
-    React.useEffect(() => {
-      setNoteText(initialNoteText ?? "");
-    }, [initialNoteText]);
-
-    // Auto-expand textarea as user types
-    React.useEffect(() => {
+    const resizeTextarea = React.useCallback(() => {
       const textarea = textareaRef.current;
-      if (!textarea) return;
+      if (!textarea) {
+        return;
+      }
 
       textarea.style.height = "auto";
       textarea.style.height = `${textarea.scrollHeight}px`;
-    }, [noteText]);
+    }, []);
+
+    const scheduleTextareaResize = React.useCallback(() => {
+      if (resizeFrameRef.current !== null) {
+        cancelAnimationFrame(resizeFrameRef.current);
+      }
+
+      resizeFrameRef.current = window.requestAnimationFrame(() => {
+        resizeFrameRef.current = null;
+        resizeTextarea();
+      });
+    }, [resizeTextarea]);
+
+    // Keep the composer uncontrolled so typing does not trigger per-key React re-renders
+    // through immersive diff overlays. Parent-initiated prefill changes are synced here.
+    React.useEffect(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) {
+        return;
+      }
+
+      textarea.value = initialNoteText ?? "";
+      scheduleTextareaResize();
+    }, [initialNoteText, scheduleTextareaResize]);
+
+    // Auto-focus on mount.
+    React.useEffect(() => {
+      textareaRef.current?.focus();
+      scheduleTextareaResize();
+    }, [scheduleTextareaResize]);
+
+    React.useEffect(() => {
+      return () => {
+        if (resizeFrameRef.current !== null) {
+          cancelAnimationFrame(resizeFrameRef.current);
+        }
+      };
+    }, []);
 
     const handleSubmit = () => {
-      const text = textareaRef.current?.value ?? noteText;
+      const text = textareaRef.current?.value ?? "";
       if (!text.trim()) return;
 
       const [start, end] = [selection.startIndex, selection.endIndex].sort((a, b) => a - b);
@@ -849,8 +878,8 @@ const ReviewNoteInput: React.FC<ReviewNoteInputProps> = React.memo(
                 minHeight: "calc(12px * 1.5 * 2 + 12px)",
               }}
               placeholder="Add a review note… (Enter to submit, Shift+Enter for newline, Esc to cancel)"
-              value={noteText}
-              onChange={(e) => setNoteText(e.target.value)}
+              defaultValue={initialNoteText ?? ""}
+              onInput={scheduleTextareaResize}
               onClick={(e) => e.stopPropagation()}
               onKeyDown={(e) => {
                 stopKeyboardPropagation(e);
@@ -984,12 +1013,60 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
     onComposerCancel,
   }) => {
     const dragAnchorRef = React.useRef<number | null>(null);
+    const dragUpdateFrameRef = React.useRef<number | null>(null);
+    const pendingDragLineIndexRef = React.useRef<number | null>(null);
     const [isDragging, setIsDragging] = React.useState(false);
+    const [selection, setSelection] = React.useState<LineSelection | null>(null);
+    const [selectionInitialNoteText, setSelectionInitialNoteText] = React.useState("");
+
+    const flushPendingDragSelection = React.useCallback(() => {
+      const anchorIndex = dragAnchorRef.current;
+      const pendingLineIndex = pendingDragLineIndexRef.current;
+      if (anchorIndex === null || pendingLineIndex === null) {
+        return;
+      }
+
+      pendingDragLineIndexRef.current = null;
+      onLineIndexSelect?.(pendingLineIndex, true);
+      setSelection((previousSelection) => {
+        if (
+          previousSelection?.startIndex === anchorIndex &&
+          previousSelection?.endIndex === pendingLineIndex
+        ) {
+          return previousSelection;
+        }
+
+        return { startIndex: anchorIndex, endIndex: pendingLineIndex };
+      });
+    }, [onLineIndexSelect]);
+
+    const scheduleDragSelectionUpdate = React.useCallback(
+      (lineIndex: number) => {
+        pendingDragLineIndexRef.current = lineIndex;
+
+        if (dragUpdateFrameRef.current !== null) {
+          return;
+        }
+
+        dragUpdateFrameRef.current = window.requestAnimationFrame(() => {
+          dragUpdateFrameRef.current = null;
+          flushPendingDragSelection();
+        });
+      },
+      [flushPendingDragSelection]
+    );
 
     React.useEffect(() => {
       const stopDragging = () => {
+        if (dragUpdateFrameRef.current !== null) {
+          cancelAnimationFrame(dragUpdateFrameRef.current);
+          dragUpdateFrameRef.current = null;
+        }
+
+        flushPendingDragSelection();
         setIsDragging(false);
         dragAnchorRef.current = null;
+        pendingDragLineIndexRef.current = null;
       };
 
       window.addEventListener("mouseup", stopDragging);
@@ -999,10 +1076,17 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
         window.removeEventListener("mouseup", stopDragging);
         window.removeEventListener("blur", stopDragging);
       };
+    }, [flushPendingDragSelection]);
+
+    React.useEffect(() => {
+      return () => {
+        if (dragUpdateFrameRef.current !== null) {
+          cancelAnimationFrame(dragUpdateFrameRef.current);
+        }
+      };
     }, []);
+
     const { theme } = useTheme();
-    const [selection, setSelection] = React.useState<LineSelection | null>(null);
-    const [selectionInitialNoteText, setSelectionInitialNoteText] = React.useState("");
 
     const lastExternalSelectionRequestIdRef = React.useRef<number | null>(null);
     const dismissedExternalSelectionRequestIdRef = React.useRef<number | null>(null);
@@ -1207,12 +1291,27 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
         onLineClick?.();
         onLineIndexSelect?.(lineIndex, shiftKey);
 
+        if (dragUpdateFrameRef.current !== null) {
+          cancelAnimationFrame(dragUpdateFrameRef.current);
+          dragUpdateFrameRef.current = null;
+        }
+        pendingDragLineIndexRef.current = null;
+
         const anchor =
           shiftKey && renderSelectionStartIndex !== null ? renderSelectionStartIndex : lineIndex;
         dragAnchorRef.current = anchor;
         setIsDragging(true);
         setSelectionInitialNoteText("");
-        setSelection({ startIndex: anchor, endIndex: lineIndex });
+        setSelection((previousSelection) => {
+          if (
+            previousSelection?.startIndex === anchor &&
+            previousSelection?.endIndex === lineIndex
+          ) {
+            return previousSelection;
+          }
+
+          return { startIndex: anchor, endIndex: lineIndex };
+        });
       },
       [onLineClick, onLineIndexSelect, onReviewNote, renderSelectionStartIndex]
     );
@@ -1223,10 +1322,11 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
           return;
         }
 
-        onLineIndexSelect?.(lineIndex, true);
-        setSelection({ startIndex: dragAnchorRef.current, endIndex: lineIndex });
+        // Dragging can emit dozens of mouseenter events per second; coalesce updates
+        // to one per animation frame so immersive line-range selection stays responsive.
+        scheduleDragSelectionUpdate(lineIndex);
       },
-      [isDragging, onLineIndexSelect]
+      [isDragging, scheduleDragSelectionUpdate]
     );
 
     const handleCommentButtonClick = (lineIndex: number, shiftKey: boolean) => {
