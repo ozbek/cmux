@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
   model VARCHAR,
   total_tokens INTEGER DEFAULT 0,
   context_tokens INTEGER DEFAULT 0,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  reasoning_tokens INTEGER DEFAULT 0,
+  cached_tokens INTEGER DEFAULT 0,
+  cache_create_tokens INTEGER DEFAULT 0,
   report_token_estimate INTEGER DEFAULT 0,
   total_cost_usd DOUBLE DEFAULT 0,
   rolled_up_at_ms BIGINT,
@@ -127,6 +132,14 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
   PRIMARY KEY (parent_workspace_id, child_workspace_id)
 )
 `;
+
+const DELEGATION_ROLLUPS_COLUMN_MIGRATIONS_SQL = [
+  "ALTER TABLE delegation_rollups ADD COLUMN IF NOT EXISTS input_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE delegation_rollups ADD COLUMN IF NOT EXISTS output_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE delegation_rollups ADD COLUMN IF NOT EXISTS reasoning_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE delegation_rollups ADD COLUMN IF NOT EXISTS cached_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE delegation_rollups ADD COLUMN IF NOT EXISTS cache_create_tokens INTEGER DEFAULT 0",
+] as const;
 
 let instance: DuckDBInstance | null = null;
 let conn: DuckDBConnection | null = null;
@@ -149,6 +162,9 @@ async function handleInit(data: InitData): Promise<void> {
   await activeConn.run(CREATE_EVENTS_TABLE_SQL);
   await activeConn.run(CREATE_WATERMARK_TABLE_SQL);
   await activeConn.run(CREATE_DELEGATION_ROLLUPS_TABLE_SQL);
+  for (const migrationSql of DELEGATION_ROLLUPS_COLUMN_MIGRATIONS_SQL) {
+    await activeConn.run(migrationSql);
+  }
 }
 
 async function handleIngest(data: IngestData): Promise<void> {
