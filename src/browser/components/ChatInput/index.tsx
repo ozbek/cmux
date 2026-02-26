@@ -356,6 +356,46 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Attached reviews come from parent via props (persisted in pendingReviews state).
   // draftReviews takes precedence when restoring or editing message drafts.
   const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
+  const draftReviewIdsByValueRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
+  const nextDraftReviewIdRef = useRef(0);
+  const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
+    typeof value === "object" && value !== null;
+  const getDraftReviewId = (review: ReviewNoteDataForDisplay): string => {
+    const existingId = draftReviewIdsByValueRef.current.get(review);
+    if (existingId) return existingId;
+    const newId = `draft-review-${nextDraftReviewIdRef.current++}`;
+    draftReviewIdsByValueRef.current.set(review, newId);
+    return newId;
+  };
+
+  const withDraftReview = (
+    reviewId: string,
+    update: (reviews: ReviewNoteDataForDisplay[], reviewIndex: number) => ReviewNoteDataForDisplay[]
+  ) =>
+    setDraftReviews((prev) => {
+      if (prev === null) return prev;
+      const reviewIndex = prev.findIndex(
+        (review) => isDraftReviewData(review) && getDraftReviewId(review) === reviewId
+      );
+      return reviewIndex === -1 ? prev : update(prev, reviewIndex);
+    });
+
+  const removeDraftReview = (reviewId: string) =>
+    withDraftReview(reviewId, (prev, reviewIndex) =>
+      prev.filter((_, index) => index !== reviewIndex)
+    );
+
+  const updateDraftReviewNote = (reviewId: string, newNote: string) =>
+    withDraftReview(reviewId, (prev, reviewIndex) => {
+      const review = prev[reviewIndex];
+      if (!review || review.userNote === newNote) return prev;
+      const next = [...prev];
+      const updatedReview = { ...review, userNote: newNote };
+      draftReviewIdsByValueRef.current.set(updatedReview, reviewId);
+      next[reviewIndex] = updatedReview;
+      return next;
+    });
+
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
   useEffect(() => {
@@ -861,7 +901,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const hasTypedText = input.trim().length > 0;
   const hasImages = attachments.length > 0;
   const reviewOverrideActive = draftReviews !== null;
-  const draftReviewItems = draftReviews ?? [];
+  const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
   const reviewData = reviewOverrideActive
     ? draftReviewItems.length > 0
       ? draftReviewItems
@@ -871,16 +911,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       : undefined;
   const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map((review) => review.id);
   const reviewPanelItems: Review[] = reviewOverrideActive
-    ? draftReviewItems.map((data, index) => ({
-        id: `draft-review-${index}`,
+    ? draftReviewItems.map((data) => ({
+        id: getDraftReviewId(data),
         data,
         status: "attached",
         createdAt: 0,
       }))
     : attachedReviews;
-  const hasReviews = reviewOverrideActive
-    ? draftReviewItems.length > 0
-    : attachedReviews.length > 0;
+  const hasReviews = reviewData !== undefined;
   // Disable send while Coder presets are loading (user could bypass preset validation)
   const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
   const coderPresetsLoading =
@@ -2387,11 +2425,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           {variant === "workspace" && !hideReviewsDuringSend && (
             <AttachedReviewsPanel
               reviews={reviewPanelItems}
-              onDetachAll={reviewOverrideActive ? undefined : props.onDetachAllReviews}
-              onDetach={reviewOverrideActive ? undefined : props.onDetachReview}
-              onCheck={reviewOverrideActive ? undefined : props.onCheckReview}
-              onDelete={reviewOverrideActive ? undefined : props.onDeleteReview}
-              onUpdateNote={reviewOverrideActive ? undefined : props.onUpdateReviewNote}
+              onDetachAll={
+                reviewOverrideActive
+                  ? () =>
+                      setDraftReviews((prev) => (prev === null || prev.length === 0 ? prev : []))
+                  : props.onDetachAllReviews
+              }
+              onDetach={reviewOverrideActive ? removeDraftReview : props.onDetachReview}
+              onCheck={reviewOverrideActive ? removeDraftReview : props.onCheckReview}
+              onDelete={reviewOverrideActive ? removeDraftReview : props.onDeleteReview}
+              onUpdateNote={reviewOverrideActive ? updateDraftReviewNote : props.onUpdateReviewNote}
             />
           )}
 
