@@ -654,6 +654,8 @@ interface SelectableDiffRendererProps extends Omit<DiffRendererProps, "filePath"
     requestId: number;
     selection: LineSelection;
     initialNoteText?: string;
+    /** Which display line to render the composer after (defaults to selection bottom) */
+    composerAfterIndex?: number;
   } | null;
   /** External request to open an existing inline review note in edit mode */
   externalEditRequest?: {
@@ -1046,6 +1048,10 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
 
     const renderSelection: LineSelection | null =
       pendingExternalSelectionRequest?.selection ?? selection;
+    // Where to render the composer: cursor position if provided, else selection bottom
+    const composerAfterIndex: number | undefined = (
+      pendingExternalSelectionRequest ?? externalSelectionRequest
+    )?.composerAfterIndex;
     const renderNoteText = pendingExternalSelectionRequest
       ? (pendingExternalSelectionRequest.initialNoteText ?? "")
       : selectionInitialNoteText;
@@ -1279,22 +1285,37 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
     const firstLineType = highlightedLineData[0]?.type;
     const lastLineType = highlightedLineData[highlightedLineData.length - 1]?.type;
 
-    // Selection highlights are applied via box-shadow to avoid affecting grid layout.
-    const reviewSelectionHighlight =
-      "inset 0 0 0 100vmax hsl(from var(--color-review-accent) h s l / 0.16)";
-    const rangeSelectionHighlight =
-      "inset 0 0 0 100vmax hsl(from var(--color-review-accent) h s l / 0.12)";
-    const activeLineHighlight = "inset 0 0 0 1px hsl(from var(--color-review-accent) h s l / 0.45)";
+    const cursorLikeOutlineColor = "hsl(from var(--color-review-accent) h s l / 0.45)";
     const normalizedSelectedLineRange = selectedLineRange
       ? {
           startIndex: Math.min(selectedLineRange.startIndex, selectedLineRange.endIndex),
           endIndex: Math.max(selectedLineRange.startIndex, selectedLineRange.endIndex),
         }
       : null;
-    const hasMultiLineExternalSelection = Boolean(
-      normalizedSelectedLineRange &&
-      normalizedSelectedLineRange.endIndex > normalizedSelectedLineRange.startIndex
-    );
+
+    const isCursorHighlightedLine = (index: number): boolean =>
+      index === activeLineIndex ||
+      isLineInSelection(index, renderSelection) ||
+      isLineInSelection(index, normalizedSelectedLineRange);
+
+    const getCursorLikeOutlineStyle = (index: number): React.CSSProperties | undefined => {
+      if (!isCursorHighlightedLine(index)) {
+        return undefined;
+      }
+
+      const hasPrevHighlightedLine = index > 0 && isCursorHighlightedLine(index - 1);
+      const hasNextHighlightedLine =
+        index < highlightedLineData.length - 1 && isCursorHighlightedLine(index + 1);
+
+      const edgeShadows = [
+        `inset 1px 0 0 ${cursorLikeOutlineColor}`,
+        `inset -1px 0 0 ${cursorLikeOutlineColor}`,
+        hasPrevHighlightedLine ? null : `inset 0 1px 0 ${cursorLikeOutlineColor}`,
+        hasNextHighlightedLine ? null : `inset 0 -1px 0 ${cursorLikeOutlineColor}`,
+      ].filter((shadow): shadow is string => Boolean(shadow));
+
+      return { boxShadow: edgeShadows.join(", ") };
+    };
 
     return (
       <DiffContainer
@@ -1307,11 +1328,7 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
         {highlightedLineData.map((lineInfo, displayIndex) => {
           const isComposerSelected = isLineInSelection(displayIndex, renderSelection);
           const isRangeSelected = isLineInSelection(displayIndex, normalizedSelectedLineRange);
-          const isActiveLine = activeLineIndex === displayIndex;
-          // When a multi-line selection is active (e.g. immersive J/K full-hunk selection),
-          // let the range highlight own the visual state so the cursor doesn't appear detached.
-          const shouldRenderActiveLineHighlight =
-            isActiveLine && !(hasMultiLineExternalSelection && isRangeSelected);
+          const lineOutlineStyle = getCursorLikeOutlineStyle(displayIndex);
           const isInReviewRange = reviewRangeByLineIndex[displayIndex] ?? false;
           const baseCodeBg = getDiffLineBackground(lineInfo.type);
           const codeBg = applyReviewRangeOverlay(baseCodeBg, isInReviewRange);
@@ -1320,16 +1337,6 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
             isInReviewRange
           );
           const anchoredReviews = inlineReviewsByAnchor.get(displayIndex);
-
-          const lineShadows: string[] = [];
-          if (isComposerSelected) {
-            lineShadows.push(reviewSelectionHighlight);
-          } else if (isRangeSelected) {
-            lineShadows.push(rangeSelectionHighlight);
-          }
-          if (shouldRenderActiveLineHighlight) {
-            lineShadows.push(activeLineHighlight);
-          }
 
           // Each line renders as 3 CSS Grid cells: gutter | indicator | code
           // Use display:contents wrapper for selection state + group hover behavior
@@ -1341,6 +1348,7 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
                   "group relative col-span-3 grid grid-cols-subgrid",
                   onLineIndexSelect ? "cursor-pointer" : "cursor-text"
                 )}
+                style={lineOutlineStyle}
                 data-line-index={displayIndex}
                 data-selected={isComposerSelected || isRangeSelected ? "true" : "false"}
                 onClick={(e) => {
@@ -1407,16 +1415,15 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
                   style={{
                     background: codeBg,
                     color: getLineContentColor(lineInfo.type),
-                    boxShadow: lineShadows.length > 0 ? lineShadows.join(", ") : undefined,
                   }}
                   dangerouslySetInnerHTML={{ __html: lineInfo.html }}
                 />
               </div>
 
-              {/* Show textarea after the last selected line */}
+              {/* Show textarea after the current cursor line (selection end). */}
               {isComposerSelected &&
                 renderSelection &&
-                displayIndex === Math.max(renderSelection.startIndex, renderSelection.endIndex) && (
+                displayIndex === (composerAfterIndex ?? renderSelection.endIndex) && (
                   <ReviewNoteInput
                     selection={renderSelection}
                     lineData={lineData}
