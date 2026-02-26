@@ -97,7 +97,8 @@ export class ProviderService {
         apiKey?: string;
         baseUrl?: string;
         models?: unknown[];
-        serviceTier?: unknown;
+        serviceTier?: string;
+        wireFormat?: string;
         cacheTtl?: unknown;
         /** OpenAI-only: default auth precedence for Codex-OAuth-allowed models. */
         codexOauthDefaultAuth?: unknown;
@@ -152,6 +153,15 @@ export class ProviderService {
           serviceTier === "priority")
       ) {
         providerInfo.serviceTier = serviceTier;
+      }
+
+      // OpenAI-specific: wire format (responses vs chatCompletions)
+      const wireFormat = config.wireFormat;
+      if (
+        provider === "openai" &&
+        (wireFormat === "responses" || wireFormat === "chatCompletions")
+      ) {
+        providerInfo.wireFormat = wireFormat;
       }
 
       // Anthropic-specific fields

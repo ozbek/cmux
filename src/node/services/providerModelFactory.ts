@@ -689,6 +689,20 @@ export class ProviderModelFactory {
           return Err({ type: "api_key_not_found", provider: providerName });
         }
 
+        // chatCompletions mode requires a real API key — Codex OAuth only supports
+        // the Responses API endpoint. Block early with a clear error instead of
+        // sending requests with the "codex-oauth" placeholder key.
+        const earlyWireFormat =
+          (providerConfig.wireFormat as string | undefined) ??
+          muxProviderOptions?.openai?.wireFormat;
+        if (
+          shouldRouteThroughCodexOauth &&
+          earlyWireFormat === "chatCompletions" &&
+          !creds.isConfigured
+        ) {
+          return Err({ type: "api_key_not_found", provider: providerName });
+        }
+
         // Merge resolved credentials into config
         const configWithCreds = {
           ...providerConfig,
@@ -699,14 +713,30 @@ export class ProviderModelFactory {
           ...(creds.organization && { organization: creds.organization }),
         };
 
-        // Extract serviceTier from config to pass through to buildProviderOptions
+        // Extract serviceTier and wireFormat from config to pass through to buildProviderOptions.
+        // Initialize muxProviderOptions if absent so config values aren't silently dropped
+        // when call sites omit options (e.g. TaskService, WorkspaceTitleGenerator).
         const configServiceTier = providerConfig.serviceTier as string | undefined;
-        if (configServiceTier && muxProviderOptions) {
-          muxProviderOptions.openai = {
-            ...muxProviderOptions.openai,
-            serviceTier: configServiceTier as "auto" | "default" | "flex" | "priority",
-          };
+        const configWireFormat = providerConfig.wireFormat as string | undefined;
+        if (configServiceTier || configWireFormat) {
+          muxProviderOptions ??= {};
+          if (configServiceTier) {
+            muxProviderOptions.openai = {
+              ...muxProviderOptions.openai,
+              serviceTier: configServiceTier as "auto" | "default" | "flex" | "priority",
+            };
+          }
+          if (configWireFormat === "responses" || configWireFormat === "chatCompletions") {
+            muxProviderOptions.openai = {
+              ...muxProviderOptions.openai,
+              wireFormat: configWireFormat,
+            };
+          }
         }
+
+        // Resolve effective wireFormat once — used by both fetch wrapper and model selection.
+        // Includes request-level overrides from muxProviderOptions, not just config.
+        const effectiveWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
 
         const baseFetch = getProviderFetch(providerConfig);
         const codexOauthService = this.codexOauthService;
@@ -859,7 +889,11 @@ export class ProviderModelFactory {
                 }
               }
 
-              if (shouldRouteThroughCodexOauth && (isOpenAIResponses || isOpenAIChatCompletions)) {
+              if (
+                shouldRouteThroughCodexOauth &&
+                effectiveWireFormat !== "chatCompletions" &&
+                (isOpenAIResponses || isOpenAIChatCompletions)
+              ) {
                 if (!codexOauthService) {
                   throw new Error("Codex OAuth service not initialized");
                 }
@@ -904,10 +938,14 @@ export class ProviderModelFactory {
           // The preconnect method is optional in our implementation but required by the SDK type.
           fetch: fetchWithOpenAITruncation as typeof fetch,
         });
-        // Use Responses API for persistence and built-in tools
         // OpenAI manages reasoning state via previousResponseId - no middleware needed
-        const model = provider.responses(modelId);
-        if (shouldRouteThroughCodexOauth) {
+        const model =
+          effectiveWireFormat === "chatCompletions"
+            ? provider.chat(modelId)
+            : provider.responses(modelId);
+        // Skip Codex OAuth routing for chatCompletions — the Codex endpoint
+        // only accepts Responses API format, so chat-completions requests would fail.
+        if (shouldRouteThroughCodexOauth && effectiveWireFormat !== "chatCompletions") {
           markModelCostsIncluded(model);
 
           // Wrap model to inject store=false into providerOptions so the SDK
