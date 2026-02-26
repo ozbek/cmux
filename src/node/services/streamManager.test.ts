@@ -8,6 +8,7 @@ import { APICallError, RetryError, type ModelMessage } from "ai";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { countTokens } from "@/node/utils/main/tokenizer";
 import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -932,6 +933,12 @@ describe("StreamManager - TTFT metadata persistence", () => {
     historySequence: number;
     startTime: number;
     parts: unknown[];
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      reasoningTokens?: number;
+    };
   }) {
     const streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
@@ -966,14 +973,16 @@ describe("StreamManager - TTFT metadata persistence", () => {
     ) => Promise<void>;
     expect(typeof processStreamWithCleanup).toBe("function");
 
+    const usage = params.usage ?? { inputTokens: 4, outputTokens: 6, totalTokens: 10 };
+
     const streamInfo = {
       state: "streaming",
       streamResult: {
         fullStream: (async function* () {
           // No-op stream: tests verify stream-end finalization behavior from pre-populated parts.
         })(),
-        totalUsage: Promise.resolve({ inputTokens: 4, outputTokens: 6, totalTokens: 10 }),
-        usage: Promise.resolve({ inputTokens: 4, outputTokens: 6, totalTokens: 10 }),
+        totalUsage: Promise.resolve(usage),
+        usage: Promise.resolve(usage),
         providerMetadata: Promise.resolve(undefined),
         steps: Promise.resolve([]),
       },
@@ -1065,6 +1074,89 @@ describe("StreamManager - TTFT metadata persistence", () => {
     expect(Object.prototype.hasOwnProperty.call(updatedMessage.metadata ?? {}, "ttftMs")).toBe(
       false
     );
+  });
+
+  describe("StreamManager - reasoning token backfill", () => {
+    test("backfills reasoningTokens from concatenated reasoning text when provider reports undefined", async () => {
+      const startTime = Date.now() - 1000;
+      const reasoningSegments = ["Thinking through ", "tradeoffs"];
+      const expectedReasoningTokens = await countTokens(
+        KNOWN_MODELS.SONNET.id,
+        reasoningSegments.join("")
+      );
+
+      const updatedMessage = await finalizeStreamAndReadMessage({
+        workspaceId: "reasoning-backfill-workspace",
+        messageId: "reasoning-backfill-message",
+        historySequence: 1,
+        startTime,
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        parts: [
+          {
+            type: "reasoning",
+            text: reasoningSegments[0],
+            timestamp: startTime + 100,
+          },
+          {
+            type: "reasoning",
+            text: reasoningSegments[1],
+            timestamp: startTime + 150,
+          },
+          {
+            type: "text",
+            text: "Final answer",
+            timestamp: startTime + 200,
+          },
+        ],
+      });
+
+      expect(updatedMessage.metadata?.usage?.reasoningTokens).toBe(expectedReasoningTokens);
+    });
+
+    test("preserves provider-reported reasoningTokens when present", async () => {
+      const startTime = Date.now() - 1000;
+      const updatedMessage = await finalizeStreamAndReadMessage({
+        workspaceId: "reasoning-provider-workspace",
+        messageId: "reasoning-provider-message",
+        historySequence: 1,
+        startTime,
+        usage: { inputTokens: 100, outputTokens: 250, totalTokens: 350, reasoningTokens: 200 },
+        parts: [
+          {
+            type: "reasoning",
+            text: "Model-supplied chain of thought",
+            timestamp: startTime + 150,
+          },
+          {
+            type: "text",
+            text: "Summarized response",
+            timestamp: startTime + 300,
+          },
+        ],
+      });
+
+      expect(updatedMessage.metadata?.usage?.reasoningTokens).toBe(200);
+    });
+
+    test("does not inject reasoningTokens when no reasoning deltas occurred", async () => {
+      const startTime = Date.now() - 1000;
+      const updatedMessage = await finalizeStreamAndReadMessage({
+        workspaceId: "reasoning-none-workspace",
+        messageId: "reasoning-none-message",
+        historySequence: 1,
+        startTime,
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        parts: [
+          {
+            type: "text",
+            text: "Only final response",
+            timestamp: startTime + 200,
+          },
+        ],
+      });
+
+      expect(updatedMessage.metadata?.usage?.reasoningTokens).toBeUndefined();
+    });
   });
 });
 

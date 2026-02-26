@@ -42,6 +42,7 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
+import { countTokens } from "@/node/utils/main/tokenizer";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
@@ -679,6 +680,35 @@ export class StreamManager extends EventEmitter {
     return totalUsage;
   }
 
+  private async backfillReasoningTokensFromParts(
+    streamInfo: Pick<WorkspaceStreamInfo, "parts" | "metadataModel" | "model">,
+    usage: LanguageModelV2Usage | undefined
+  ): Promise<void> {
+    // Backfill reasoningTokens from the full reasoning text when the provider
+    // doesn't report them. @ai-sdk/anthropic sets reasoning: undefined even for
+    // extended-thinking models. Tokenizing concatenated text (not per-delta
+    // sums) avoids BPE chunk-boundary inflation.
+    if (!usage || usage.reasoningTokens) {
+      return;
+    }
+
+    const reasoningText = streamInfo.parts
+      .filter(
+        (part): part is Extract<CompletedMessagePart, { type: "reasoning" }> =>
+          part.type === "reasoning"
+      )
+      .map((part) => part.text)
+      .join("");
+    if (!reasoningText) {
+      return;
+    }
+
+    usage.reasoningTokens = await countTokens(
+      streamInfo.metadataModel ?? streamInfo.model,
+      reasoningText
+    );
+  }
+
   private resolveTtftMsForStreamEnd(streamInfo: WorkspaceStreamInfo): number | undefined {
     const firstTokenPart = streamInfo.parts.find(
       (
@@ -947,6 +977,7 @@ export class StreamManager extends EventEmitter {
     const duration = Date.now() - streamInfo.startTime;
     const hasCumulativeUsage = (streamInfo.cumulativeUsage.totalTokens ?? 0) > 0;
     const usage = hasCumulativeUsage ? streamInfo.cumulativeUsage : undefined;
+    await this.backfillReasoningTokensFromParts(streamInfo, usage);
 
     // For context window display, use last step's usage (inputTokens = current context size)
     const contextUsage = streamInfo.lastStepUsage;
@@ -1952,6 +1983,7 @@ export class StreamManager extends EventEmitter {
               streamInfo,
               streamMeta.totalUsage
             );
+            await this.backfillReasoningTokensFromParts(streamInfo, totalUsage);
             const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
             const contextProviderMetadata =
               streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
