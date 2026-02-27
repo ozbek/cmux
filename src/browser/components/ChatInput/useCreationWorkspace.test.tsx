@@ -1,6 +1,6 @@
 import type { APIClient } from "@/browser/contexts/API";
-import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
+import type { ProjectConfig } from "@/common/types/project";
 import {
   GLOBAL_SCOPE_ID,
   getAgentIdKey,
@@ -146,10 +146,46 @@ void mock.module("@/browser/contexts/API", () => ({
   },
 }));
 
+// Synchronous mock for useProjectContext — eliminates the async race from
+// ProjectProvider's useEffect → refreshProjects() that caused CI-only hangs.
+// Tests that need untrusted projects set mockProjectConfigMap directly.
+let mockProjectConfigMap = new Map<string, ProjectConfig>();
+
+void mock.module("@/browser/contexts/ProjectContext", () => ({
+  useProjectContext: () => ({
+    loading: false,
+    getProjectConfig: (path: string) => mockProjectConfigMap.get(path),
+    refreshProjects: mock(() => Promise.resolve()),
+    userProjects: mockProjectConfigMap,
+    hasAnyProject: mockProjectConfigMap.size > 0,
+    systemProjectPath: null,
+    resolveProjectPath: () => null,
+    addProject: noop,
+    removeProject: mock(() => Promise.resolve({ success: true })),
+    isProjectCreateModalOpen: false,
+    openProjectCreateModal: noop,
+    closeProjectCreateModal: noop,
+    workspaceModalState: { isOpen: false },
+    openWorkspaceModal: mock(() => Promise.resolve()),
+    closeWorkspaceModal: noop,
+    getBranchesForProject: mock(() => Promise.resolve({ branches: [], recommendedTrunk: null })),
+    getSecrets: mock(() => Promise.resolve([])),
+    updateSecrets: mock(() => Promise.resolve()),
+    createSection: mock(() => Promise.resolve({ success: true })),
+    updateSection: mock(() => Promise.resolve({ success: true })),
+    removeSection: mock(() => Promise.resolve({ success: true })),
+    reorderSections: mock(() => Promise.resolve({ success: true })),
+    assignWorkspaceToSection: mock(() => Promise.resolve({ success: true })),
+    resolveNewChatProjectPath: () => null,
+  }),
+  ProjectProvider: (props: Record<string, unknown>) => props.children,
+}));
+
 const TEST_PROJECT_PATH = "/projects/demo";
 const FALLBACK_BRANCH = "main";
 const TEST_WORKSPACE_ID = "ws-created";
 type BranchListResult = Awaited<ReturnType<APIClient["projects"]["listBranches"]>>;
+type ProjectListResult = Awaited<ReturnType<APIClient["projects"]["list"]>>;
 type ListBranchesArgs = Parameters<APIClient["projects"]["listBranches"]>[0];
 type WorkspaceSendMessageArgs = Parameters<APIClient["workspace"]["sendMessage"]>[0];
 type WorkspaceSendMessageResult = Awaited<ReturnType<APIClient["workspace"]["sendMessage"]>>;
@@ -165,7 +201,7 @@ type NameGenerationArgs = Parameters<APIClient["nameGeneration"]["generate"]>[0]
 type NameGenerationResult = Awaited<ReturnType<APIClient["nameGeneration"]["generate"]>>;
 type MockOrpcProjectsClient = Pick<
   APIClient["projects"],
-  "list" | "listBranches" | "runtimeAvailability"
+  "list" | "listBranches" | "runtimeAvailability" | "setTrust"
 >;
 type MockOrpcWorkspaceClient = Pick<
   APIClient["workspace"],
@@ -193,6 +229,7 @@ interface MockOrpcClient {
   nameGeneration: MockOrpcNameGenerationClient;
 }
 interface SetupWindowOptions {
+  listProjects?: ReturnType<typeof mock<() => Promise<ProjectListResult>>>;
   listBranches?: ReturnType<typeof mock<(args: ListBranchesArgs) => Promise<BranchListResult>>>;
   sendMessage?: ReturnType<
     typeof mock<(args: WorkspaceSendMessageArgs) => Promise<WorkspaceSendMessageResult>>
@@ -209,12 +246,29 @@ interface SetupWindowOptions {
 }
 
 const setupWindow = ({
+  listProjects,
   listBranches,
   sendMessage,
   create,
   updateAgentAISettings,
   nameGeneration,
 }: SetupWindowOptions = {}) => {
+  // Sync the useProjectContext mock with the default trusted config.
+  // Tests that need untrusted projects override mockProjectConfigMap directly.
+  if (!listProjects && mockProjectConfigMap.get(TEST_PROJECT_PATH)?.trusted !== false) {
+    mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
+  }
+
+  const listProjectsMock =
+    listProjects ??
+    mock<() => Promise<ProjectListResult>>(() => {
+      const trustedProjectConfig: ProjectConfig = {
+        workspaces: [],
+        trusted: true,
+      };
+      return Promise.resolve([[TEST_PROJECT_PATH, trustedProjectConfig]]);
+    });
+
   const listBranchesMock =
     listBranches ??
     mock<(args: ListBranchesArgs) => Promise<BranchListResult>>(({ projectPath }) => {
@@ -271,7 +325,7 @@ const setupWindow = ({
 
   currentORPCClient = {
     projects: {
-      list: () => Promise.resolve([]),
+      list: () => listProjectsMock(),
       listBranches: (input: ListBranchesArgs) => listBranchesMock(input),
       runtimeAvailability: () =>
         Promise.resolve({
@@ -281,6 +335,7 @@ const setupWindow = ({
           docker: { available: true },
           devcontainer: { available: false, reason: "No devcontainer.json found" },
         }),
+      setTrust: mock(() => Promise.resolve()),
     },
     workspace: {
       sendMessage: (input: WorkspaceSendMessageArgs) => sendMessageMock(input),
@@ -409,6 +464,7 @@ const TEST_METADATA: FrontendWorkspaceMetadata = {
 
 describe("useCreationWorkspace", () => {
   beforeEach(() => {
+    mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
     persistedPreferences = {};
     readPersistedStateCalls.length = 0;
     updatePersistedStateCalls.length = 0;
@@ -581,6 +637,58 @@ describe("useCreationWorkspace", () => {
     // Thinking is workspace-scoped, but this test doesn't set a project-scoped thinking preference.
     expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
     expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+  });
+
+  test("handleSend shows trust dialog for untrusted projects", async () => {
+    mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: false }]]);
+    const nameGenerationMock = mock(
+      (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+        Promise.resolve({
+          success: true,
+          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+        } as NameGenerationResult)
+    );
+    const { workspaceApi, nameGenerationApi } = setupWindow({
+      nameGeneration: nameGenerationMock,
+    });
+
+    draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
+    const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "trust check",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
+
+    let handleSendPromise: Promise<CreationSendResult> | null = null;
+    act(() => {
+      handleSendPromise = getHook().handleSend("trust check");
+    });
+
+    await waitFor(() => expect(getHook().trustDialog).not.toBeNull());
+    expect(workspaceApi.create.mock.calls.length).toBe(0);
+
+    const trustDialog = getHook().trustDialog;
+    if (!trustDialog || typeof trustDialog !== "object" || !("props" in trustDialog)) {
+      throw new Error("Expected trust dialog props");
+    }
+
+    const trustDialogProps = trustDialog.props as {
+      onCancel: () => void;
+    };
+
+    act(() => {
+      trustDialogProps.onCancel();
+    });
+
+    // handleSendPromise is assigned inside act() which TypeScript's control flow cannot track
+    const handleSendResult = await (handleSendPromise as unknown as Promise<CreationSendResult>);
+    expect(handleSendResult).toEqual({ success: false });
+    expect(workspaceApi.create.mock.calls.length).toBe(0);
   });
 
   test("syncs global default agent to workspace when project agent is unset", async () => {
@@ -962,11 +1070,7 @@ function renderUseCreationWorkspace(options: HookOptions) {
     return null;
   }
 
-  render(
-    <ProjectProvider>
-      <Harness {...options} />
-    </ProjectProvider>
-  );
+  render(<Harness {...options} />);
 
   return () => {
     if (!resultRef.current) {

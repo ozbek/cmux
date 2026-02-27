@@ -32,6 +32,17 @@ void mock.module("./ConfiguredProvidersBar", () => ({
   ConfiguredProvidersBar: () => <div data-testid="ConfiguredProvidersBarMock" />,
 }));
 
+// Mock ProjectContext to provide trust data without requiring a full provider.
+// Must include all fields consumed by downstream hooks (e.g., useDraftWorkspaceSettings
+// reads userProjects) since bun test may share mock scope across files.
+void mock.module("@/browser/contexts/ProjectContext", () => ({
+  useProjectContext: () => ({
+    userProjects: new Map(),
+    getProjectConfig: () => undefined,
+    refreshProjects: () => Promise.resolve(),
+  }),
+}));
+
 // Mock ChatInput to simulate the old (buggy) behavior where onReady can fire again
 // on unrelated re-renders (e.g. workspace list updates).
 void mock.module("./ChatInput/index", () => ({
