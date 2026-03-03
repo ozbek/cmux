@@ -807,6 +807,7 @@ export class Config {
                   : undefined),
               parentWorkspaceId: workspace.parentWorkspaceId,
               agentType: workspace.agentType,
+              agentId: workspace.agentId,
               taskStatus: workspace.taskStatus,
               reportedAt: workspace.reportedAt,
               taskModelString: workspace.taskModelString,
@@ -893,6 +894,7 @@ export class Config {
             // Preserve tree/task metadata when present in config (metadata.json won't have it)
             metadata.parentWorkspaceId ??= workspace.parentWorkspaceId;
             metadata.agentType ??= workspace.agentType;
+            metadata.agentId ??= workspace.agentId;
             metadata.taskStatus ??= workspace.taskStatus;
             metadata.reportedAt ??= workspace.reportedAt;
             metadata.taskModelString ??= workspace.taskModelString;
@@ -904,6 +906,7 @@ export class Config {
             metadata.unarchivedAt ??= workspace.unarchivedAt;
             // Preserve section assignment from config
             metadata.sectionId ??= workspace.sectionId;
+
             if (!workspace.aiSettingsByAgent && metadata.aiSettingsByAgent) {
               workspace.aiSettingsByAgent = metadata.aiSettingsByAgent;
               configModified = true;
@@ -943,6 +946,7 @@ export class Config {
                   : undefined),
               parentWorkspaceId: workspace.parentWorkspaceId,
               agentType: workspace.agentType,
+              agentId: workspace.agentId,
               taskStatus: workspace.taskStatus,
               reportedAt: workspace.reportedAt,
               taskModelString: workspace.taskModelString,
@@ -987,6 +991,7 @@ export class Config {
                 : undefined),
             parentWorkspaceId: workspace.parentWorkspaceId,
             agentType: workspace.agentType,
+            agentId: workspace.agentId,
             taskStatus: workspace.taskStatus,
             reportedAt: workspace.reportedAt,
             taskModelString: workspace.taskModelString,
@@ -995,6 +1000,7 @@ export class Config {
             taskTrunkBranch: workspace.taskTrunkBranch,
             sectionId: workspace.sectionId,
           };
+
           workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path, projectPath));
         }
       }
