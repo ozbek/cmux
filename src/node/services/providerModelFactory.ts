@@ -421,6 +421,28 @@ export function parseModelString(modelString: string): [string, string] {
   return [providerName, modelId];
 }
 
+/**
+ * Classify a Copilot API request as "user" or "agent" initiated by inspecting
+ * the last message role in the request body. GitHub Copilot bills premium
+ * requests only for "user"-initiated calls.
+ *
+ * Heuristic: if the last message in the messages array has role "user",
+ * this is a user-initiated turn. Everything else (tool results, assistant
+ * continuations) is agent-initiated.
+ */
+export function classifyCopilotInitiator(body: string | null | undefined): "user" | "agent" {
+  try {
+    if (typeof body !== "string") return "user"; // can't parse → safe default
+    const parsed = JSON.parse(body) as { messages?: unknown[] };
+    const messages = parsed.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return "user";
+    const last = messages[messages.length - 1] as { role?: string } | undefined;
+    return last?.role === "user" ? "user" : "agent";
+  } catch {
+    return "user"; // parse failure → safe fallback (don't hide usage)
+  }
+}
+
 function parseAnthropicCacheTtl(value: unknown): AnthropicCacheTtl | undefined {
   if (value === "5m" || value === "1h") {
     return value;
@@ -1349,6 +1371,28 @@ export class ProviderModelFactory {
           const headers = new Headers(init?.headers);
           headers.set("Authorization", `Bearer ${creds.apiKey ?? ""}`);
           headers.set("Openai-Intent", "conversation-edits");
+
+          // Resolve request body text for billing classification.
+          // Standard AI SDK path: init.body is a JSON string.
+          // Request object path: clone + read body text so the original stream
+          // remains intact for the real network request.
+          let bodyText: string | undefined;
+          if (typeof init?.body === "string") {
+            bodyText = init.body;
+          } else if (input instanceof Request) {
+            try {
+              bodyText = await input.clone().text();
+            } catch {
+              // Fall back to undefined so classifyCopilotInitiator defaults to "user".
+            }
+          }
+
+          // GitHub Copilot uses X-Initiator to determine premium request billing.
+          // "user" = consumes a premium request; "agent" = free (tool/agent work).
+          // We inspect the last message role: only a genuine user message at the
+          // end of the messages array indicates a user-initiated turn. Tool results
+          // (role "tool") and assistant continuations are agent-initiated.
+          headers.set("X-Initiator", classifyCopilotInitiator(bodyText));
           headers.delete("x-api-key");
           return baseFetch(input, { ...init, headers });
         };
