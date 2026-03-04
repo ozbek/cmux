@@ -228,14 +228,14 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
   };
 }
 
-const ON_CHAT_RETRY_BASE_MS = 250;
-const ON_CHAT_RETRY_MAX_MS = 5000;
+const SUBSCRIPTION_RETRY_BASE_MS = 250;
+const SUBSCRIPTION_RETRY_MAX_MS = 5000;
 
 // Stall detection: server sends heartbeats every 5s, so if we don't receive any events
 // (including heartbeats) for 10s, the connection is likely dead. This handles half-open
 // WebSocket paths (e.g., some WSL localhost forwarding setups).
-const ON_CHAT_STALL_TIMEOUT_MS = 10_000;
-const ON_CHAT_STALL_CHECK_INTERVAL_MS = 2_000;
+const SUBSCRIPTION_STALL_TIMEOUT_MS = 10_000;
+const SUBSCRIPTION_STALL_CHECK_INTERVAL_MS = 2_000;
 
 interface ValidationIssue {
   path?: Array<string | number>;
@@ -306,8 +306,8 @@ function areAgentStatusesEqual(
   return a.emoji === b.emoji && a.message === b.message && (a.url ?? null) === (b.url ?? null);
 }
 
-function calculateOnChatBackoffMs(attempt: number): number {
-  return Math.min(ON_CHAT_RETRY_BASE_MS * 2 ** attempt, ON_CHAT_RETRY_MAX_MS);
+function calculateSubscriptionBackoffMs(attempt: number): number {
+  return Math.min(SUBSCRIPTION_RETRY_BASE_MS * 2 ** attempt, SUBSCRIPTION_RETRY_MAX_MS);
 }
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
@@ -2520,6 +2520,54 @@ export class WorkspaceStore {
     }
   }
 
+  /**
+   * Creates a stall watchdog that aborts the attempt when no events arrive
+   * within the configured timeout. Call start() only after the subscription
+   * connection is established so handshake latency isn't misclassified as
+   * stream silence.
+   */
+  private createStallWatchdog(
+    attemptController: AbortController,
+    label: string
+  ): { markEvent: () => void; start: () => void; stop: () => void } {
+    let lastEventAt = Date.now();
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    return {
+      markEvent: () => {
+        lastEventAt = Date.now();
+      },
+      start: () => {
+        if (interval != null) {
+          return;
+        }
+
+        lastEventAt = Date.now();
+        interval = setInterval(() => {
+          if (attemptController.signal.aborted) {
+            return;
+          }
+
+          const elapsedMs = Date.now() - lastEventAt;
+          if (elapsedMs < SUBSCRIPTION_STALL_TIMEOUT_MS) {
+            return;
+          }
+
+          console.warn(
+            `[WorkspaceStore] ${label} stalled (no events for ${elapsedMs}ms); retrying...`
+          );
+          attemptController.abort();
+        }, SUBSCRIPTION_STALL_CHECK_INTERVAL_MS);
+      },
+      stop: () => {
+        if (interval != null) {
+          clearInterval(interval);
+          interval = null;
+        }
+      },
+    };
+  }
+
   private async runTerminalActivitySubscription(controller: AbortController): Promise<void> {
     const signal = controller.signal;
     let attempt = 0;
@@ -2547,18 +2595,33 @@ export class WorkspaceStore {
         const onClientChange = () => attemptController.abort();
         clientChangeSignal.addEventListener("abort", onClientChange, { once: true });
 
+        const watchdog = this.createStallWatchdog(
+          attemptController,
+          "terminal activity subscription"
+        );
+
         try {
           const iterator = await subscribe(undefined, {
             signal: attemptController.signal,
           });
+
+          // Start watchdog after subscribe connects so timeout measures
+          // post-connect silence, not handshake latency.
+          watchdog.start();
 
           for await (const event of iterator) {
             if (signal.aborted) {
               return;
             }
 
+            watchdog.markEvent();
+
             // Connection is alive again - don't carry old backoff into the next failure.
             attempt = 0;
+
+            if (event.type === "heartbeat") {
+              continue;
+            }
 
             queueMicrotask(() => {
               if (signal.aborted || attemptController.signal.aborted) {
@@ -2611,10 +2674,11 @@ export class WorkspaceStore {
         } finally {
           signal.removeEventListener("abort", onAbort);
           clientChangeSignal.removeEventListener("abort", onClientChange);
+          watchdog.stop();
         }
 
         if (!signal.aborted && !attemptController.signal.aborted) {
-          const delayMs = calculateOnChatBackoffMs(attempt);
+          const delayMs = calculateSubscriptionBackoffMs(attempt);
           attempt++;
 
           await this.sleepWithAbort(delayMs, signal);
@@ -2642,6 +2706,8 @@ export class WorkspaceStore {
       const onClientChange = () => attemptController.abort();
       clientChangeSignal.addEventListener("abort", onClientChange, { once: true });
 
+      const watchdog = this.createStallWatchdog(attemptController, "activity subscription");
+
       try {
         // Open the live delta stream first so no state transition can be lost
         // between the list snapshot fetch and subscribe registration.
@@ -2667,13 +2733,23 @@ export class WorkspaceStore {
           this.applyWorkspaceActivityList(snapshots);
         });
 
+        // Start watchdog after bootstrap so slow list() doesn't trigger
+        // false-positive reconnects.
+        watchdog.start();
+
         for await (const event of iterator) {
           if (signal.aborted) {
             return;
           }
 
+          watchdog.markEvent();
+
           // Connection is alive again - don't carry old backoff into the next failure.
           attempt = 0;
+
+          if (event.type === "heartbeat") {
+            continue;
+          }
 
           queueMicrotask(() => {
             if (signal.aborted || attemptController.signal.aborted) {
@@ -2706,9 +2782,10 @@ export class WorkspaceStore {
       } finally {
         signal.removeEventListener("abort", onAbort);
         clientChangeSignal.removeEventListener("abort", onClientChange);
+        watchdog.stop();
       }
 
-      const delayMs = calculateOnChatBackoffMs(attempt);
+      const delayMs = calculateSubscriptionBackoffMs(attempt);
       attempt++;
 
       await this.sleepWithAbort(delayMs, signal);
@@ -2740,7 +2817,7 @@ export class WorkspaceStore {
         const timeout = setTimeout(() => {
           cleanup();
           resolve();
-        }, ON_CHAT_RETRY_BASE_MS);
+        }, SUBSCRIPTION_RETRY_BASE_MS);
 
         const cleanup = () => {
           clearTimeout(timeout);
@@ -2978,13 +3055,13 @@ export class WorkspaceStore {
           if (attemptController.signal.aborted) return;
 
           const elapsedMs = Date.now() - lastChatEventAt;
-          if (elapsedMs < ON_CHAT_STALL_TIMEOUT_MS) return;
+          if (elapsedMs < SUBSCRIPTION_STALL_TIMEOUT_MS) return;
 
           console.warn(
             `[WorkspaceStore] onChat appears stalled for ${workspaceId} (no events for ${elapsedMs}ms); retrying...`
           );
           attemptController.abort();
-        }, ON_CHAT_STALL_CHECK_INTERVAL_MS);
+        }, SUBSCRIPTION_STALL_CHECK_INTERVAL_MS);
 
         for await (const data of iterator) {
           if (signal.aborted) {
@@ -3095,7 +3172,7 @@ export class WorkspaceStore {
         });
       }
 
-      const delayMs = calculateOnChatBackoffMs(attempt);
+      const delayMs = calculateSubscriptionBackoffMs(attempt);
       attempt++;
 
       await this.sleepWithAbort(delayMs, signal);

@@ -19,6 +19,7 @@ import {
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
+  HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
   StreamEndEventSchema,
@@ -1153,10 +1154,14 @@ export const workspace = {
     subscribe: {
       input: z.void(),
       output: eventIterator(
-        z.object({
-          workspaceId: z.string(),
-          activity: WorkspaceActivitySnapshotSchema.nullable(),
-        })
+        z.discriminatedUnion("type", [
+          z.object({
+            type: z.literal("activity"),
+            workspaceId: z.string(),
+            activity: WorkspaceActivitySnapshotSchema.nullable(),
+          }),
+          HeartbeatEventSchema,
+        ])
       ),
     },
   },
@@ -1491,6 +1496,7 @@ export const terminal = {
               totalSessions: z.number(),
             }),
           }),
+          HeartbeatEventSchema,
         ])
       ),
     },
