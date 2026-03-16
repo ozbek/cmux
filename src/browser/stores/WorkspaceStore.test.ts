@@ -11,7 +11,7 @@ import {
 } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
 import { WorkspaceStore } from "./WorkspaceStore";
-import type { ResponseCompleteMetadata } from "@/browser/utils/messages/responseCompletionMetadata";
+import type { ResponseCompleteEvent } from "@/browser/utils/messages/responseCompletionMetadata";
 
 interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
@@ -290,6 +290,26 @@ describe("WorkspaceStore", () => {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
     store.setClient(mockClient as any);
   });
+
+  const createResponseCompleteSpy = () => mock((_event: ResponseCompleteEvent) => undefined);
+
+  const recreateStore = (onResponseComplete?: ReturnType<typeof createResponseCompleteSpy>) => {
+    store.dispose();
+    store = new WorkspaceStore(mockOnModelUsed);
+    if (onResponseComplete) {
+      store.setOnResponseComplete(onResponseComplete);
+    }
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    store.setClient(mockClient as any);
+  };
+
+  const expectResponseComplete = (
+    onResponseComplete: ReturnType<typeof createResponseCompleteSpy>,
+    event: Record<string, unknown>
+  ) => {
+    expect(onResponseComplete).toHaveBeenCalledTimes(1);
+    expect(onResponseComplete).toHaveBeenCalledWith(event);
+  };
 
   afterEach(() => {
     store.dispose();
@@ -1836,23 +1856,10 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
       // Recreate the store so the first activity.list call uses this test snapshot.
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, activeWorkspaceId);
       createAndAddWorkspace(store, backgroundWorkspaceId, {}, false);
@@ -1860,15 +1867,11 @@ describe("WorkspaceStore", () => {
       releaseBackgroundCompletion();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(onResponseComplete).toHaveBeenCalledTimes(1);
-      expect(onResponseComplete).toHaveBeenCalledWith(
-        backgroundWorkspaceId,
-        "",
-        true,
-        "",
-        undefined,
-        initialRecency + 1
-      );
+      expectResponseComplete(onResponseComplete, {
+        workspaceId: backgroundWorkspaceId,
+        isFinal: true,
+        completedAt: initialRecency + 1,
+      });
     });
 
     it("preserves queued auto-follow-up metadata for background completion callbacks", async () => {
@@ -1944,22 +1947,9 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, backgroundWorkspaceId);
 
@@ -1974,15 +1964,12 @@ describe("WorkspaceStore", () => {
       releaseBackgroundCompletion();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(onResponseComplete).toHaveBeenCalledTimes(1);
-      expect(onResponseComplete).toHaveBeenCalledWith(
-        backgroundWorkspaceId,
-        "",
-        true,
-        "",
-        { kind: "response", hasAutoFollowUp: true },
-        initialRecency + 1
-      );
+      expectResponseComplete(onResponseComplete, {
+        workspaceId: backgroundWorkspaceId,
+        isFinal: true,
+        completion: { kind: "response", hasAutoFollowUp: true },
+        completedAt: initialRecency + 1,
+      });
     });
 
     it("does not let stale queued auto-follow-up state suppress the final background completion", async () => {
@@ -2069,22 +2056,9 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, backgroundWorkspaceId);
 
@@ -2102,15 +2076,11 @@ describe("WorkspaceStore", () => {
       releaseBackgroundCompletion();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(onResponseComplete).toHaveBeenCalledTimes(1);
-      expect(onResponseComplete).toHaveBeenCalledWith(
-        backgroundWorkspaceId,
-        "",
-        true,
-        "",
-        undefined,
-        initialRecency + 1
-      );
+      expectResponseComplete(onResponseComplete, {
+        workspaceId: backgroundWorkspaceId,
+        isFinal: true,
+        completedAt: initialRecency + 1,
+      });
     });
 
     it("preserves compaction auto-follow-up metadata for background completion callbacks", async () => {
@@ -2203,23 +2173,10 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
       // Recreate the store so the first activity.list call uses this test snapshot.
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, backgroundWorkspaceId);
 
@@ -2234,15 +2191,12 @@ describe("WorkspaceStore", () => {
       releaseBackgroundCompletion();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(onResponseComplete).toHaveBeenCalledTimes(1);
-      expect(onResponseComplete).toHaveBeenCalledWith(
-        backgroundWorkspaceId,
-        "",
-        true,
-        "",
-        { kind: "compaction", hasAutoFollowUp: true },
-        initialRecency + 1
-      );
+      expectResponseComplete(onResponseComplete, {
+        workspaceId: backgroundWorkspaceId,
+        isFinal: true,
+        completion: { kind: "compaction", hasAutoFollowUp: true },
+        completedAt: initialRecency + 1,
+      });
     });
 
     it("marks normal completions with queued follow-up for active callbacks", async () => {
@@ -2288,37 +2242,23 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, workspaceId);
 
       const sawResponseComplete = await waitUntil(() => onResponseComplete.mock.calls.length > 0);
       expect(sawResponseComplete).toBe(true);
 
-      expect(onResponseComplete).toHaveBeenCalledTimes(1);
-      expect(onResponseComplete).toHaveBeenCalledWith(
+      expectResponseComplete(onResponseComplete, {
         workspaceId,
-        "response-stream",
-        true,
-        "",
-        { kind: "response", hasAutoFollowUp: true },
-        expect.any(Number)
-      );
+        messageId: "response-stream",
+        isFinal: true,
+        finalText: "",
+        completion: { kind: "response", hasAutoFollowUp: true },
+        completedAt: expect.any(Number),
+      });
     });
 
     it("marks compaction completions with queued follow-up as auto-follow-up for active callbacks", async () => {
@@ -2386,37 +2326,23 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, workspaceId);
 
       const sawResponseComplete = await waitUntil(() => onResponseComplete.mock.calls.length > 0);
       expect(sawResponseComplete).toBe(true);
 
-      expect(onResponseComplete).toHaveBeenCalledTimes(1);
-      expect(onResponseComplete).toHaveBeenCalledWith(
+      expectResponseComplete(onResponseComplete, {
         workspaceId,
-        "compaction-stream",
-        true,
-        "",
-        { kind: "compaction", hasAutoFollowUp: true },
-        expect.any(Number)
-      );
+        messageId: "compaction-stream",
+        isFinal: true,
+        finalText: "",
+        completion: { kind: "compaction", hasAutoFollowUp: true },
+        completedAt: expect.any(Number),
+      });
     });
 
     it("preserves queued auto-follow-up metadata for background compaction completions", async () => {
@@ -2513,22 +2439,9 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, backgroundWorkspaceId);
 
@@ -2545,15 +2458,12 @@ describe("WorkspaceStore", () => {
       releaseBackgroundCompletion();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(onResponseComplete).toHaveBeenCalledTimes(1);
-      expect(onResponseComplete).toHaveBeenCalledWith(
-        backgroundWorkspaceId,
-        "",
-        true,
-        "",
-        { kind: "compaction", hasAutoFollowUp: true },
-        initialRecency + 1
-      );
+      expectResponseComplete(onResponseComplete, {
+        workspaceId: backgroundWorkspaceId,
+        isFinal: true,
+        completion: { kind: "compaction", hasAutoFollowUp: true },
+        completedAt: initialRecency + 1,
+      });
     });
 
     it("does not fire response-complete callback when background streaming stops without recency advance", async () => {
@@ -2600,23 +2510,10 @@ describe("WorkspaceStore", () => {
         await waitForAbortSignal(options?.signal);
       });
 
-      const onResponseComplete = mock(
-        (
-          _workspaceId: string,
-          _messageId: string,
-          _isFinal: boolean,
-          _finalText: string,
-          _completion?: ResponseCompleteMetadata,
-          _completedAt?: number | null
-        ) => undefined
-      );
+      const onResponseComplete = createResponseCompleteSpy();
 
       // Recreate the store so the first activity.list call uses this test snapshot.
-      store.dispose();
-      store = new WorkspaceStore(mockOnModelUsed);
-      store.setOnResponseComplete(onResponseComplete);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-      store.setClient(mockClient as any);
+      recreateStore(onResponseComplete);
 
       createAndAddWorkspace(store, activeWorkspaceId);
       createAndAddWorkspace(store, backgroundWorkspaceId, {}, false);
