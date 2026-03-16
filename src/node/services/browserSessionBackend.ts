@@ -8,13 +8,37 @@ import type {
   BrowserSession,
   BrowserSessionOwnership,
 } from "@/common/types/browserSession";
+import { getMuxBrowserSessionId } from "@/common/utils/browserSession";
+import {
+  AgentBrowserBinaryNotFoundError,
+  AgentBrowserUnsupportedPlatformError,
+  AgentBrowserVendoredPackageNotFoundError,
+  resolveAgentBrowserBinary,
+} from "@/node/services/agentBrowserLauncher";
 import { DisposableProcess } from "@/node/utils/disposableExec";
 
 const CLI_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 2_000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+const VENDORED_BROWSER_RECOVERY_HINT =
+  "Reinstall Mux, or run bun install in the repo if you're developing locally.";
 const MISSING_BROWSER_BINARY_ERROR =
-  "agent-browser binary not found. Install it with: bun install -g @anthropic-ai/agent-browser";
+  "Vendored agent-browser binary disappeared before launch. Reinstall Mux, or run bun install in the repo if you're developing locally.";
+
+function getAgentBrowserLauncherError(error: unknown): string | null {
+  if (error instanceof AgentBrowserUnsupportedPlatformError) {
+    return `${error.message} ${VENDORED_BROWSER_RECOVERY_HINT}`;
+  }
+
+  if (
+    error instanceof AgentBrowserBinaryNotFoundError ||
+    error instanceof AgentBrowserVendoredPackageNotFoundError
+  ) {
+    return `${error.message} ${VENDORED_BROWSER_RECOVERY_HINT}`;
+  }
+
+  return null;
+}
 
 type CliResult = { ok: true; data: unknown } | { ok: false; error: string };
 
@@ -113,19 +137,21 @@ export class BrowserSessionBackend {
     this.session = this.createSession("starting");
     this.emitSessionUpdate();
 
-    const openResult = await this.runCliCommand(["open", this.options.initialUrl]);
-    if (!openResult.ok) {
-      // If stop/dispose interrupts the CLI command, the session already transitioned
-      // to a terminal state elsewhere; keep that state instead of overwriting it.
+    if (!this.hasExistingSession()) {
+      const openResult = await this.runCliCommand(["open", this.options.initialUrl]);
+      if (!openResult.ok) {
+        // If stop/dispose interrupts the CLI command, the session already transitioned
+        // to a terminal state elsewhere; keep that state instead of overwriting it.
+        if (this.disposed) {
+          return this.getSession();
+        }
+        this.transitionToError(openResult.error);
+        return this.getSession();
+      }
+
       if (this.disposed) {
         return this.getSession();
       }
-      this.transitionToError(openResult.error);
-      return this.getSession();
-    }
-
-    if (this.disposed) {
-      return this.getSession();
     }
 
     await this.refreshMetadata();
@@ -180,8 +206,9 @@ export class BrowserSessionBackend {
 
   private createSession(status: BrowserSession["status"]): BrowserSession {
     const now = new Date().toISOString();
+    const runId = `${this.sessionId}-${randomUUID().slice(0, 8)}`;
     return {
-      id: this.sessionId,
+      id: runId,
       workspaceId: this.options.workspaceId,
       status,
       ownership: this.options.ownership,
@@ -195,7 +222,22 @@ export class BrowserSessionBackend {
   }
 
   private createSessionId(): string {
-    return `browser-${this.options.workspaceId}-${randomUUID().slice(0, 8)}`;
+    return getMuxBrowserSessionId(this.options.workspaceId);
+  }
+
+  private hasExistingSession(): boolean {
+    try {
+      // Lazy-load to avoid startup crashes when the optional agent-browser package is missing
+      // or corrupt. agent-browser also auto-launches blank browsers for metadata commands,
+      // so checking the daemon PID is the least destructive way to detect attachable sessions.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { isDaemonRunning: isDaemonRunningFn } = require("agent-browser/dist/daemon.js") as {
+        isDaemonRunning: (sessionId: string) => boolean;
+      };
+      return isDaemonRunningFn(this.sessionId);
+    } catch {
+      return false;
+    }
   }
 
   private emitSessionUpdate(): void {
@@ -350,10 +392,25 @@ export class BrowserSessionBackend {
   }
 
   private async runCliCommand(args: string[], timeoutMs = CLI_TIMEOUT_MS): Promise<CliResult> {
-    const childProcess = spawn("agent-browser", ["--json", "--session", this.sessionId, ...args], {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    let agentBrowserBinary: string;
+    try {
+      agentBrowserBinary = resolveAgentBrowserBinary();
+    } catch (error) {
+      const launcherError = getAgentBrowserLauncherError(error);
+      if (launcherError !== null) {
+        return { ok: false, error: launcherError };
+      }
+      throw error;
+    }
+
+    const childProcess = spawn(
+      agentBrowserBinary,
+      ["--json", "--session", this.sessionId, ...args],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      }
+    );
     const disposableProcess = new DisposableProcess(childProcess);
     this.inFlightProcesses.add(childProcess);
 

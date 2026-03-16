@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   Camera,
@@ -64,6 +64,66 @@ const ACTION_ICONS: Record<BrowserAction["type"], LucideIcon> = {
   custom: Sparkles,
 };
 
+interface AutoStartGateState {
+  attempted: boolean;
+  autoStartPending: boolean;
+  manuallyStopped: boolean;
+}
+
+// BrowserTab unmounts when users switch sidebar tabs, so the auto-start and manual-stop
+// gates must outlive a single component instance to avoid surprise restarts on remount.
+const autoStartStateByWorkspace = new Map<string, AutoStartGateState>();
+
+function getAutoStartState(workspaceId: string): AutoStartGateState {
+  const existingState = autoStartStateByWorkspace.get(workspaceId);
+  if (existingState != null) {
+    return existingState;
+  }
+
+  const initialState: AutoStartGateState = {
+    attempted: false,
+    autoStartPending: false,
+    manuallyStopped: false,
+  };
+  autoStartStateByWorkspace.set(workspaceId, initialState);
+  return initialState;
+}
+
+type BrowserSessionClient = NonNullable<ReturnType<typeof useAPI>["api"]>["browserSession"];
+
+function getSessionErrorMessage(sessionError: unknown, fallbackMessage: string): string {
+  return sessionError instanceof Error ? sessionError.message : fallbackMessage;
+}
+
+function startBrowserSession(args: {
+  browserSessionApi: BrowserSessionClient | null;
+  workspaceId: string;
+  ownership: Extract<BrowserSession["ownership"], "agent" | "user">;
+  startingSession: boolean;
+  stoppingSession: boolean;
+  setStartingSession: (value: boolean) => void;
+  setStartError: (value: string | null) => void;
+}) {
+  if (args.browserSessionApi == null || args.startingSession || args.stoppingSession) {
+    return;
+  }
+
+  args.setStartingSession(true);
+  args.setStartError(null);
+
+  args.browserSessionApi
+    .start({
+      workspaceId: args.workspaceId,
+      ownership: args.ownership,
+    })
+    .catch((sessionError: unknown) => {
+      args.setStartError(getSessionErrorMessage(sessionError, "Failed to start session"));
+    })
+    .finally(() => {
+      args.setStartingSession(false);
+    });
+}
+
 export function BrowserTab(props: BrowserTabProps) {
   if (props.workspaceId.trim().length === 0) {
     throw new Error("Browser tab requires a workspaceId");
@@ -74,8 +134,11 @@ export function BrowserTab(props: BrowserTabProps) {
   const [startingSession, setStartingSession] = useState(false);
   const [stoppingSession, setStoppingSession] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const autoStartState = getAutoStartState(props.workspaceId);
+  const browserSessionApi = api?.browserSession ?? null;
 
-  const isStarting = startingSession || session?.status === "starting";
+  const isStarting =
+    startingSession || autoStartState.autoStartPending || session?.status === "starting";
   const screenshotSrc = session?.lastScreenshotBase64
     ? `data:image/jpeg;base64,${session.lastScreenshotBase64}`
     : null;
@@ -101,43 +164,83 @@ export function BrowserTab(props: BrowserTabProps) {
       ? STATUS_BADGES.starting
       : null;
 
-  const handleStartSession = () => {
-    if (!api || startingSession) {
+  // This effect syncs the Browser tab with the external browser-session service by
+  // issuing a single agent-owned attach/start request when no session exists yet.
+  useEffect(() => {
+    if (
+      browserSessionApi == null ||
+      session != null ||
+      error != null ||
+      startError != null ||
+      stoppingSession ||
+      autoStartState.attempted ||
+      autoStartState.autoStartPending ||
+      autoStartState.manuallyStopped
+    ) {
       return;
     }
 
-    setStartingSession(true);
+    autoStartState.attempted = true;
+    autoStartState.autoStartPending = true;
     setStartError(null);
 
-    api.browserSession
+    browserSessionApi
       .start({
         workspaceId: props.workspaceId,
-        ownership: "user",
+        ownership: "agent",
       })
       .catch((sessionError: unknown) => {
-        setStartError(
-          sessionError instanceof Error ? sessionError.message : "Failed to start session"
-        );
+        setStartError(getSessionErrorMessage(sessionError, "Failed to start session"));
       })
       .finally(() => {
-        setStartingSession(false);
+        autoStartState.autoStartPending = false;
       });
+  }, [
+    autoStartState,
+    browserSessionApi,
+    error,
+    props.workspaceId,
+    session,
+    startError,
+    stoppingSession,
+  ]);
+
+  const handleStartSession = () => {
+    const currentAutoStartState = autoStartStateByWorkspace.get(props.workspaceId);
+    if (
+      browserSessionApi == null ||
+      startingSession ||
+      stoppingSession ||
+      currentAutoStartState?.autoStartPending
+    ) {
+      return;
+    }
+
+    autoStartState.manuallyStopped = false;
+    startBrowserSession({
+      browserSessionApi,
+      workspaceId: props.workspaceId,
+      ownership: "user",
+      startingSession,
+      stoppingSession,
+      setStartingSession,
+      setStartError,
+    });
   };
 
   const handleStopSession = () => {
-    if (!api || stoppingSession) {
+    if (browserSessionApi == null || stoppingSession) {
       return;
     }
 
+    autoStartState.manuallyStopped = true;
     setStoppingSession(true);
     setStartError(null);
 
-    api.browserSession
+    browserSessionApi
       .stop({ workspaceId: props.workspaceId })
       .catch((sessionError: unknown) => {
-        setStartError(
-          sessionError instanceof Error ? sessionError.message : "Failed to stop session"
-        );
+        setStartError(getSessionErrorMessage(sessionError, "Failed to stop session"));
       })
       .finally(() => {
         setStoppingSession(false);
@@ -179,10 +282,10 @@ export function BrowserTab(props: BrowserTabProps) {
           <button
             type="button"
             onClick={handleStartSession}
-            disabled={!api || startingSession}
+            disabled={!api || isStarting}
             className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex max-w-full items-center gap-1.5 self-start rounded-md px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {startingSession ? (
+            {isStarting ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : session?.status === "ended" || session?.status === "error" ? (
               <RefreshCw className="h-3.5 w-3.5" />
