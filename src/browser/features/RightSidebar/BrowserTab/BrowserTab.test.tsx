@@ -138,15 +138,7 @@ describe("BrowserTab recent action timestamps", () => {
     expect(endedView.queryByText("Stream live")).toBeNull();
   });
 
-  test("shows stream-specific combined header badges for live sessions", () => {
-    mockSession = createSession({ streamState: "fallback" });
-
-    const fallbackView = renderBrowserTab();
-
-    expect(fallbackView.getAllByText("Fallback")).toHaveLength(1);
-
-    fallbackView.unmount();
-
+  test("shows degraded stream-state header badges for live sessions", () => {
     mockSession = createSession({ streamState: "restart_required", title: "Restart page" });
 
     const restartRequiredView = renderBrowserTab();
@@ -254,7 +246,7 @@ describe("BrowserTab address bar and reload", () => {
   test("shows ready state even with non-live stream state at about:blank", () => {
     mockSession = createSession({
       currentUrl: "about:blank",
-      streamState: "fallback",
+      streamState: "restart_required",
     });
 
     const view = renderBrowserTab();
@@ -327,7 +319,7 @@ describe("BrowserTab address bar and reload", () => {
   });
 
   test("reload button is disabled when stream is not live", () => {
-    mockSession = createSession({ streamState: "fallback" });
+    mockSession = createSession({ streamState: "restart_required" });
 
     const view = renderBrowserTab();
     const reloadButton = view.getByRole("button", { name: "Reload page" }) as HTMLButtonElement;
