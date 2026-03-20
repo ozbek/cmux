@@ -38,9 +38,9 @@ import type {
   ToolCallEndEvent,
   ToolCallStartEvent,
 } from "@/common/types/stream";
-import { BrowserSessionService } from "@/node/services/browserSessionService";
-import { BrowserSessionStreamPortRegistry } from "@/node/services/browserSessionStreamPortRegistry";
-import { BrowserSessionAttachmentStore } from "@/node/services/browserSessionAttachmentStore";
+import { BrowserBridgeServer } from "@/node/services/browser/BrowserBridgeServer";
+import { AgentBrowserSessionDiscoveryService } from "@/node/services/browser/AgentBrowserSessionDiscoveryService";
+import { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserBridgeTokenManager";
 import { DevToolsService } from "@/node/services/devToolsService";
 import { SessionTimingService } from "@/node/services/sessionTimingService";
 import { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -59,6 +59,10 @@ import {
 import { setGlobalCoderService } from "@/node/runtime/runtimeFactory";
 import { setSshPromptService } from "@/node/runtime/sshConnectionPool";
 import { setSshPromptService as setSSH2SshPromptService } from "@/node/runtime/SSH2ConnectionPool";
+import {
+  createRuntimeForWorkspace,
+  resolveWorkspaceExecutionPath,
+} from "@/node/runtime/runtimeHelpers";
 import { PolicyService } from "@/node/services/policyService";
 import { ServerAuthService } from "@/node/services/serverAuthService";
 import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
@@ -123,8 +127,9 @@ export class ServiceContainer {
   public readonly telemetryService: TelemetryService;
   public readonly sessionTimingService: SessionTimingService;
   public readonly devToolsService: DevToolsService;
-  public readonly browserSessionService: BrowserSessionService;
-  public readonly streamPortRegistry: BrowserSessionStreamPortRegistry;
+  public readonly browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
+  public readonly browserBridgeTokenManager: BrowserBridgeTokenManager;
+  public readonly browserBridgeServer: BrowserBridgeServer;
   public readonly analyticsService: AnalyticsService;
   public readonly experimentsService: ExperimentsService;
   public readonly signingService: SigningService;
@@ -152,13 +157,7 @@ export class ServiceContainer {
     this.sessionTimingService = new SessionTimingService(config, this.telemetryService);
     this.analyticsService = new AnalyticsService(config);
     this.devToolsService = new DevToolsService(config);
-    const browserSessionAttachmentStore = new BrowserSessionAttachmentStore(config.rootDir);
-    this.streamPortRegistry = new BrowserSessionStreamPortRegistry({
-      attachmentStore: browserSessionAttachmentStore,
-    });
-    this.browserSessionService = new BrowserSessionService({
-      streamPortRegistry: this.streamPortRegistry,
-    });
+    this.browserBridgeTokenManager = new BrowserBridgeTokenManager();
 
     // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
     // the persistent config rather than creating a default with an ephemeral one.
@@ -191,7 +190,26 @@ export class ServiceContainer {
     this.historyService = core.historyService;
     this.aiService = core.aiService;
     this.aiService.setAnalyticsService(this.analyticsService);
-    this.aiService.setBrowserSessionStreamPortRegistry(this.streamPortRegistry);
+    this.browserSessionDiscoveryService = new AgentBrowserSessionDiscoveryService({
+      resolveWorkspaceCandidatePathsFn: async (workspaceId: string) => {
+        const allWorkspaceMetadata = await config.getAllWorkspaceMetadata();
+        const workspaceMetadata =
+          allWorkspaceMetadata.find((candidate) => candidate.id === workspaceId) ?? null;
+        if (workspaceMetadata == null) {
+          return [];
+        }
+
+        const runtime = createRuntimeForWorkspace(workspaceMetadata);
+        const workspacePath = resolveWorkspaceExecutionPath(workspaceMetadata, runtime);
+        return [workspaceMetadata.projectPath, workspacePath].filter(
+          (candidatePath): candidatePath is string => candidatePath.trim().length > 0
+        );
+      },
+    });
+    this.browserBridgeServer = new BrowserBridgeServer({
+      browserSessionDiscoveryService: this.browserSessionDiscoveryService,
+      browserBridgeTokenManager: this.browserBridgeTokenManager,
+    });
     this.workspaceService = core.workspaceService;
     this.taskService = core.taskService;
     this.providerService = core.providerService;
@@ -249,16 +267,10 @@ export class ServiceContainer {
     this.copilotOauthService = new CopilotOauthService(this.providerService, this.windowService);
     // Terminal services - PTYService is cross-platform
     this.ptyService = new PTYService();
-    this.terminalService = new TerminalService(
-      config,
-      this.ptyService,
-      opResolver,
-      this.streamPortRegistry
-    );
+    this.terminalService = new TerminalService(config, this.ptyService, opResolver);
     // Wire terminal service to workspace service for cleanup on removal
     this.workspaceService.setTerminalService(this.terminalService);
     this.workspaceService.setDesktopSessionManager(this.desktopSessionManager);
-    this.workspaceService.setBrowserSessionService(this.browserSessionService);
     // Editor service for opening workspaces in code editors
     this.editorService = new EditorService(config);
     this.updateService = new UpdateService(this.config);
@@ -578,7 +590,9 @@ export class ServiceContainer {
       experimentsService: this.experimentsService,
       sessionUsageService: this.sessionUsageService,
       devToolsService: this.devToolsService,
-      browserSessionService: this.browserSessionService,
+      browserSessionDiscoveryService: this.browserSessionDiscoveryService,
+      browserBridgeTokenManager: this.browserBridgeTokenManager,
+      browserBridgeServer: this.browserBridgeServer,
       policyService: this.policyService,
       signingService: this.signingService,
       coderService: this.coderService,
@@ -600,8 +614,8 @@ export class ServiceContainer {
     this.desktopTokenManager.dispose();
     await this.desktopSessionManager.closeAll();
     this.idleCompactionService.stop();
-    this.browserSessionService.dispose();
-    this.streamPortRegistry.dispose();
+    await this.browserBridgeServer.stop();
+    this.browserBridgeTokenManager.dispose();
     await this.analyticsService.dispose();
     await this.telemetryService.shutdown();
   }
@@ -623,8 +637,8 @@ export class ServiceContainer {
     await this.desktopBridgeServer.stop();
     this.desktopTokenManager.dispose();
     await this.desktopSessionManager.closeAll();
-    this.browserSessionService.dispose();
-    this.streamPortRegistry.dispose();
+    await this.browserBridgeServer.stop();
+    this.browserBridgeTokenManager.dispose();
     await this.analyticsService.dispose();
     this.policyService.dispose();
     this.mcpServerManager.dispose();
