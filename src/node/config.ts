@@ -36,6 +36,11 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { getMuxHome } from "@/common/constants/paths";
 import { GATEWAY_PROVIDERS } from "@/common/constants/providers";
+import {
+  CODER_ARCHIVE_BEHAVIORS,
+  DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+  type CoderWorkspaceArchiveBehavior,
+} from "@/common/config/coderArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
 import {
   isValidModelFormat,
@@ -90,6 +95,53 @@ function parseUpdateChannel(value: unknown): UpdateChannel | undefined {
   }
 
   return undefined;
+}
+
+function parseCoderWorkspaceArchiveBehavior(
+  value: unknown
+): CoderWorkspaceArchiveBehavior | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  return CODER_ARCHIVE_BEHAVIORS.includes(value as CoderWorkspaceArchiveBehavior)
+    ? (value as CoderWorkspaceArchiveBehavior)
+    : undefined;
+}
+
+function resolveCoderWorkspaceArchiveBehavior(
+  coderWorkspaceArchiveBehavior: unknown,
+  stopCoderWorkspaceOnArchive: unknown
+): CoderWorkspaceArchiveBehavior {
+  const parsedBehavior = parseCoderWorkspaceArchiveBehavior(coderWorkspaceArchiveBehavior);
+  if (parsedBehavior !== undefined) {
+    return parsedBehavior;
+  }
+
+  return parseOptionalBoolean(stopCoderWorkspaceOnArchive) === false
+    ? "keep"
+    : DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+}
+
+function getLegacyStopCoderWorkspaceOnArchiveValue(
+  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
+): false | undefined {
+  return coderWorkspaceArchiveBehavior === "keep" ? false : undefined;
+}
+
+function resolveCoderWorkspaceArchiveBehaviorForSave(
+  config: Pick<ProjectsConfig, "coderWorkspaceArchiveBehavior" | "stopCoderWorkspaceOnArchive">
+): CoderWorkspaceArchiveBehavior {
+  const parsedBehavior = parseCoderWorkspaceArchiveBehavior(config.coderWorkspaceArchiveBehavior);
+  if (parsedBehavior != null) {
+    return parsedBehavior;
+  }
+
+  if (config.stopCoderWorkspaceOnArchive === false) {
+    return "keep";
+  }
+
+  return DEFAULT_CODER_ARCHIVE_BEHAVIOR;
 }
 
 function parseOptionalStringArray(value: unknown): string[] | undefined {
@@ -566,9 +618,13 @@ export class Config {
         const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
         const legacySubagentAiDefaults = normalizeSubagentAiDefaults(parsed.subagentAiDefaults);
 
-        // Default ON: store `false` only so config.json stays minimal.
-        const stopCoderWorkspaceOnArchive =
-          parseOptionalBoolean(parsed.stopCoderWorkspaceOnArchive) === false ? false : undefined;
+        const coderWorkspaceArchiveBehavior = resolveCoderWorkspaceArchiveBehavior(
+          parsed.coderWorkspaceArchiveBehavior,
+          parsed.stopCoderWorkspaceOnArchive
+        );
+        const stopCoderWorkspaceOnArchive = getLegacyStopCoderWorkspaceOnArchiveValue(
+          coderWorkspaceArchiveBehavior
+        );
         const updateChannel = parseUpdateChannel(parsed.updateChannel);
 
         const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
@@ -611,6 +667,7 @@ export class Config {
           useSSH2Transport: parseOptionalBoolean(parsed.useSSH2Transport),
           muxGovernorUrl: parseOptionalNonEmptyString(parsed.muxGovernorUrl),
           muxGovernorToken: parseOptionalNonEmptyString(parsed.muxGovernorToken),
+          coderWorkspaceArchiveBehavior,
           stopCoderWorkspaceOnArchive,
           terminalDefaultShell: parseOptionalNonEmptyString(parsed.terminalDefaultShell),
           updateChannel,
@@ -630,6 +687,7 @@ export class Config {
       agentAiDefaults: {},
       subagentAiDefaults: {},
       routePriority: this.seedRoutePriorityFromProviders(),
+      coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
     };
   }
 
@@ -765,9 +823,14 @@ export class Config {
         data.muxGovernorToken = muxGovernorToken;
       }
 
-      // Default ON: persist `false` only.
-      if (config.stopCoderWorkspaceOnArchive === false) {
-        data.stopCoderWorkspaceOnArchive = false;
+      const coderWorkspaceArchiveBehavior = resolveCoderWorkspaceArchiveBehaviorForSave(config);
+      data.coderWorkspaceArchiveBehavior = coderWorkspaceArchiveBehavior;
+
+      const stopCoderWorkspaceOnArchive = getLegacyStopCoderWorkspaceOnArchiveValue(
+        coderWorkspaceArchiveBehavior
+      );
+      if (stopCoderWorkspaceOnArchive !== undefined) {
+        data.stopCoderWorkspaceOnArchive = stopCoderWorkspaceOnArchive;
       }
 
       const terminalDefaultShell = parseOptionalNonEmptyString(config.terminalDefaultShell);

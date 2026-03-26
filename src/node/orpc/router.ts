@@ -1,4 +1,5 @@
 import { os, ORPCError } from "@orpc/server";
+import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import * as schemas from "@/common/orpc/schemas";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ORPCContext } from "./context";
@@ -579,7 +580,8 @@ export const router = (authToken?: string) => {
             routeOverrides: config.routeOverrides,
             defaultModel: config.defaultModel,
             hiddenModels: config.hiddenModels,
-            stopCoderWorkspaceOnArchive: config.stopCoderWorkspaceOnArchive !== false,
+            coderWorkspaceArchiveBehavior:
+              config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
             runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
             defaultRuntime: config.defaultRuntime ?? null,
             agentAiDefaults: config.agentAiDefaults ?? {},
@@ -769,8 +771,7 @@ export const router = (authToken?: string) => {
           await context.config.editConfig((config) => {
             return {
               ...config,
-              // Default ON: store `false` only.
-              stopCoderWorkspaceOnArchive: input.stopCoderWorkspaceOnArchive ? undefined : false,
+              coderWorkspaceArchiveBehavior: input.coderWorkspaceArchiveBehavior,
             };
           });
         }),
