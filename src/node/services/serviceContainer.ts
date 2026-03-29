@@ -59,6 +59,7 @@ import {
   createCoderArchiveHook,
   createCoderUnarchiveHook,
 } from "@/node/runtime/coderLifecycleHooks";
+import { createWorktreeArchiveHook } from "@/node/runtime/worktreeLifecycleHooks";
 import { setGlobalCoderService } from "@/node/runtime/runtimeFactory";
 import { setSshPromptService } from "@/node/runtime/sshConnectionPool";
 import { setSshPromptService as setSSH2SshPromptService } from "@/node/runtime/SSH2ConnectionPool";
@@ -316,6 +317,11 @@ export class ServiceContainer {
         coderService: this.coderService,
         getArchiveBehavior,
       })
+    );
+    const getDeleteWorktreeOnArchive = () =>
+      this.config.loadConfigOrDefault().deleteWorktreeOnArchive === true;
+    workspaceLifecycleHooks.registerAfterArchive(
+      createWorktreeArchiveHook({ getDeleteWorktreeOnArchive })
     );
     this.workspaceService.setWorkspaceLifecycleHooks(workspaceLifecycleHooks);
 

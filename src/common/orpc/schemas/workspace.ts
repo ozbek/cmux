@@ -153,6 +153,10 @@ export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
     description:
       "True if this workspace is currently initializing (postCreateSetup or initWorkspace running).",
   }),
+  transcriptOnly: z.boolean().optional().meta({
+    description:
+      "True if this workspace's checkout directory is missing (worktree deleted). Chat history is available but the workspace cannot run commands.",
+  }),
 });
 
 export const WorkspaceAgentStatusSchema = z.object({

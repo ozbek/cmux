@@ -185,8 +185,12 @@ export function GeneralSection() {
   const [archiveBehavior, setArchiveBehavior] = useState<CoderWorkspaceArchiveBehavior>(
     DEFAULT_CODER_ARCHIVE_BEHAVIOR
   );
+  const [deleteWorktreeOnArchive, setDeleteWorktreeOnArchive] = useState(false);
+  const [archiveSettingsLoaded, setArchiveSettingsLoaded] = useState(false);
   const [llmDebugLogs, setLlmDebugLogs] = useState(false);
   const archiveBehaviorLoadNonceRef = useRef(0);
+  const archiveBehaviorRef = useRef<CoderWorkspaceArchiveBehavior>(DEFAULT_CODER_ARCHIVE_BEHAVIOR);
+  const deleteWorktreeOnArchiveRef = useRef(false);
 
   const llmDebugLogsLoadNonceRef = useRef(0);
 
@@ -197,12 +201,14 @@ export function GeneralSection() {
   const archiveBehaviorPendingUpdateRef = useRef<CoderWorkspaceArchiveBehavior | undefined>(
     undefined
   );
+  const deleteWorktreeOnArchivePendingUpdateRef = useRef<boolean | undefined>(undefined);
 
   useEffect(() => {
     if (!api) {
       return;
     }
 
+    setArchiveSettingsLoaded(false);
     const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
     const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
 
@@ -211,11 +217,17 @@ export function GeneralSection() {
       .then((cfg) => {
         // If the user changed the setting while this request was in flight, keep the UI selection.
         if (archiveBehaviorNonce === archiveBehaviorLoadNonceRef.current) {
-          setArchiveBehavior(
-            isCoderWorkspaceArchiveBehavior(cfg.coderWorkspaceArchiveBehavior)
-              ? cfg.coderWorkspaceArchiveBehavior
-              : DEFAULT_CODER_ARCHIVE_BEHAVIOR
-          );
+          const nextArchiveBehavior = isCoderWorkspaceArchiveBehavior(
+            cfg.coderWorkspaceArchiveBehavior
+          )
+            ? cfg.coderWorkspaceArchiveBehavior
+            : DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+          setArchiveBehavior(nextArchiveBehavior);
+          archiveBehaviorRef.current = nextArchiveBehavior;
+          const shouldDeleteWorktreeOnArchive = cfg.deleteWorktreeOnArchive === true;
+          setDeleteWorktreeOnArchive(shouldDeleteWorktreeOnArchive);
+          deleteWorktreeOnArchiveRef.current = shouldDeleteWorktreeOnArchive;
+          setArchiveSettingsLoaded(true);
         }
 
         // Use an independent nonce so debug-log toggles do not discard archive-setting updates.
@@ -224,47 +236,85 @@ export function GeneralSection() {
         }
       })
       .catch(() => {
-        // Best-effort only. Keep the default (stop) if config fails to load.
+        if (archiveBehaviorNonce === archiveBehaviorLoadNonceRef.current) {
+          // Fall back to the safe defaults already in state so the controls can recover after a
+          // config read failure and the next user change can persist a fresh value.
+          setArchiveSettingsLoaded(true);
+        }
       });
   }, [api]);
 
+  const queueArchiveBehaviorUpdate = useCallback(() => {
+    if (!api?.config?.updateCoderPrefs || !archiveSettingsLoaded) {
+      return;
+    }
+
+    archiveBehaviorUpdateChainRef.current = archiveBehaviorUpdateChainRef.current
+      .then(async () => {
+        // Drain pending refs so changes that happen while updateCoderPrefs is in-flight always
+        // schedule another serialized write with the latest combined preferences.
+        for (;;) {
+          const pendingArchiveBehavior = archiveBehaviorPendingUpdateRef.current;
+          const pendingDeleteWorktreeOnArchive = deleteWorktreeOnArchivePendingUpdateRef.current;
+          if (
+            pendingArchiveBehavior === undefined &&
+            pendingDeleteWorktreeOnArchive === undefined
+          ) {
+            return;
+          }
+
+          // Clear before awaiting so rapid changes coalesce into a new pending value.
+          archiveBehaviorPendingUpdateRef.current = undefined;
+          deleteWorktreeOnArchivePendingUpdateRef.current = undefined;
+
+          try {
+            await api.config.updateCoderPrefs({
+              coderWorkspaceArchiveBehavior: pendingArchiveBehavior ?? archiveBehaviorRef.current,
+              deleteWorktreeOnArchive:
+                pendingDeleteWorktreeOnArchive ?? deleteWorktreeOnArchiveRef.current,
+            });
+          } catch {
+            // Best-effort only. Swallow errors so the queue doesn't get stuck.
+          }
+        }
+      })
+      .catch(() => {
+        // Best-effort only.
+      });
+  }, [api, archiveSettingsLoaded]);
+
   const handleArchiveBehaviorChange = useCallback(
     (behavior: CoderWorkspaceArchiveBehavior) => {
-      // Invalidate any in-flight initial load so it doesn't overwrite the user's selection.
-      archiveBehaviorLoadNonceRef.current++;
-      setArchiveBehavior(behavior);
-
-      if (!api?.config?.updateCoderPrefs) {
+      if (!archiveSettingsLoaded || !api?.config?.updateCoderPrefs) {
         return;
       }
 
+      // Invalidate any in-flight initial load so it doesn't overwrite the user's selection.
+      archiveBehaviorLoadNonceRef.current++;
+      setArchiveBehavior(behavior);
+      archiveBehaviorRef.current = behavior;
+
       archiveBehaviorPendingUpdateRef.current = behavior;
-
-      archiveBehaviorUpdateChainRef.current = archiveBehaviorUpdateChainRef.current
-        .then(async () => {
-          // Drain the pending ref so a change that happens while updateCoderPrefs is in-flight
-          // doesn't get stranded without a subsequent write scheduled.
-          for (;;) {
-            const pending = archiveBehaviorPendingUpdateRef.current;
-            if (pending === undefined) {
-              return;
-            }
-
-            // Clear before awaiting so rapid changes coalesce into a new pending value.
-            archiveBehaviorPendingUpdateRef.current = undefined;
-
-            try {
-              await api.config.updateCoderPrefs({ coderWorkspaceArchiveBehavior: pending });
-            } catch {
-              // Best-effort only. Swallow errors so the queue doesn't get stuck.
-            }
-          }
-        })
-        .catch(() => {
-          // Best-effort only.
-        });
+      queueArchiveBehaviorUpdate();
     },
-    [api]
+    [api, archiveSettingsLoaded, queueArchiveBehaviorUpdate]
+  );
+
+  const handleDeleteWorktreeOnArchiveChange = useCallback(
+    (checked: boolean) => {
+      if (!archiveSettingsLoaded || !api?.config?.updateCoderPrefs) {
+        return;
+      }
+
+      // Invalidate any in-flight archive config load so it does not overwrite the user's toggle.
+      archiveBehaviorLoadNonceRef.current++;
+      setDeleteWorktreeOnArchive(checked);
+      deleteWorktreeOnArchiveRef.current = checked;
+
+      deleteWorktreeOnArchivePendingUpdateRef.current = checked;
+      queueArchiveBehaviorUpdate();
+    },
+    [api, archiveSettingsLoaded, queueArchiveBehaviorUpdate]
   );
 
   const handleLlmDebugLogsChange = (checked: boolean) => {
@@ -545,7 +595,7 @@ export function GeneralSection() {
           onValueChange={(value) =>
             handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
           }
-          disabled={!api?.config?.updateCoderPrefs}
+          disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
         >
           <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
             <SelectValue />
@@ -558,6 +608,22 @@ export function GeneralSection() {
             ))}
           </SelectContent>
         </Select>
+      </div>
+
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex-1 pr-4">
+          <div className="text-foreground text-sm">Delete worktree on archive</div>
+          <div className="text-muted mt-0.5 text-xs">
+            When enabled, mux-managed worktrees are deleted when archiving a workspace; the
+            transcript and usage history are preserved.
+          </div>
+        </div>
+        <Switch
+          checked={deleteWorktreeOnArchive}
+          onCheckedChange={handleDeleteWorktreeOnArchiveChange}
+          disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+          aria-label="Toggle Delete worktree on archive"
+        />
       </div>
 
       {isBrowserMode && sshHostLoaded && (

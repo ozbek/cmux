@@ -63,7 +63,9 @@ import {
   probeDevcontainerStatus,
   stopDevcontainer,
 } from "@/node/runtime/devcontainerCli";
+import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
 import { expandTilde, expandTildeForSSH } from "@/node/runtime/tildeExpansion";
+import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
 
 import { ContainerManager } from "@/node/multiProject/containerManager";
 
@@ -3681,6 +3683,33 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
+      // Lifecycle hooks run after we persist archivedAt.
+      //
+      // Why best-effort: Archive should stay successful once the archived state is durable, even if
+      // follow-up cleanup like managed worktree deletion fails.
+      if (this.workspaceLifecycleHooks) {
+        let hookMetadata: WorkspaceMetadata | undefined = updatedMetadata;
+        if (!hookMetadata) {
+          const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
+          if (!metadataResult.success) {
+            log.debug("Failed to load workspace metadata for afterArchive hook", {
+              workspaceId,
+              error: metadataResult.error,
+            });
+          } else {
+            hookMetadata = metadataResult.data;
+          }
+        }
+
+        if (hookMetadata) {
+          await this.workspaceLifecycleHooks.runAfterArchive({
+            workspaceId,
+            workspaceMetadata: hookMetadata,
+          });
+          await this.emitCurrentWorkspaceMetadata(workspaceId);
+        }
+      }
+
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -3777,6 +3806,32 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to unarchive workspace: ${message}`);
+    }
+  }
+
+  async deleteWorktree(workspaceId: string): Promise<Result<void>> {
+    try {
+      const allMetadata = await this.config.getAllWorkspaceMetadata();
+      const workspaceMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
+      if (!workspaceMetadata) {
+        return Err("Workspace not found");
+      }
+
+      if (!isWorkspaceArchived(workspaceMetadata.archivedAt, workspaceMetadata.unarchivedAt)) {
+        return Err("Only archived workspaces can delete their managed worktree");
+      }
+
+      if (!isWorktreeRuntime(workspaceMetadata.runtimeConfig)) {
+        return Err("Deleting a managed worktree is only supported for worktree runtimes");
+      }
+
+      const managedPath = workspaceMetadata.namedWorkspacePath;
+      await removeManagedGitWorktree(workspaceMetadata.projectPath, managedPath);
+      await this.emitCurrentWorkspaceMetadata(workspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      const message = getErrorMessage(error);
+      return Err(`Failed to delete managed worktree: ${message}`);
     }
   }
 

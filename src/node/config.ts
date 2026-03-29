@@ -31,7 +31,11 @@ import {
 } from "@/common/types/tasks";
 import { isLayoutPresetsConfigEmpty, normalizeLayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
-import { RUNTIME_ENABLEMENT_IDS, type RuntimeEnablementId } from "@/common/types/runtime";
+import {
+  isWorktreeRuntime,
+  RUNTIME_ENABLEMENT_IDS,
+  type RuntimeEnablementId,
+} from "@/common/types/runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { getMuxHome } from "@/common/constants/paths";
@@ -101,6 +105,10 @@ function parseCoderWorkspaceArchiveBehavior(
   value: unknown
 ): CoderWorkspaceArchiveBehavior | undefined {
   return isCoderWorkspaceArchiveBehavior(value) ? value : undefined;
+}
+
+function resolveDeleteWorktreeOnArchive(deleteWorktreeOnArchive: unknown): boolean {
+  return parseOptionalBoolean(deleteWorktreeOnArchive) ?? false;
 }
 
 function resolveCoderWorkspaceArchiveBehavior(
@@ -616,6 +624,9 @@ export class Config {
           parsed.coderWorkspaceArchiveBehavior,
           parsed.stopCoderWorkspaceOnArchive
         );
+        const deleteWorktreeOnArchive = resolveDeleteWorktreeOnArchive(
+          parsed.deleteWorktreeOnArchive
+        );
         const stopCoderWorkspaceOnArchive = getLegacyStopCoderWorkspaceOnArchiveValue(
           coderWorkspaceArchiveBehavior
         );
@@ -662,6 +673,7 @@ export class Config {
           muxGovernorUrl: parseOptionalNonEmptyString(parsed.muxGovernorUrl),
           muxGovernorToken: parseOptionalNonEmptyString(parsed.muxGovernorToken),
           coderWorkspaceArchiveBehavior,
+          deleteWorktreeOnArchive,
           stopCoderWorkspaceOnArchive,
           terminalDefaultShell: parseOptionalNonEmptyString(parsed.terminalDefaultShell),
           updateChannel,
@@ -682,6 +694,7 @@ export class Config {
       subagentAiDefaults: {},
       routePriority: this.seedRoutePriorityFromProviders(),
       coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+      deleteWorktreeOnArchive: false,
     };
   }
 
@@ -825,6 +838,11 @@ export class Config {
       );
       if (stopCoderWorkspaceOnArchive !== undefined) {
         data.stopCoderWorkspaceOnArchive = stopCoderWorkspaceOnArchive;
+      }
+
+      const deleteWorktreeOnArchive = parseOptionalBoolean(config.deleteWorktreeOnArchive);
+      if (deleteWorktreeOnArchive !== undefined) {
+        data.deleteWorktreeOnArchive = deleteWorktreeOnArchive;
       }
 
       const terminalDefaultShell = parseOptionalNonEmptyString(config.terminalDefaultShell);
@@ -999,11 +1017,11 @@ export class Config {
    * Add paths to WorkspaceMetadata to create FrontendWorkspaceMetadata.
    * Helper to avoid duplicating path computation logic.
    */
-  private addPathsToMetadata(
+  private async addPathsToMetadata(
     metadata: WorkspaceMetadata,
     workspacePath: string,
     _projectPath: string
-  ): FrontendWorkspaceMetadata {
+  ): Promise<FrontendWorkspaceMetadata> {
     const result: FrontendWorkspaceMetadata = {
       ...metadata,
       namedWorkspacePath: workspacePath,
@@ -1014,6 +1032,21 @@ export class Config {
       result.incompatibleRuntime =
         "This workspace was created with a newer version of mux. " +
         "Please upgrade mux to use this workspace.";
+    }
+
+    // Mark worktree workspaces with missing checkout directories as transcript-only.
+    // Queued agent tasks can briefly exist without a provisioned checkout, so keep
+    // those workspaces interactive until the checkout is created.
+    const workspacePathExists = await fs.promises
+      .access(workspacePath)
+      .then(() => true)
+      .catch(() => false);
+    if (
+      isWorktreeRuntime(metadata.runtimeConfig) &&
+      metadata.taskStatus !== "queued" &&
+      !workspacePathExists
+    ) {
+      result.transcriptOnly = true;
     }
 
     return result;
@@ -1246,7 +1279,9 @@ export class Config {
               };
             }
 
-            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path, projectPath));
+            workspaceMetadata.push(
+              await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+            );
             continue; // Skip metadata file lookup
           }
 
@@ -1319,7 +1354,9 @@ export class Config {
               configModified = true;
             }
 
-            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path, projectPath));
+            workspaceMetadata.push(
+              await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+            );
             metadataFound = true;
           }
 
@@ -1367,7 +1404,9 @@ export class Config {
             workspace.runtimeConfig = metadata.runtimeConfig;
             configModified = true;
 
-            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path, projectPath));
+            workspaceMetadata.push(
+              await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+            );
           }
         } catch (error) {
           log.error(`Failed to load/migrate workspace metadata:`, error);
@@ -1405,7 +1444,9 @@ export class Config {
             sectionId: workspace.sectionId,
           };
 
-          workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path, projectPath));
+          workspaceMetadata.push(
+            await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+          );
         }
       }
     }
