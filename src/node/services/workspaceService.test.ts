@@ -3282,6 +3282,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       }),
       editConfig: editConfigSpy,
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+      loadConfigOrDefault: mock(() => configState),
     };
     mockAIService = {
       isStreaming: mock(() => false),
@@ -3339,6 +3340,22 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     expect(result.success).toBe(false);
     expect(interruptStreamSpy).toHaveBeenCalledTimes(0);
+  });
+
+  test("archive() stays successful when post-persist terminal teardown fails", async () => {
+    const closeWorkspaceSessions = mock(() => {
+      throw new Error("terminal close failed");
+    });
+    const terminalService = {
+      closeWorkspaceSessions,
+    } as unknown as TerminalService;
+    workspaceService.setTerminalService(terminalService);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Ok(undefined));
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    expect(entry?.archivedAt).toBeTruthy();
   });
 
   test("archive() closes workspace terminal sessions on success", async () => {
@@ -3532,6 +3549,7 @@ describe("WorkspaceService archive init cancellation", () => {
       }),
       editConfig: editConfigSpy,
       getAllWorkspaceMetadata: mock(() => Promise.resolve([frontendMetadata])),
+      loadConfigOrDefault: mock(() => configState),
     };
 
     const mockAIService: AIService = {
@@ -3732,6 +3750,361 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
         .catch(() => false)
     ).toBe(false);
     expect(entry?.path).toBe(workspacePath);
+  });
+});
+
+describe("WorkspaceService archive snapshots", () => {
+  const workspaceId = "ws-archive-snapshot";
+  const projectPath = "/tmp/project";
+  const workspacePath = "/tmp/project/ws-archive-snapshot";
+
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+  let configState: ProjectsConfig;
+  let editConfigSpy: ReturnType<typeof mock>;
+  let workspaceService: WorkspaceService;
+
+  const workspaceMetadata: WorkspaceMetadata = {
+    id: workspaceId,
+    name: "ws-archive-snapshot",
+    projectName: "proj",
+    projectPath,
+    runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+  };
+
+  beforeEach(async () => {
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    configState = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                path: workspacePath,
+                id: workspaceId,
+                name: "ws-archive-snapshot",
+                runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+              },
+            ],
+          },
+        ],
+      ]),
+      worktreeArchiveBehavior: "snapshot",
+    };
+
+    editConfigSpy = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
+      configState = fn(configState);
+      return Promise.resolve();
+    });
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      generateStableId: mock(() => "test-id"),
+      findWorkspace: mock((id: string) => {
+        if (id !== workspaceId) {
+          return null;
+        }
+
+        return { projectPath, workspacePath };
+      }),
+      editConfig: editConfigSpy,
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+      loadConfigOrDefault: mock(() => configState),
+    };
+    const aiService: AIService = {
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+
+    workspaceService = new WorkspaceService(
+      mockConfig as Config,
+      historyService,
+      aiService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("archive() persists captured snapshot metadata together with archivedAt", async () => {
+    const snapshot = {
+      version: 1 as const,
+      capturedAt: "2026-03-30T00:00:00.000Z",
+      stateDirPath: "archive-state",
+      projects: [
+        {
+          projectPath,
+          projectName: "proj",
+          storageKey: "proj",
+          branchName: "ws-archive-snapshot",
+          trunkBranch: "main",
+          baseSha: "base-sha",
+          headSha: "head-sha",
+        },
+      ],
+    };
+    const captureSnapshotForArchive = mock(() => Promise.resolve(Ok(snapshot)));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive,
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+    });
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Ok(undefined));
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    expect(entry?.archivedAt).toBeTruthy();
+    expect(entry?.worktreeArchiveSnapshot).toEqual(snapshot);
+    expect(captureSnapshotForArchive).toHaveBeenCalledWith({
+      workspaceId,
+      workspaceMetadata,
+    });
+  });
+
+  test("archive() does not close live sessions when snapshot capture fails", async () => {
+    const closeWorkspaceSessions = mock(() => undefined);
+    workspaceService.setTerminalService({
+      closeWorkspaceSessions,
+    } as unknown as TerminalService);
+
+    const closeDesktopSession = mock(() => Promise.resolve(undefined));
+    workspaceService.setDesktopSessionManager({
+      close: closeDesktopSession,
+    } as unknown as DesktopSessionManager);
+
+    const preflightSnapshotForArchive = mock(() => Promise.resolve(Err("snapshot failed")));
+    const captureSnapshotForArchive = mock(() => Promise.resolve(Err("should not run")));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive,
+      captureSnapshotForArchive,
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+    });
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Err("snapshot failed"));
+    expect(captureSnapshotForArchive).not.toHaveBeenCalled();
+    expect(closeWorkspaceSessions).not.toHaveBeenCalled();
+    expect(closeDesktopSession).not.toHaveBeenCalled();
+  });
+
+  test("archive() skips snapshot capture for multi-project workspaces", async () => {
+    const captureSnapshotForArchive = mock(() => Promise.resolve(Err("should not run")));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive,
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+    });
+
+    const multiProjectMetadata = {
+      ...workspaceMetadata,
+      projects: [
+        { projectPath, projectName: "proj" },
+        { projectPath: "/tmp/project-b", projectName: "proj-b" },
+      ],
+    } satisfies WorkspaceMetadata;
+    const aiService = workspaceService as unknown as { aiService: AIService };
+    aiService.aiService.getWorkspaceMetadata = mock(() =>
+      Promise.resolve(Ok(multiProjectMetadata))
+    );
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Ok(undefined));
+    expect(captureSnapshotForArchive).not.toHaveBeenCalled();
+  });
+
+  test("archive() aborts when snapshot capture fails", async () => {
+    const captureSnapshotForArchive = mock(() => Promise.resolve(Err("snapshot failed")));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive,
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+    });
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toBe("snapshot failed");
+    }
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    expect(entry?.archivedAt).toBeUndefined();
+    expect(entry?.worktreeArchiveSnapshot).toBeUndefined();
+    expect(editConfigSpy).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe("WorkspaceService unarchive snapshot restore", () => {
+  const workspaceId = "ws-unarchive-snapshot";
+  const projectPath = "/tmp/project";
+  const workspacePath = "/tmp/project/ws-unarchive-snapshot";
+
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+  let workspaceService: WorkspaceService;
+
+  const workspaceMetadata: FrontendWorkspaceMetadata = {
+    id: workspaceId,
+    name: "ws-unarchive-snapshot",
+    projectName: "proj",
+    projectPath,
+    runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+    archivedAt: "2020-01-01T00:00:00.000Z",
+    namedWorkspacePath: workspacePath,
+  };
+
+  beforeEach(async () => {
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    let configState: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                path: workspacePath,
+                id: workspaceId,
+                name: "ws-unarchive-snapshot",
+                archivedAt: "2020-01-01T00:00:00.000Z",
+                runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+                worktreeArchiveSnapshot: {
+                  version: 1,
+                  capturedAt: "2026-03-30T00:00:00.000Z",
+                  stateDirPath: "archive-state",
+                  projects: [
+                    {
+                      projectPath,
+                      projectName: "proj",
+                      storageKey: "proj",
+                      branchName: "ws-unarchive-snapshot",
+                      trunkBranch: "main",
+                      baseSha: "base-sha",
+                      headSha: "head-sha",
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      generateStableId: mock(() => "test-id"),
+      findWorkspace: mock((id: string) => {
+        if (id !== workspaceId) {
+          return null;
+        }
+
+        return { projectPath, workspacePath };
+      }),
+      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
+        configState = fn(configState);
+        return Promise.resolve();
+      }),
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([workspaceMetadata])),
+      loadConfigOrDefault: mock(() => configState),
+    };
+    const aiService: AIService = {
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+
+    workspaceService = new WorkspaceService(
+      mockConfig as Config,
+      historyService,
+      aiService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("unarchive() returns Err when snapshot restore fails", async () => {
+    const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive,
+    });
+
+    const result = await workspaceService.unarchive(workspaceId);
+
+    expect(result).toEqual(Err("restore failed"));
+  });
+
+  test("unarchive() rolls back unarchivedAt when snapshot restore fails", async () => {
+    const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive,
+    });
+
+    const result = await workspaceService.unarchive(workspaceId);
+
+    expect(result).toEqual(Err("restore failed"));
+  });
+
+  test("unarchive() rolls back legacy path-only entries when snapshot restore fails", async () => {
+    const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive,
+    });
+
+    const config = workspaceService as unknown as { config: Config };
+    await config.config.editConfig((currentConfig) => {
+      const workspaceEntry = currentConfig.projects.get(projectPath)?.workspaces[0];
+      if (!workspaceEntry) {
+        throw new Error("Missing workspace entry");
+      }
+      delete workspaceEntry.id;
+      return currentConfig;
+    });
+
+    const result = await workspaceService.unarchive(workspaceId);
+
+    expect(result).toEqual(Err("restore failed"));
+  });
+
+  test("unarchive() invokes snapshot restore when snapshot metadata is present", async () => {
+    const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Ok("restored" as const)));
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive,
+    });
+
+    const result = await workspaceService.unarchive(workspaceId);
+
+    expect(result).toEqual(Ok(undefined));
+    expect(restoreSnapshotAfterUnarchive).toHaveBeenCalledWith({
+      workspaceId,
+      workspaceMetadata,
+    });
   });
 });
 
@@ -4334,6 +4707,7 @@ describe("WorkspaceService init cancellation", () => {
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
       getSessionDir: mock(() => "/tmp/test/sessions"),
       generateStableId: mock(() => "test-id"),
+      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
 
     const mockInitStateManager: Partial<InitStateManager> = {
@@ -4391,6 +4765,7 @@ describe("WorkspaceService init cancellation", () => {
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
       getSessionDir: mock(() => "/tmp/test/sessions"),
       generateStableId: mock(() => "test-id"),
+      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
 
     const mockInitStateManager: Partial<InitStateManager> = {
