@@ -54,6 +54,7 @@ import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { isDurableCompactedMarker } from "@/common/utils/messages/compactionBoundary";
+import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { fileExists } from "@/node/utils/runtime/fileExists";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -211,22 +212,8 @@ type WorktreeArchiveSnapshotLifecycleService = Pick<
   | "restoreSnapshotAfterUnarchive"
   | "getUnsupportedUntrackedPaths"
 >;
-function normalizeHeartbeatMessageInput(message: string | undefined): string | undefined {
-  if (message == null) {
-    return undefined;
-  }
-
-  assert(typeof message === "string", "Heartbeat message must be a string when provided");
-  const trimmedMessage = message.trim();
-  if (trimmedMessage.length === 0) {
-    return undefined;
-  }
-
-  return trimmedMessage;
-}
-
-// Persisted workspace config can contain non-string or whitespace-only values; normalize the
-// message on read so an invalid override never bricks heartbeat execution.
+// Trim and normalize a heartbeat message for storage. Accepts `unknown` so it safely handles
+// both user input (string | undefined) and persisted config values that may have been corrupted.
 function sanitizeHeartbeatMessage(message: unknown): string | undefined {
   if (typeof message !== "string") {
     return undefined;
@@ -560,18 +547,6 @@ async function resetForkedSessionUsage(
   await fsPromises.writeFile(
     path.join(sessionDir, "session-usage.json"),
     JSON.stringify({ byModel: {}, version: 1 }, null, 2)
-  );
-}
-
-function isPositiveInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0
-  );
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0
   );
 }
 
@@ -3292,18 +3267,12 @@ export class WorkspaceService extends EventEmitter {
 
     const message = sanitizeHeartbeatMessage(workspaceEntry.heartbeat.message);
     const contextMode = sanitizeHeartbeatContextMode(workspaceEntry.heartbeat.contextMode);
-    return message == null
-      ? {
-          enabled: workspaceEntry.heartbeat.enabled,
-          intervalMs: workspaceEntry.heartbeat.intervalMs,
-          contextMode,
-        }
-      : {
-          enabled: workspaceEntry.heartbeat.enabled,
-          intervalMs: workspaceEntry.heartbeat.intervalMs,
-          message,
-          contextMode,
-        };
+    return {
+      enabled: workspaceEntry.heartbeat.enabled,
+      intervalMs: workspaceEntry.heartbeat.intervalMs,
+      contextMode,
+      ...(message != null ? { message } : {}),
+    };
   }
 
   async setHeartbeatSettings(
@@ -3356,26 +3325,18 @@ export class WorkspaceService extends EventEmitter {
       }
 
       const nextMessage = hasMessageUpdate
-        ? normalizeHeartbeatMessageInput(settings.message)
+        ? sanitizeHeartbeatMessage(settings.message)
         : sanitizeHeartbeatMessage(workspaceEntry.heartbeat?.message);
       const nextContextMode = hasContextModeUpdate
         ? sanitizeHeartbeatContextMode(settings.contextMode)
         : sanitizeHeartbeatContextMode(workspaceEntry.heartbeat?.contextMode);
-      const nextSettings: WorkspaceHeartbeatSettings =
-        nextMessage == null
-          ? {
-              enabled: settings.enabled,
-              // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
-              intervalMs: settings.intervalMs,
-              contextMode: nextContextMode,
-            }
-          : {
-              enabled: settings.enabled,
-              // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
-              intervalMs: settings.intervalMs,
-              message: nextMessage,
-              contextMode: nextContextMode,
-            };
+      // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
+      const nextSettings: WorkspaceHeartbeatSettings = {
+        enabled: settings.enabled,
+        intervalMs: settings.intervalMs,
+        contextMode: nextContextMode,
+        ...(nextMessage != null ? { message: nextMessage } : {}),
+      };
 
       const changed =
         workspaceEntry.heartbeat?.enabled !== nextSettings.enabled ||

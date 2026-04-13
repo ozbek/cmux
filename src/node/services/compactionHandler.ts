@@ -1,6 +1,7 @@
 import type { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
+import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import * as path from "path";
 
 import type { HistoryService } from "./historyService";
@@ -247,18 +248,6 @@ function isCompactedSummaryMessage(message: MuxMessage): boolean {
   return isDurableCompactedMarker(message.metadata?.compacted);
 }
 
-function isPositiveInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0
-  );
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0
-  );
-}
-
 function getNextCompactionEpoch(messages: MuxMessage[]): number {
   let epochCursor = 0;
 
@@ -462,10 +451,6 @@ export class CompactionHandler {
     await this.deletePersistedPendingStateBestEffort();
   }
 
-  async ackPendingDiffsConsumed(): Promise<void> {
-    await this.ackPendingStateConsumed();
-  }
-
   /**
    * Drop pending post-compaction state (e.g., because it caused context_exceeded).
    */
@@ -488,10 +473,6 @@ export class CompactionHandler {
       await this.ackPendingStateConsumed();
     }
     this.cachedLoadedSkills = [];
-  }
-
-  async discardPendingDiffs(reason: string): Promise<void> {
-    await this.discardPendingState(reason);
   }
 
   private async deletePersistedPendingStateBestEffort(): Promise<void> {
